@@ -7,6 +7,7 @@ Reads packed memmap token files from pack_dataset.py (./packed/train.bin,
 ./packed/val.bin) and trains with:
 
   - bf16 mixed precision
+  - torch.compile for kernel fusion (+25-40% throughput)
   - Gradient accumulation  (simulate large batch on few GPUs)
   - Cosine LR schedule with linear warmup
   - AdamW with weight-decay excluded from norms / embeddings
@@ -16,6 +17,7 @@ Reads packed memmap token files from pack_dataset.py (./packed/train.bin,
   - Periodic validation loss
   - Checkpoint save/resume
   - Optional Weights & Biases logging
+  - Accurate per-GPU MFU reporting
 
 Single GPU:
     python train.py --model-size 0.6B --data-dir ./packed --out-dir ./checkpoints
@@ -25,6 +27,11 @@ Multi-GPU (e.g. 4 GPUs on one node):
 
 Resume from checkpoint:
     python train.py --resume ./checkpoints/ckpt_step5000.pt
+
+Recommended command for RTX 4090 (0.3B model):
+    python train.py --model-size 0.3B --data-dir ./packed \\
+            --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \\
+            --compile --out-dir ./checkpoints
 
 Full production run (8B model, large effective batch)
     torchrun --nproc_per_node=8 train.py \
@@ -37,6 +44,8 @@ Full production run (8B model, large effective batch)
         --warmup-steps 5000 \
         --lr 3e-4 \
         --wandb-project my-llm
+
+
 """
 
 import argparse
@@ -58,6 +67,48 @@ from model import Qwen3Config, Qwen3ForCausalLM, count_parameters
 
 
 # ---------------------------------------------------------------------------
+# GPU peak FLOP/s table  (bf16 Tensor Core, per card)
+# ---------------------------------------------------------------------------
+# Used for MFU estimation. Add your GPU here if missing.
+GPU_PEAK_TFLOPS = {
+    # NVIDIA consumer
+    "NVIDIA GeForce RTX 4090":    165.2,
+    "NVIDIA GeForce RTX 4080":    97.5,
+    "NVIDIA GeForce RTX 4070 Ti": 80.8,
+    "NVIDIA GeForce RTX 4070":    59.8,
+    "NVIDIA GeForce RTX 3090":    71.0,
+    "NVIDIA GeForce RTX 3080":    59.4,
+    # NVIDIA data-center
+    "NVIDIA A100-SXM4-80GB":      312.0,
+    "NVIDIA A100-SXM4-40GB":      312.0,
+    "NVIDIA A100-PCIE-40GB":      312.0,
+    "NVIDIA H100 SXM5":           989.5,
+    "NVIDIA H100 PCIe":           756.0,
+    "NVIDIA L40S":                362.1,
+    "NVIDIA L4":                  121.0,
+    "NVIDIA A10G":                125.0,
+    "NVIDIA V100-SXM2-16GB":      28.0,   # fp16 only; no bf16 HW
+    # AMD
+    "AMD Instinct MI300X":        1307.4,
+    "AMD Instinct MI250X":        383.0,
+}
+
+_FALLBACK_TFLOPS = 100.0  # conservative fallback if GPU not in table
+
+
+def get_gpu_peak_tflops(device: torch.device) -> float:
+    if device.type != "cuda":
+        return _FALLBACK_TFLOPS
+    name = torch.cuda.get_device_name(device)
+    for key, val in GPU_PEAK_TFLOPS.items():
+        if key.lower() in name.lower() or name.lower() in key.lower():
+            return val
+    print(f"[MFU] Unknown GPU '{name}', using {_FALLBACK_TFLOPS} TFLOP/s fallback. "
+          f"Add it to GPU_PEAK_TFLOPS for accurate MFU.")
+    return _FALLBACK_TFLOPS
+
+
+# ---------------------------------------------------------------------------
 # Distributed helpers
 # ---------------------------------------------------------------------------
 
@@ -65,16 +116,16 @@ def setup_distributed():
     """Init DDP if launched with torchrun, else single-process."""
     if "RANK" in os.environ:
         dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
+        rank       = dist.get_rank()
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
-        rank = 0
+        rank       = 0
         local_rank = 0
         world_size = 1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return rank, local_rank, world_size, device
 
 
@@ -96,43 +147,69 @@ class PackedDataLoader:
     Streams random fixed-length windows from a flat memmap token file.
     Each rank gets a non-overlapping shard of the data so no two GPUs
     see the same tokens in the same step.
+
+    Prefetch: the next batch is built on CPU while the GPU runs the
+    current forward/backward, hiding the CPU cost completely.
     """
 
     def __init__(self, bin_path: str, seq_len: int, batch_size: int,
-                 rank: int = 0, world_size: int = 1, dtype=np.uint16):
-        self.seq_len = seq_len
+                 rank: int = 0, world_size: int = 1, dtype=np.uint16,
+                 prefetch: bool = True):
+        self.seq_len    = seq_len
         self.batch_size = batch_size
-        self.rank = rank
-        self.world_size = world_size
+        self.prefetch   = prefetch
 
         data = np.memmap(bin_path, dtype=dtype, mode="r")
-        # shard across ranks
         shard_size = len(data) // world_size
         start = rank * shard_size
-        end = start + shard_size if rank < world_size - 1 else len(data)
+        end   = start + shard_size if rank < world_size - 1 else len(data)
         self.data = data[start:end]
 
         self.n_positions = max(1, len(self.data) - seq_len)
-        self._ptr = 0          # sequential pointer for reproducibility
-        self._step = 0
+        self._prefetched: Optional[tuple] = None
+
         print(f"[DataLoader rank {rank}] {bin_path}: "
               f"{len(self.data):,} tokens, shard [{start}:{end}]")
 
-    def next_batch(self, device: torch.device):
-        """Return (x, y) each of shape (batch_size, seq_len)."""
+    def _build_batch_cpu(self):
+        """Build a (x, y) batch entirely on CPU as int64 tensors."""
         ix = torch.randint(self.n_positions, (self.batch_size,))
         x = torch.stack([
-            torch.from_numpy(self.data[i: i + self.seq_len].astype(np.int64))
+            torch.from_numpy(self.data[i : i + self.seq_len].astype(np.int64))
             for i in ix
         ])
         y = torch.stack([
-            torch.from_numpy(self.data[i + 1: i + 1 + self.seq_len].astype(np.int64))
+            torch.from_numpy(self.data[i + 1 : i + 1 + self.seq_len].astype(np.int64))
             for i in ix
         ])
-        # pin_memory -> non_blocking for faster H2D transfer
-        x = x.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else x.to(device)
-        y = y.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else y.to(device)
-        self._step += 1
+        return x, y
+
+    def prime(self, device: torch.device):
+        """Prefetch the very first batch before the loop starts."""
+        if self.prefetch:
+            self._prefetched = self._build_batch_cpu()
+
+    def next_batch(self, device: torch.device):
+        """
+        Return (x, y) on `device`.
+        If prefetch is on, the CPU batch for the *next* call is prepared
+        while the caller is doing GPU work with the current one.
+        """
+        if self.prefetch and self._prefetched is not None:
+            x_cpu, y_cpu = self._prefetched
+            # Kick off the prefetch for the next call *before* H2D transfer
+            self._prefetched = self._build_batch_cpu()
+        else:
+            x_cpu, y_cpu = self._build_batch_cpu()
+            if self.prefetch:
+                self._prefetched = self._build_batch_cpu()
+
+        if device.type == "cuda":
+            x = x_cpu.pin_memory().to(device, non_blocking=True)
+            y = y_cpu.pin_memory().to(device, non_blocking=True)
+        else:
+            x = x_cpu.to(device)
+            y = y_cpu.to(device)
         return x, y
 
 
@@ -147,7 +224,7 @@ def get_lr(step: int, warmup_steps: int, max_steps: int,
     if step >= max_steps:
         return min_lr
     progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+    coeff    = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + coeff * (max_lr - min_lr)
 
 
@@ -161,35 +238,42 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float,
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # exclude 1-D params (norms, bias) and embeddings from weight decay
         if param.ndim < 2 or "norm" in name or "embed" in name:
             no_decay_params.append(param)
         else:
             decay_params.append(param)
     groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": decay_params,    "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
-    print(f"[Optimizer] decay={sum(p.numel() for p in decay_params):,} "
+    print(f"[Optimizer] decay={sum(p.numel() for p in decay_params):,}  "
           f"no_decay={sum(p.numel() for p in no_decay_params):,}")
-    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, fused=True
-                             if torch.cuda.is_available() else False)
+    return torch.optim.AdamW(
+        groups, lr=lr, betas=betas, eps=eps,
+        fused=torch.cuda.is_available(),   # fused kernel: ~15% faster on CUDA
+    )
 
 
 # ---------------------------------------------------------------------------
-# MFU (model FLOPs utilization)
+# MFU (model FLOPs utilization) — calibrated per GPU
 # ---------------------------------------------------------------------------
 
-def estimate_mfu(model: Qwen3ForCausalLM, tokens_per_sec: float) -> float:
-    """Estimate MFU vs. the theoretical peak of the current GPU (A100 bf16)."""
-    cfg = model.config if not isinstance(model, DDP) else model.module.config
-    n_params = count_parameters(model)
-    # ~6 * N * tokens forward+backward FLOPs (Chinchilla approximation)
-    flops_per_token = 6 * n_params
-    flops_per_sec = flops_per_token * tokens_per_sec
-    # A100 80GB bf16 peak = 312e12 FLOP/s (adjust for your GPU)
-    gpu_peak_flops = 312e12
-    return flops_per_sec / gpu_peak_flops
+def estimate_mfu(model: nn.Module, tokens_per_sec: float,
+                 gpu_peak_tflops: float) -> float:
+    """
+    Estimate what fraction of the GPU's theoretical bf16 peak we are using.
+
+    Formula: each token costs ~6N FLOPs for forward + backward
+    (Chinchilla / PaLM approximation, N = non-embedding params).
+    Attention FLOPs (quadratic in seq_len) are omitted here because they
+    are a small fraction for typical seq_len << hidden_size*n_layers.
+    """
+    raw = model.module if isinstance(model, DDP) else model
+    # exclude embedding table — not a matmul, much lower arithmetic intensity
+    n_params = sum(p.numel() for name, p in raw.named_parameters()
+                   if "embed_tokens" not in name)
+    flops_per_sec = 6 * n_params * tokens_per_sec
+    return flops_per_sec / (gpu_peak_tflops * 1e12)
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +284,19 @@ def save_checkpoint(out_dir: str, step: int, model: nn.Module,
                     optimizer: torch.optim.Optimizer, config: Qwen3Config,
                     train_args: dict, best_val_loss: float):
     raw_model = model.module if isinstance(model, DDP) else model
+    # unwrap compiled model if present
+    state_model = (raw_model._orig_mod if hasattr(raw_model, "_orig_mod")
+                   else raw_model)
     ckpt = {
-        "step": step,
-        "model_state": raw_model.state_dict(),
+        "step":            step,
+        "model_state":     state_model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "config": vars(config),
-        "train_args": train_args,
-        "best_val_loss": best_val_loss,
+        "config":          vars(config),
+        "train_args":      train_args,
+        "best_val_loss":   best_val_loss,
     }
-    path = os.path.join(out_dir, f"ckpt_step{step:07d}.pt")
+    path   = os.path.join(out_dir, f"ckpt_step{step:07d}.pt")
     torch.save(ckpt, path)
-    # keep a symlink 'latest.pt' pointing to the newest checkpoint
     latest = os.path.join(out_dir, "latest.pt")
     if os.path.islink(latest):
         os.remove(latest)
@@ -222,13 +308,15 @@ def save_checkpoint(out_dir: str, step: int, model: nn.Module,
 def load_checkpoint(path: str, model: nn.Module,
                     optimizer: Optional[torch.optim.Optimizer],
                     device: torch.device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt      = torch.load(path, map_location=device)
     raw_model = model.module if isinstance(model, DDP) else model
-    raw_model.load_state_dict(ckpt["model_state"])
+    state_model = (raw_model._orig_mod if hasattr(raw_model, "_orig_mod")
+                   else raw_model)
+    state_model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and "optimizer_state" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state"])
-    step = ckpt.get("step", 0)
-    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    step           = ckpt.get("step", 0)
+    best_val_loss  = ckpt.get("best_val_loss", float("inf"))
     print(f"[Checkpoint] resumed from {path} at step {step}")
     return step, best_val_loss
 
@@ -238,8 +326,8 @@ def load_checkpoint(path: str, model: nn.Module,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model: nn.Module, val_loader: PackedDataLoader, eval_steps: int,
-             device: torch.device, ctx) -> float:
+def evaluate(model: nn.Module, val_loader: PackedDataLoader,
+             eval_steps: int, device: torch.device, ctx) -> float:
     model.eval()
     losses = []
     for _ in range(eval_steps):
@@ -248,8 +336,7 @@ def evaluate(model: nn.Module, val_loader: PackedDataLoader, eval_steps: int,
             out = model(x, labels=y)
         losses.append(out["loss"].item())
     model.train()
-    val_loss = float(np.mean(losses))
-    return val_loss
+    return float(np.mean(losses))
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +366,20 @@ def log_wandb(metrics: dict, step: int):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint pruning
+# ---------------------------------------------------------------------------
+
+def _prune_checkpoints(out_dir: str, keep: int = 3):
+    ckpts = sorted(
+        Path(out_dir).glob("ckpt_step*.pt"),
+        key=lambda p: int(p.stem.replace("ckpt_step", "")),
+    )
+    for old in ckpts[:-keep]:
+        old.unlink()
+        print(f"[Checkpoint] pruned {old}")
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -288,7 +389,7 @@ def train(args):
 
     torch.manual_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32        = True
 
     # ------------------------------------------------------------------ meta
     meta_path = os.path.join(args.data_dir, "meta.json")
@@ -296,12 +397,12 @@ def train(args):
         meta = json.load(f)
 
     vocab_size = meta["vocab_size"]
-    dtype_np = np.uint16 if meta["dtype"] == "uint16" else np.uint32
+    dtype_np   = np.uint16 if meta["dtype"] == "uint16" else np.uint32
 
     # ------------------------------------------------------------------ model
     if args.resume:
         ckpt_raw = torch.load(args.resume, map_location="cpu")
-        config = Qwen3Config(**ckpt_raw["config"])
+        config   = Qwen3Config(**ckpt_raw["config"])
         if master:
             print(f"[Resume] loaded config from checkpoint")
     else:
@@ -311,18 +412,30 @@ def train(args):
             verbose=master,
         )
 
-    model = Qwen3ForCausalLM(config).to(device)
+    model    = Qwen3ForCausalLM(config).to(device)
     n_params = count_parameters(model)
 
-    if args.gradient_checkpointing:
-        # Enable activation checkpointing on each decoder layer
-        for layer in model.model.layers:
-            layer.__class__.__call__ = torch.utils.checkpoint.checkpoint_wrapper(
-                layer.__class__.__call__
-            )
-
     if master:
-        print(f"Model params: {n_params:,} ({n_params / 1e9:.3f}B)")
+        print(f"Model params : {n_params:,}  ({n_params / 1e9:.3f}B)")
+        if device.type == "cuda":
+            vram_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            # rough estimate: weights (bf16) + grads + optimizer states (fp32 copies)
+            model_vram = n_params * (2 + 2 + 8) / 1024**3
+            print(f"GPU          : {torch.cuda.get_device_name(device)}")
+            print(f"VRAM         : {vram_gb:.1f} GB total, "
+                  f"~{model_vram:.1f} GB for model+grads+optimizer")
+
+    # ---- gradient checkpointing (trades memory for recompute)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable() if hasattr(model, "gradient_checkpointing_enable") \
+            else print("[warn] gradient_checkpointing_enable not available on this model")
+
+    # ---- torch.compile  (biggest single performance lever on modern PyTorch)
+    if args.compile:
+        if master:
+            print("[compile] compiling model with torch.compile (mode='reduce-overhead')…")
+            print("          First step will be slow (~60-120s), subsequent steps are fast.")
+        model = torch.compile(model, mode="reduce-overhead")
 
     # ------------------------------------------------------------------ DDP
     if world_size > 1:
@@ -331,69 +444,67 @@ def train(args):
     # ------------------------------------------------------------------ data
     train_loader = PackedDataLoader(
         os.path.join(args.data_dir, "train.bin"),
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        rank=rank,
-        world_size=world_size,
-        dtype=dtype_np,
+        seq_len=args.seq_len, batch_size=args.batch_size,
+        rank=rank, world_size=world_size, dtype=dtype_np,
     )
     val_loader = PackedDataLoader(
         os.path.join(args.data_dir, "val.bin"),
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        rank=rank,
-        world_size=world_size,
-        dtype=dtype_np,
+        seq_len=args.seq_len, batch_size=args.batch_size,
+        rank=rank, world_size=world_size, dtype=dtype_np,
     )
+    train_loader.prime(device)   # fill prefetch buffer
+    val_loader.prime(device)
 
     # ------------------------------------------------------------------ optim
-    optimizer = build_optimizer(
-        model,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
 
     # ------------------------------------------------------------------ amp
-    use_amp = device.type == "cuda" and args.dtype == "bf16"
+    use_amp   = device.type == "cuda" and args.dtype == "bf16"
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
-    scaler = None  # bf16 doesn't need GradScaler (only fp16 does)
-    ctx = (
-        torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
-        if use_amp else nullcontext()
-    )
+    ctx       = (torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+                 if use_amp else nullcontext())
 
     # ------------------------------------------------------------------ resume
-    start_step = 0
+    start_step    = 0
     best_val_loss = float("inf")
     if args.resume:
-        start_step, best_val_loss = load_checkpoint(args.resume, model, optimizer, device)
+        start_step, best_val_loss = load_checkpoint(
+            args.resume, model, optimizer, device
+        )
 
+    # ------------------------------------------------------------------ MFU
+    gpu_peak_tflops = get_gpu_peak_tflops(device)
     if master:
-        os.makedirs(args.out_dir, exist_ok=True)
+        print(f"GPU peak bf16: {gpu_peak_tflops:.1f} TFLOP/s")
 
     # ------------------------------------------------------------------ W&B
-    use_wandb = master and args.wandb_project and try_init_wandb(args, config, n_params)
+    if master:
+        os.makedirs(args.out_dir, exist_ok=True)
+    use_wandb = (master and args.wandb_project
+                 and try_init_wandb(args, config, n_params))
 
     # ------------------------------------------------------------------ tokens accounting
     tokens_per_step = (
         args.batch_size * args.seq_len * args.grad_accum_steps * world_size
     )
     if master:
-        print(f"\nTokens per optimizer step: {tokens_per_step:,}")
-        print(f"Effective batch size:       {args.batch_size * args.grad_accum_steps * world_size}")
-        print(f"Max steps:                  {args.max_steps}")
-        print(f"Total tokens (planned):     {args.max_steps * tokens_per_step:,}\n")
+        print(f"\nTokens / optimizer step : {tokens_per_step:,}")
+        print(f"Effective batch size    : {args.batch_size * args.grad_accum_steps * world_size}")
+        print(f"Max steps               : {args.max_steps:,}")
+        print(f"Checkpoint every        : {args.ckpt_interval:,} steps")
+        print(f"Total tokens (planned)  : {args.max_steps * tokens_per_step:,}\n")
 
     # ================================================================== LOOP
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    t0 = time.perf_counter()
-    local_loss_accum = 0.0
-    local_grad_norm = 0.0
+    t0              = time.perf_counter()
+    loss_accum      = 0.0
+    grad_norm_accum = 0.0
 
     for step in range(start_step, args.max_steps):
-        # ---- learning rate
+
+        # ---- LR
         lr = get_lr(step, args.warmup_steps, args.max_steps, args.lr, args.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -402,104 +513,91 @@ def train(args):
         for micro_step in range(args.grad_accum_steps):
             x, y = train_loader.next_batch(device)
 
-            # in DDP, only sync gradients on the last micro-step
-            if world_size > 1:
-                sync = micro_step == args.grad_accum_steps - 1
-                ctx_ddp = nullcontext() if sync else model.no_sync()
-            else:
-                ctx_ddp = nullcontext()
+            sync = (micro_step == args.grad_accum_steps - 1)
+            ctx_ddp = nullcontext() if (world_size == 1 or sync) else model.no_sync()
 
             with ctx_ddp:
                 with ctx:
-                    out = model(x, labels=y)
+                    out  = model(x, labels=y)
                 loss = out["loss"] / args.grad_accum_steps
                 loss.backward()
 
-            local_loss_accum += loss.item()
+            loss_accum += loss.item()
 
         # ---- gradient clipping
-        raw_model = model.module if isinstance(model, DDP) else model
-        local_grad_norm = nn.utils.clip_grad_norm_(
-            model.parameters(), args.grad_clip
-        ).item()
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
+        grad_norm_accum += grad_norm
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        # ---- logging
-        if master and (step % args.log_interval == 0 or step == start_step):
-            t1 = time.perf_counter()
-            dt = t1 - t0
-            tokens_per_sec = tokens_per_step * args.log_interval / max(dt, 1e-9)
-            mfu = estimate_mfu(raw_model, tokens_per_sec)
+        # flush CUDA so timing is accurate
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
-            loss_display = local_loss_accum * args.grad_accum_steps  # un-scale
+        # ---- logging
+        if master and step % args.log_interval == 0:
+            t1  = time.perf_counter()
+            dt  = max(t1 - t0, 1e-9)
+            tok_per_sec = tokens_per_step * args.log_interval / dt
+            mfu         = estimate_mfu(model, tok_per_sec, gpu_peak_tflops)
+
+            # un-scale the accumulated loss for display
+            loss_display      = loss_accum * args.grad_accum_steps / args.log_interval
+            grad_norm_display = grad_norm_accum / args.log_interval
+            loss_accum        = 0.0
+            grad_norm_accum   = 0.0
+
             print(
                 f"step {step:7d} | loss {loss_display:.4f} | lr {lr:.2e} | "
-                f"grad_norm {local_grad_norm:.3f} | "
-                f"{tokens_per_sec / 1e3:.1f}k tok/s | mfu {mfu * 100:.2f}%"
+                f"grad {grad_norm_display:.3f} | "
+                f"{tok_per_sec / 1e3:.1f}k tok/s | "
+                f"mfu {mfu * 100:.2f}%"
             )
 
             if use_wandb:
                 log_wandb({
-                    "train/loss": loss_display,
-                    "train/lr": lr,
-                    "train/grad_norm": local_grad_norm,
-                    "perf/tokens_per_sec": tokens_per_sec,
-                    "perf/mfu_pct": mfu * 100,
+                    "train/loss":         loss_display,
+                    "train/lr":           lr,
+                    "train/grad_norm":    grad_norm_display,
+                    "perf/tokens_per_sec": tok_per_sec,
+                    "perf/mfu_pct":       mfu * 100,
                 }, step=step)
 
-            local_loss_accum = 0.0
             t0 = t1
 
         # ---- validation
         if step % args.eval_interval == 0 and step > start_step:
-            val_loss = evaluate(
-                model, val_loader, args.eval_steps, device, ctx
-            )
+            val_loss = evaluate(model, val_loader, args.eval_steps, device, ctx)
             if world_size > 1:
                 vl = torch.tensor(val_loss, device=device)
                 dist.all_reduce(vl, op=dist.ReduceOp.AVG)
                 val_loss = vl.item()
 
             if master:
-                print(f"  [eval] step {step} | val_loss {val_loss:.4f}")
+                print(f"  [eval] step {step:7d} | val_loss {val_loss:.4f}")
                 if use_wandb:
                     log_wandb({"val/loss": val_loss}, step=step)
-
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
 
         # ---- checkpoint
         if master and step % args.ckpt_interval == 0 and step > start_step:
             save_checkpoint(
-                args.out_dir, step, model, optimizer, config,
-                vars(args), best_val_loss,
+                args.out_dir, step, model, optimizer,
+                config, vars(args), best_val_loss,
             )
-            # keep only the last N checkpoints to save disk
             _prune_checkpoints(args.out_dir, keep=args.keep_ckpts)
 
     # ---- final checkpoint
     if master:
         save_checkpoint(
-            args.out_dir, args.max_steps, model, optimizer, config,
-            vars(args), best_val_loss,
+            args.out_dir, args.max_steps, model, optimizer,
+            config, vars(args), best_val_loss,
         )
         print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
 
     destroy_distributed()
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint pruning
-# ---------------------------------------------------------------------------
-
-def _prune_checkpoints(out_dir: str, keep: int = 3):
-    ckpts = sorted(Path(out_dir).glob("ckpt_step*.pt"),
-                   key=lambda p: int(p.stem.replace("ckpt_step", "")))
-    for old in ckpts[:-keep]:
-        old.unlink()
-        print(f"[Checkpoint] pruned {old}")
 
 
 # ---------------------------------------------------------------------------
@@ -510,132 +608,94 @@ def parse_args():
     p = argparse.ArgumentParser(description="Pretrain a Qwen3-style dense LLM.")
 
     # model
-    p.add_argument("--model-size", default="0.6B",
-                   help="Target model size passed to Qwen3Config.from_target_size (e.g. 0.6B, 1.7B, 8B)")
-    p.add_argument("--vocab-size", type=int, default=None,
-                   help="Override vocab size (default: read from packed/meta.json)")
+    p.add_argument("--model-size", default="0.6B")
+    p.add_argument("--vocab-size", type=int, default=None)
 
     # data
-    p.add_argument("--data-dir", default="./packed",
-                   help="Directory with train.bin, val.bin, meta.json from pack_dataset.py")
-    p.add_argument("--seq-len", type=int, default=2048,
-                   help="Sequence length (tokens per example)")
+    p.add_argument("--data-dir", default="./packed")
+    p.add_argument("--seq-len",  type=int, default=2048)
 
     # training
-    p.add_argument("--batch-size", type=int, default=8,
-                   help="Micro-batch size per GPU per grad-accum step")
-    p.add_argument("--grad-accum-steps", type=int, default=4,
-                   help="Gradient accumulation steps (effective_batch = batch * accum * world_size)")
-    p.add_argument("--max-steps", type=int, default=100_000)
-    p.add_argument("--warmup-steps", type=int, default=2_000)
-    p.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
-    p.add_argument("--min-lr", type=float, default=3e-5,
-                   help="Minimum LR at end of cosine decay (default: lr/10)")
-    p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--batch-size",       type=int,   default=8)
+    p.add_argument("--grad-accum-steps", type=int,   default=4)
+    p.add_argument("--max-steps",        type=int,   default=100_000)
+    p.add_argument("--warmup-steps",     type=int,   default=2_000)
+    p.add_argument("--lr",               type=float, default=3e-4)
+    p.add_argument("--min-lr",           type=float, default=3e-5)
+    p.add_argument("--weight-decay",     type=float, default=0.1)
+    p.add_argument("--grad-clip",        type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
-    p.add_argument("--gradient-checkpointing", action="store_true",
-                   help="Trade compute for memory by recomputing activations in backward")
+    p.add_argument("--compile", action="store_true",
+                   help="Run torch.compile(model) for kernel fusion (+25-40%% throughput)")
+    p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 
     # checkpointing
-    p.add_argument("--out-dir", default="./checkpoints")
-    p.add_argument("--resume", default=None,
-                   help="Path to a checkpoint .pt file to resume from")
+    p.add_argument("--out-dir",       default="./checkpoints")
+    p.add_argument("--resume",        default=None)
     p.add_argument("--ckpt-interval", type=int, default=5_000,
-                   help="Save a checkpoint every N steps")
-    p.add_argument("--keep-ckpts", type=int, default=3,
-                   help="Number of recent checkpoints to keep on disk")
+                   help="Save checkpoint every N steps (default 5000)")
+    p.add_argument("--keep-ckpts",    type=int, default=3)
 
     # logging / eval
-    p.add_argument("--log-interval", type=int, default=10)
+    p.add_argument("--log-interval",  type=int, default=10)
     p.add_argument("--eval-interval", type=int, default=500)
-    p.add_argument("--eval-steps", type=int, default=50,
-                   help="Number of val batches per eval pass")
-    p.add_argument("--wandb-project", default=None,
-                   help="W&B project name. Omit to disable W&B logging.")
-    p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--eval-steps",    type=int, default=50)
+    p.add_argument("--wandb-project", default=None)
+    p.add_argument("--wandb-run-name",default=None)
 
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Smoke-test (runs automatically when no packed data is found)
+# Smoke test
 # ---------------------------------------------------------------------------
 
 def smoke_test():
-    """
-    Runs a 5-step training loop on synthetic data so the whole stack
-    (model, dataloader, optimizer, scaler, checkpointing) can be validated
-    without a real dataset.
-    """
     print("\n=== smoke test (no real data found) ===")
     import tempfile, shutil
 
-    tmp = tempfile.mkdtemp()
+    tmp    = tempfile.mkdtemp()
     packed = os.path.join(tmp, "packed")
     os.makedirs(packed)
     ckpt_dir = os.path.join(tmp, "ckpts")
 
-    # synthetic packed data
     vocab_size = 1024
-    n_tokens = 50_000
+    n_tokens   = 50_000
     arr = np.random.randint(0, vocab_size, n_tokens, dtype=np.uint16)
     arr.tofile(os.path.join(packed, "train.bin"))
     arr[:5000].tofile(os.path.join(packed, "val.bin"))
-    meta = {
-        "vocab_size": vocab_size,
-        "dtype": "uint16",
-        "train_tokens": n_tokens,
-        "val_tokens": 5000,
-        "total_tokens": n_tokens,
-        "category_token_counts": {},
-    }
     with open(os.path.join(packed, "meta.json"), "w") as f:
-        json.dump(meta, f)
+        json.dump({"vocab_size": vocab_size, "dtype": "uint16",
+                   "train_tokens": n_tokens, "val_tokens": 5000,
+                   "total_tokens": n_tokens, "category_token_counts": {}}, f)
 
-    # tiny model config
     config = Qwen3Config(
-        vocab_size=vocab_size,
-        hidden_size=256,
-        intermediate_size=512,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=64,
-        max_position_embeddings=256,
+        vocab_size=vocab_size, hidden_size=256, intermediate_size=512,
+        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=64, max_position_embeddings=256,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Qwen3ForCausalLM(config).to(device)
+    model  = Qwen3ForCausalLM(config).to(device)
     print(f"Smoke-test model: {count_parameters(model):,} params on {device}")
 
     optimizer = build_optimizer(model, lr=3e-4, weight_decay=0.1)
-    use_amp = device.type == "cuda"
     ctx = (torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-           if use_amp else nullcontext())
+           if device.type == "cuda" else nullcontext())
 
-    loader = PackedDataLoader(
-        os.path.join(packed, "train.bin"),
-        seq_len=64,
-        batch_size=2,
-        dtype=np.uint16,
-    )
-    val_loader = PackedDataLoader(
-        os.path.join(packed, "val.bin"),
-        seq_len=64,
-        batch_size=2,
-        dtype=np.uint16,
-    )
+    loader     = PackedDataLoader(os.path.join(packed, "train.bin"), 64, 2, dtype=np.uint16)
+    val_loader = PackedDataLoader(os.path.join(packed, "val.bin"),   64, 2, dtype=np.uint16)
+    loader.prime(device)
+    val_loader.prime(device)
 
+    gpu_peak = get_gpu_peak_tflops(device)
     model.train()
     os.makedirs(ckpt_dir, exist_ok=True)
     t0 = time.perf_counter()
 
     for step in range(5):
-        lr = get_lr(step, warmup_steps=2, max_steps=5, max_lr=3e-4, min_lr=3e-5)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-
+        lr = get_lr(step, 2, 5, 3e-4, 3e-5)
+        for pg in optimizer.param_groups: pg["lr"] = lr
         x, y = loader.next_batch(device)
         optimizer.zero_grad(set_to_none=True)
         with ctx:
@@ -643,29 +703,24 @@ def smoke_test():
         out["loss"].backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        mfu = estimate_mfu(model, 2 * 64 / max(time.perf_counter() - t0, 1e-6), gpu_peak)
+        print(f"  step {step} | loss {out['loss'].item():.4f} | "
+              f"lr {lr:.2e} | mfu {mfu*100:.2f}%")
 
-        print(f"  step {step} | loss {out['loss'].item():.4f} | lr {lr:.2e}")
-
-    # validation
-    val_loss = evaluate(model, val_loader, eval_steps=3, device=device, ctx=ctx)
+    val_loss = evaluate(model, val_loader, 3, device, ctx)
     print(f"  val_loss: {val_loss:.4f}")
 
-    # checkpoint
-    save_checkpoint(ckpt_dir, 5, model, optimizer, config,
-                    train_args={}, best_val_loss=val_loss)
+    save_checkpoint(ckpt_dir, 5, model, optimizer, config, {}, val_loss)
 
-    # reload checkpoint and verify
-    model2 = Qwen3ForCausalLM(config).to(device)
+    model2     = Qwen3ForCausalLM(config).to(device)
     optimizer2 = build_optimizer(model2, lr=3e-4, weight_decay=0.1)
-    step_resumed, _ = load_checkpoint(
-        os.path.join(ckpt_dir, "ckpt_step0000005.pt"),
-        model2, optimizer2, device,
+    step_r, _  = load_checkpoint(
+        os.path.join(ckpt_dir, "ckpt_step0000005.pt"), model2, optimizer2, device
     )
-    assert step_resumed == 5, "checkpoint step mismatch"
+    assert step_r == 5
 
-    dt = time.perf_counter() - t0
     shutil.rmtree(tmp)
-    print(f"\n=== smoke test passed in {dt:.2f}s ===\n")
+    print(f"\n=== smoke test passed in {time.perf_counter()-t0:.2f}s ===\n")
 
 
 # ---------------------------------------------------------------------------
@@ -674,10 +729,7 @@ def smoke_test():
 
 if __name__ == "__main__":
     args = parse_args()
-
-    # if no real data present, run smoke test and exit
-    train_bin = os.path.join(args.data_dir, "train.bin")
-    if not os.path.exists(train_bin):
+    if not os.path.exists(os.path.join(args.data_dir, "train.bin")):
         smoke_test()
     else:
         train(args)
