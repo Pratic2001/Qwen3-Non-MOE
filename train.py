@@ -25,6 +25,18 @@ Multi-GPU (e.g. 4 GPUs on one node):
 
 Resume from checkpoint:
     python train.py --resume ./checkpoints/ckpt_step5000.pt
+
+Full production run (8B model, large effective batch)
+    torchrun --nproc_per_node=8 train.py \
+        --model-size 8B \
+        --data-dir ./packed \
+        --seq-len 4096 \
+        --batch-size 4 \
+        --grad-accum-steps 16 \
+        --max-steps 500000 \
+        --warmup-steps 5000 \
+        --lr 3e-4 \
+        --wandb-project my-llm
 """
 
 import argparse
