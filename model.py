@@ -434,13 +434,29 @@ class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
         self.config = config
-        self.model = Qwen3Model(config)
-        if config.tie_word_embeddings:
-            self.lm_head = None
-        else:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model  = Qwen3Model(config)
+
+        # Always create lm_head as a proper nn.Linear so torch.compile /
+        # CUDAGraphs sees a single unambiguous tensor owner for the output
+        # projection.  When tie_word_embeddings=True we later point
+        # lm_head.weight at the embedding table via tie_weights() — keeping
+        # them parameter-identical but graph-distinct, which is what
+        # CUDAGraphs needs to avoid the "tensor overwritten by a subsequent
+        # run" error that fires when the same Parameter is consumed by two
+        # different graph nodes (embed lookup + output projection).
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
+
+        # Tie weights immediately after init so the model is correct by
+        # default even before tie_weights() is called explicitly.
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    def tie_weights(self):
+        """Re-tie lm_head -> embed_tokens after loading a checkpoint."""
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def _init_weights(self, module):
         std = 0.02
@@ -452,8 +468,6 @@ class Qwen3ForCausalLM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def get_output_embeddings(self) -> nn.Linear:
-        if self.config.tie_word_embeddings:
-            return self.model.embed_tokens
         return self.lm_head
 
     def forward(
@@ -469,10 +483,10 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids, attention_mask, position_ids, past_key_values, use_cache,
         )
 
-        if self.config.tie_word_embeddings:
-            logits = F.linear(hidden_states, self.model.embed_tokens.weight)
-        else:
-            logits = self.lm_head(hidden_states)
+        # lm_head is always an nn.Linear; when tie_word_embeddings=True its
+        # weight was pointed at embed_tokens.weight in __init__ / tie_weights,
+        # so no extra memory is used and gradients flow correctly.
+        logits = self.lm_head(hidden_states)
 
         loss = None
         if labels is not None:

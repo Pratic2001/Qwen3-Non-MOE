@@ -30,22 +30,8 @@ Resume from checkpoint:
 
 Recommended command for RTX 4090 (0.3B model):
     python train.py --model-size 0.3B --data-dir ./packed \\
-            --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \\
-            --compile --out-dir ./checkpoints
-
-Full production run (8B model, large effective batch)
-    torchrun --nproc_per_node=8 train.py \
-        --model-size 8B \
-        --data-dir ./packed \
-        --seq-len 4096 \
-        --batch-size 4 \
-        --grad-accum-steps 16 \
-        --max-steps 500000 \
-        --warmup-steps 5000 \
-        --lr 3e-4 \
-        --wandb-project my-llm
-
-
+        --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \\
+        --compile --out-dir ./checkpoints
 """
 
 import argparse
@@ -313,6 +299,10 @@ def load_checkpoint(path: str, model: nn.Module,
     state_model = (raw_model._orig_mod if hasattr(raw_model, "_orig_mod")
                    else raw_model)
     state_model.load_state_dict(ckpt["model_state"])
+    # Re-tie lm_head -> embed_tokens after state_dict restore, because
+    # load_state_dict replaces the weight tensor object so the tie is broken.
+    if hasattr(state_model, "tie_weights"):
+        state_model.tie_weights()
     if optimizer is not None and "optimizer_state" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state"])
     step           = ckpt.get("step", 0)
@@ -327,12 +317,15 @@ def load_checkpoint(path: str, model: nn.Module,
 
 @torch.no_grad()
 def evaluate(model: nn.Module, val_loader: PackedDataLoader,
-             eval_steps: int, device: torch.device, ctx) -> float:
+             eval_steps: int, device: torch.device, ctx,
+             use_cudagraphs: bool = False) -> float:
     model.eval()
     losses = []
     for _ in range(eval_steps):
         x, y = val_loader.next_batch(device)
         with ctx:
+            if use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
             out = model(x, labels=y)
         losses.append(out["loss"].item())
     model.train()
@@ -433,9 +426,17 @@ def train(args):
     # ---- torch.compile  (biggest single performance lever on modern PyTorch)
     if args.compile:
         if master:
-            print("[compile] compiling model with torch.compile (mode='reduce-overhead')…")
-            print("          First step will be slow (~60-120s), subsequent steps are fast.")
-        model = torch.compile(model, mode="reduce-overhead")
+            print(f"[compile] torch.compile(mode='{args.compile_mode}')…")
+            if args.compile_mode == "reduce-overhead":
+                print("          Using CUDAGraphs (reduce-overhead). If you see tensor")
+                print("          overwrite errors, switch to --compile-mode default.")
+            print("          First step will be slow (~60-120s). Subsequent steps are fast.")
+        model = torch.compile(model, mode=args.compile_mode)
+
+    # Whether to call cudagraph_mark_step_begin() before every forward.
+    # Required when using reduce-overhead (CUDAGraphs) to prevent the
+    # "tensor overwritten by subsequent run" error on tied-weight models.
+    _use_cudagraphs = args.compile and args.compile_mode == "reduce-overhead"
 
     # ------------------------------------------------------------------ DDP
     if world_size > 1:
@@ -471,6 +472,12 @@ def train(args):
         start_step, best_val_loss = load_checkpoint(
             args.resume, model, optimizer, device
         )
+        # Re-tie weights after loading state_dict — loading replaces the
+        # lm_head weight tensor so we need to re-point it at embed_tokens.
+        raw = model.module if isinstance(model, DDP) else model
+        raw_model = getattr(raw, "_orig_mod", raw)
+        if hasattr(raw_model, "tie_weights"):
+            raw_model.tie_weights()
 
     # ------------------------------------------------------------------ MFU
     gpu_peak_tflops = get_gpu_peak_tflops(device)
@@ -518,6 +525,11 @@ def train(args):
 
             with ctx_ddp:
                 with ctx:
+                    # CUDAGraphs (reduce-overhead mode) requires this marker
+                    # before every forward pass so it knows a new "step" has
+                    # begun and won't confuse output buffers across calls.
+                    if _use_cudagraphs:
+                        torch.compiler.cudagraph_mark_step_begin()
                     out  = model(x, labels=y)
                 loss = out["loss"] / args.grad_accum_steps
                 loss.backward()
@@ -568,7 +580,8 @@ def train(args):
 
         # ---- validation
         if step % args.eval_interval == 0 and step > start_step:
-            val_loss = evaluate(model, val_loader, args.eval_steps, device, ctx)
+            val_loss = evaluate(model, val_loader, args.eval_steps, device, ctx,
+                                use_cudagraphs=_use_cudagraphs)
             if world_size > 1:
                 vl = torch.tensor(val_loss, device=device)
                 dist.all_reduce(vl, op=dist.ReduceOp.AVG)
@@ -626,7 +639,16 @@ def parse_args():
     p.add_argument("--grad-clip",        type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--compile", action="store_true",
-                   help="Run torch.compile(model) for kernel fusion (+25-40%% throughput)")
+                   help="Run torch.compile for kernel fusion (+25-40%% throughput)")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help=(
+                       "torch.compile mode. "
+                       "'default' — safe, good speedup, no CUDAGraphs. "
+                       "'reduce-overhead' — uses CUDAGraphs for lower kernel-launch overhead "
+                       "(marginally faster for small batches, needs cudagraph_mark_step_begin). "
+                       "'max-autotune' — exhaustive kernel search, very slow to compile."
+                   ))
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 
