@@ -29,8 +29,8 @@ Resume from checkpoint:
     python train.py --resume ./checkpoints/ckpt_step5000.pt
 
 Recommended command for RTX 4090 (0.3B model):
-    python train.py --model-size 0.3B --data-dir ./packed \
-        --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \
+    python train.py --model-size 0.3B --data-dir ./packed \\
+        --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \\
         --compile --out-dir ./checkpoints
 """
 
@@ -411,17 +411,51 @@ def train(args):
     if master:
         print(f"Model params : {n_params:,}  ({n_params / 1e9:.3f}B)")
         if device.type == "cuda":
-            vram_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
-            # rough estimate: weights (bf16) + grads + optimizer states (fp32 copies)
-            model_vram = n_params * (2 + 2 + 8) / 1024**3
-            print(f"GPU          : {torch.cuda.get_device_name(device)}")
-            print(f"VRAM         : {vram_gb:.1f} GB total, "
-                  f"~{model_vram:.1f} GB for model+grads+optimizer")
+            vram_total  = torch.cuda.get_device_properties(device).total_memory
+            vram_gb     = vram_total / 1024**3
+            # Static VRAM: weights(bf16) + grads(bf16) + Adam states(fp32 m+v)
+            static_gb   = n_params * (2 + 2 + 8) / 1024**3
+            # Activation VRAM per token (rough): ~60 bytes for hidden+FFN+attn
+            # per layer in bf16, with flash attention (O(seq) not O(seq^2))
+            cfg = config
+            bytes_per_token_per_layer = (
+                cfg.hidden_size * 2               # hidden states (bf16)
+                + cfg.intermediate_size * 2 * 2   # gate + up proj (bf16)
+                + cfg.num_attention_heads * cfg.head_dim * 2  # attn output (bf16)
+            )
+            act_gb_per_step = (
+                args.batch_size * args.seq_len
+                * cfg.num_hidden_layers
+                * bytes_per_token_per_layer
+                / 1024**3
+            )
+            total_est   = static_gb + act_gb_per_step
+            headroom_gb = vram_gb - total_est
 
-    # ---- gradient checkpointing (trades memory for recompute)
+            print(f"GPU          : {torch.cuda.get_device_name(device)}")
+            print(f"VRAM         : {vram_gb:.1f} GB total")
+            print(f"  static     : ~{static_gb:.1f} GB  (weights + grads + Adam)")
+            print(f"  activations: ~{act_gb_per_step:.1f} GB  "
+                  f"(batch={args.batch_size}, seq={args.seq_len})")
+            print(f"  headroom   : ~{headroom_gb:.1f} GB")
+
+            if headroom_gb < 1.5:
+                # Suggest a safe batch size that leaves 2 GB headroom
+                safe_batch = max(1, int(
+                    (vram_gb - static_gb - 2.0) * 1024**3
+                    / (args.seq_len * cfg.num_hidden_layers * bytes_per_token_per_layer)
+                ))
+                print(f"\n  ⚠  WARNING: estimated VRAM is tight (<1.5 GB headroom).")
+                print(f"     Likely OOM at batch={args.batch_size}, seq={args.seq_len}.")
+                print(f"     Suggestions:")
+                print(f"       --batch-size {safe_batch}  (estimated safe)")
+                print(f"       --gradient-checkpointing   (cuts activation VRAM ~35%)")
+                print(f"       --seq-len {args.seq_len // 2}  (halves activation VRAM)\n")
+
+    # ---- gradient checkpointing (trades ~30% compute for ~35% VRAM reduction)
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable() if hasattr(model, "gradient_checkpointing_enable") \
-            else print("[warn] gradient_checkpointing_enable not available on this model")
+        # Call the real method on our custom model, not the HF stub
+        model.model.enable_gradient_checkpointing()
 
     # ---- torch.compile  (biggest single performance lever on modern PyTorch)
     if args.compile:

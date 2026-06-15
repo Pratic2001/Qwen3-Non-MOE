@@ -400,6 +400,26 @@ class Qwen3Model(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             config.head_dim, config.max_position_embeddings, config.rope_theta,
         )
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """
+        Trade ~30-35% compute for ~30-35% VRAM reduction by recomputing each
+        layer's activations during the backward pass instead of storing them.
+        Call this before torch.compile() if using both together.
+        """
+        self.gradient_checkpointing = True
+        print("[GradCkpt] gradient checkpointing enabled — activations will be "
+              "recomputed on backward (saves VRAM, ~30% slower per step)")
+
+    def _ckpt_layer(self, layer, hidden_states, cos, sin):
+        """Wrapper so torch.utils.checkpoint can call a layer with no kwargs."""
+        # use_reentrant=False is required for compatibility with torch.compile
+        # and avoids issues with in-place ops during recompute.
+        return torch.utils.checkpoint.checkpoint(
+            layer, hidden_states, cos, sin, None, None, False,
+            use_reentrant=False,
+        )
 
     def forward(
         self,
@@ -419,10 +439,25 @@ class Qwen3Model(nn.Module):
 
         cos, sin = self.rotary_emb(position_ids)
 
+        # gradient checkpointing is incompatible with KV-cache (the cached
+        # tensors are not recomputed, so we disable use_cache when enabled).
+        if self.gradient_checkpointing and self.training:
+            use_cache = False
+
         new_past_key_values = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            hidden_states, new_kv = layer(hidden_states, cos, sin, attention_mask, past_kv, use_cache)
+
+            if self.gradient_checkpointing and self.training:
+                # Recompute this layer's activations during backward instead
+                # of storing them — saves (num_layers - 1) * activation_size
+                # of VRAM at the cost of one extra forward pass per layer.
+                hidden_states, new_kv = self._ckpt_layer(layer, hidden_states, cos, sin)
+            else:
+                hidden_states, new_kv = layer(
+                    hidden_states, cos, sin, attention_mask, past_kv, use_cache
+                )
+
             if use_cache:
                 new_past_key_values.append(new_kv)
 

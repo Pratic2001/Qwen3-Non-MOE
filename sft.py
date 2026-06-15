@@ -36,26 +36,26 @@ Template produced for each record:
 
 Usage:
     # Full fine-tune (small model / LoRA for large)
-    python sft.py \
-        --checkpoint ./checkpoints/latest.pt \
-        --tokenizer  ./tokenizer \
-        --data-dir   ./sft_data \
+    python sft.py \\
+        --checkpoint ./checkpoints/latest.pt \\
+        --tokenizer  ./tokenizer \\
+        --data-dir   ./sft_data \\
         --out-dir    ./sft_checkpoints
 
     # LoRA fine-tune (recommended for 1B+ on a single 4090)
-    python sft.py \
-        --checkpoint ./checkpoints/latest.pt \
-        --tokenizer  ./tokenizer \
-        --data-dir   ./sft_data \
-        --lora --lora-rank 64 --lora-alpha 128 \
+    python sft.py \\
+        --checkpoint ./checkpoints/latest.pt \\
+        --tokenizer  ./tokenizer \\
+        --data-dir   ./sft_data \\
+        --lora --lora-rank 64 --lora-alpha 128 \\
         --out-dir    ./sft_checkpoints
 
     # Multi-GPU
     torchrun --nproc_per_node=4 sft.py --checkpoint ... --lora
 
     # Merge LoRA weights back into the base model after training
-    python sft.py --merge-lora \
-        --checkpoint ./sft_checkpoints/latest.pt \
+    python sft.py --merge-lora \\
+        --checkpoint ./sft_checkpoints/latest.pt \\
         --out-dir    ./sft_merged
 """
 
@@ -278,15 +278,23 @@ def format_and_tokenise(
 # Dataset: reads JSONL shards, formats, packs into fixed-length windows
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dataset: streams JSONL shards → writes packed memmap .bin files → reads back
+# ---------------------------------------------------------------------------
+# Peak RAM during the preprocessing pass is just one record at a time plus
+# two small write buffers — no matter how large the dataset is on disk.
+# After preprocessing, training reads directly from mmap (OS page cache,
+# not loaded into Python heap).
+
 class SFTDataset:
     """
-    Packs variable-length SFT examples into fixed-length windows of `seq_len`
-    tokens.  Documents are separated by EOS; the loss mask from each example
-    is propagated so loss never crosses document boundaries into prompt tokens.
+    Builds (once) and reads from packed memmap files:
+        <cache_dir>/sft_<split>_tokens.bin   — uint16/uint32 token ids
+        <cache_dir>/sft_<split>_mask.bin     — uint8 loss mask (1=compute loss)
 
-    Call build() once to materialise the full packed dataset in memory
-    (fine for SFT sizes; typically a few hundred MB).
-    For very large SFT corpora use the streaming variant (build_streaming).
+    On the first call these files are built by streaming through the JSONL
+    shards one record at a time (constant RAM regardless of dataset size).
+    Subsequent calls just mmap the existing files.
     """
 
     def __init__(
@@ -295,124 +303,221 @@ class SFTDataset:
         tokenizer: Tokenizer,
         seq_len: int,
         max_len_per_example: int,
+        cache_dir: str = "./sft_packed",
         rank: int = 0,
         world_size: int = 1,
         split: str = "train",
         val_fraction: float = 0.01,
+        vocab_size: int = None,
     ):
-        self.seq_len   = seq_len
-        self.rank      = rank
+        self.seq_len    = seq_len
+        self.rank       = rank
         self.world_size = world_size
+        self.split      = split
 
-        # Pre-look up special token ids once
-        self.eos_id = get_special_token_id(tokenizer, "<|endoftext|>")
-        self.token_ids = {"eos": self.eos_id}
+        self.eos_id  = get_special_token_id(tokenizer, "<|endoftext|>")
+        vocab_size   = vocab_size or tokenizer.get_vocab_size()
+        self.dtype_t = np.uint16 if vocab_size <= 65536 else np.uint32
+        self.dtype_m = np.uint8
 
-        all_records = self._load_records(data_dir)
-        if not all_records:
-            raise RuntimeError(f"No SFT records found in {data_dir}")
+        os.makedirs(cache_dir, exist_ok=True)
+        tok_path  = os.path.join(cache_dir, f"sft_{split}_tokens.bin")
+        mask_path = os.path.join(cache_dir, f"sft_{split}_mask.bin")
+        meta_path = os.path.join(cache_dir, "sft_meta.json")
 
-        # Shuffle deterministically then split train/val
-        rng = np.random.default_rng(seed=42)
-        idx = np.arange(len(all_records))
-        rng.shuffle(idx)
-        n_val = max(1, int(len(idx) * val_fraction))
+        # ---- build packed files if they don't exist yet
+        if not os.path.exists(tok_path) or not os.path.exists(mask_path):
+            if rank == 0:
+                self._build(
+                    data_dir, tokenizer, cache_dir,
+                    max_len_per_example, val_fraction,
+                )
+            # In DDP, non-master ranks wait for rank-0 to finish writing
+            if world_size > 1:
+                dist.barrier()
+        else:
+            if rank == 0:
+                print(f"[SFTDataset] using cached packed files in {cache_dir}")
 
-        val_idx   = idx[:n_val]
-        train_idx = idx[n_val:]
+        # ---- mmap the files (no copy into RAM)
+        self.tokens = np.memmap(tok_path,  dtype=self.dtype_t, mode="r")
+        self.mask   = np.memmap(mask_path, dtype=self.dtype_m, mode="r")
 
-        chosen_idx = train_idx if split == "train" else val_idx
+        # Shard across DDP ranks by token count
+        shard_size = len(self.tokens) // world_size
+        start = rank * shard_size
+        end   = start + shard_size if rank < world_size - 1 else len(self.tokens)
+        self.tokens = self.tokens[start:end]
+        self.mask   = self.mask[start:end]
 
-        # Shard across DDP ranks
-        shard = np.array_split(chosen_idx, world_size)[rank]
-        records = [all_records[i] for i in shard]
-
-        print(f"[SFTDataset rank {rank}] {split}: {len(records):,} records")
-
-        # Tokenise and pack
-        self.tokens, self.mask = self._pack(records, tokenizer, max_len_per_example)
         n_windows = max(0, (len(self.tokens) - 1) // seq_len)
-        print(f"[SFTDataset rank {rank}] packed into {len(self.tokens):,} tokens "
+        print(f"[SFTDataset rank {rank}] {split}: {len(self.tokens):,} tokens "
               f"-> {n_windows:,} windows of {seq_len}")
 
-    def _load_records(self, data_dir: str) -> list:
-        paths = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
-        if not paths:
+    # ------------------------------------------------------------------
+    def _build(self, data_dir, tokenizer, cache_dir,
+               max_len_per_example, val_fraction):
+        """
+        Stream every JSONL record, tokenise it, and write to memmap.
+        Peak RAM = one record + two small write buffers.
+        """
+        shard_paths = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
+        if not shard_paths:
             raise FileNotFoundError(
                 f"No .jsonl shards found under {data_dir}/<category>/. "
                 f"Run download_sft_data.py first."
             )
-        records = []
-        for path in paths:
+
+        print(f"[SFTDataset] building packed files from {len(shard_paths)} shard(s) "
+              f"in {data_dir} …")
+        print(f"[SFTDataset] this streams records one-by-one (constant RAM)")
+
+        eos_id   = self.eos_id
+        token_ids = {"eos": eos_id}
+
+        # ---- first pass: count total tokens so we can pre-allocate mmaps
+        # We do ONE full pass to get exact counts, then ONE more to write.
+        # This avoids any in-memory list growth.
+        t0          = time.time()
+        total_train = 0
+        total_val   = 0
+        n_records   = 0
+
+        for path in shard_paths:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-        return records
+                    rec = _safe_load_line(line)
+                    if rec is None: continue
+                    result = format_and_tokenise(
+                        rec, tokenizer, token_ids, max_len=max_len_per_example
+                    )
+                    if result is None: continue
+                    ids, _ = result
+                    n_tok  = len(ids) + 1  # +1 for EOS separator
+                    if _is_val(n_records, val_fraction):
+                        total_val += n_tok
+                    else:
+                        total_train += n_tok
+                    n_records += 1
 
-    def _pack(
-        self,
-        records: list,
-        tokenizer: Tokenizer,
-        max_len_per_example: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Concatenate all tokenised examples (separated by EOS) into flat arrays.
-        tokens: uint32 array of token ids
-        mask:   uint8 array, 1 = this position contributes to loss
-        """
-        all_tokens = []
-        all_mask   = []
+        print(f"[SFTDataset] counted {n_records:,} records in {time.time()-t0:.1f}s")
+        print(f"[SFTDataset] train tokens: {total_train:,}  val tokens: {total_val:,}")
 
-        for rec in records:
-            result = format_and_tokenise(rec, tokenizer, self.token_ids,
-                                         max_len=max_len_per_example)
-            if result is None:
-                continue
-            ids, lmask = result
-            all_tokens.extend(ids)
-            all_mask.extend(lmask)
-            # EOS separator between documents (not included in loss)
-            all_tokens.append(self.eos_id)
-            all_mask.append(0)
+        # ---- allocate memmap files on disk (no RAM)
+        for split_name, n_tok in [("train", total_train), ("val", total_val)]:
+            tok_path  = os.path.join(cache_dir, f"sft_{split_name}_tokens.bin")
+            mask_path = os.path.join(cache_dir, f"sft_{split_name}_mask.bin")
+            np.memmap(tok_path,  dtype=self.dtype_t, mode="w+", shape=(n_tok,))
+            np.memmap(mask_path, dtype=self.dtype_m, mode="w+", shape=(n_tok,))
 
-        return (np.array(all_tokens, dtype=np.uint32),
-                np.array(all_mask,   dtype=np.uint8))
+        # Re-open for writing
+        train_tok  = np.memmap(os.path.join(cache_dir, "sft_train_tokens.bin"),
+                               dtype=self.dtype_t, mode="r+")
+        train_mask = np.memmap(os.path.join(cache_dir, "sft_train_mask.bin"),
+                               dtype=self.dtype_m, mode="r+")
+        val_tok    = np.memmap(os.path.join(cache_dir, "sft_val_tokens.bin"),
+                               dtype=self.dtype_t, mode="r+")
+        val_mask   = np.memmap(os.path.join(cache_dir, "sft_val_mask.bin"),
+                               dtype=self.dtype_m, mode="r+")
 
+        # ---- second pass: write tokens + masks directly into the mmaps
+        train_ptr = 0
+        val_ptr   = 0
+        n_records = 0
+        last_print = time.time()
+
+        for path in shard_paths:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    rec = _safe_load_line(line)
+                    if rec is None: continue
+                    result = format_and_tokenise(
+                        rec, tokenizer, token_ids, max_len=max_len_per_example
+                    )
+                    if result is None: continue
+
+                    ids, lmask = result
+                    tok_arr  = np.array(ids,   dtype=self.dtype_t)
+                    mask_arr = np.array(lmask, dtype=self.dtype_m)
+                    sep_tok  = np.array([eos_id], dtype=self.dtype_t)
+                    sep_mask = np.array([0],      dtype=self.dtype_m)
+
+                    if _is_val(n_records, val_fraction):
+                        n = len(tok_arr)
+                        val_tok [val_ptr : val_ptr + n]     = tok_arr
+                        val_mask[val_ptr : val_ptr + n]     = mask_arr
+                        val_tok [val_ptr + n]               = sep_tok[0]
+                        val_mask[val_ptr + n]               = sep_mask[0]
+                        val_ptr += n + 1
+                    else:
+                        n = len(tok_arr)
+                        train_tok [train_ptr : train_ptr + n] = tok_arr
+                        train_mask[train_ptr : train_ptr + n] = mask_arr
+                        train_tok [train_ptr + n]             = sep_tok[0]
+                        train_mask[train_ptr + n]             = sep_mask[0]
+                        train_ptr += n + 1
+
+                    n_records += 1
+                    if time.time() - last_print > 5:
+                        print(f"[SFTDataset] packing … {n_records:,} records written",
+                              end="\r")
+                        last_print = time.time()
+
+        train_tok.flush(); train_mask.flush()
+        val_tok.flush();   val_mask.flush()
+        print(f"\n[SFTDataset] packed {n_records:,} records in "
+              f"{time.time()-t0:.1f}s total")
+
+    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return max(0, (len(self.tokens) - 1) // self.seq_len)
 
     def get_batch(self, batch_size: int, device: torch.device):
-        """Sample `batch_size` random windows, return (x, y, loss_mask)."""
+        """Sample `batch_size` random windows; return (x, y, loss_mask)."""
         n = len(self)
         if n == 0:
-            raise RuntimeError("Dataset has no complete windows.")
-
+            raise RuntimeError(
+                "SFT dataset has no complete windows. "
+                "Try smaller --seq-len or re-run download_sft_data.py with a larger --target-size."
+            )
         starts = torch.randint(0, n, (batch_size,)) * self.seq_len
-
         xs, ys, ms = [], [], []
         for s in starts.tolist():
-            s = min(s, len(self.tokens) - self.seq_len - 1)
-            xs.append(torch.from_numpy(self.tokens[s     : s + self.seq_len    ].astype(np.int64)))
-            ys.append(torch.from_numpy(self.tokens[s + 1 : s + self.seq_len + 1].astype(np.int64)))
-            ms.append(torch.from_numpy(self.mask  [s + 1 : s + self.seq_len + 1].astype(np.float32)))
-
+            s = min(int(s), len(self.tokens) - self.seq_len - 1)
+            xs.append(torch.from_numpy(
+                self.tokens[s     : s + self.seq_len    ].astype(np.int64)))
+            ys.append(torch.from_numpy(
+                self.tokens[s + 1 : s + self.seq_len + 1].astype(np.int64)))
+            ms.append(torch.from_numpy(
+                self.mask  [s + 1 : s + self.seq_len + 1].astype(np.float32)))
         x = torch.stack(xs)
         y = torch.stack(ys)
         m = torch.stack(ms)
-
         if device.type == "cuda":
             x = x.pin_memory().to(device, non_blocking=True)
             y = y.pin_memory().to(device, non_blocking=True)
             m = m.pin_memory().to(device, non_blocking=True)
         else:
             x, y, m = x.to(device), y.to(device), m.to(device)
-
         return x, y, m
+
+
+def _safe_load_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _is_val(record_idx: int, val_fraction: float) -> bool:
+    """Deterministic train/val split: every Nth record goes to val."""
+    if val_fraction <= 0:
+        return False
+    period = max(1, round(1.0 / val_fraction))
+    return (record_idx % period) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -683,20 +788,25 @@ def train(args):
     # ------------------------------------------------------------------ data
     if master:
         print(f"\nBuilding SFT dataset from {args.data_dir} …")
+        print(f"Packed cache : {args.cache_dir}")
 
     train_ds = SFTDataset(
         args.data_dir, tokenizer,
         seq_len=args.seq_len,
         max_len_per_example=args.max_len_per_example,
+        cache_dir=args.cache_dir,
         rank=rank, world_size=world_size,
         split="train", val_fraction=args.val_fraction,
+        vocab_size=tokenizer.get_vocab_size(),
     )
     val_ds = SFTDataset(
         args.data_dir, tokenizer,
         seq_len=args.seq_len,
         max_len_per_example=args.max_len_per_example,
+        cache_dir=args.cache_dir,
         rank=rank, world_size=world_size,
         split="val", val_fraction=args.val_fraction,
+        vocab_size=tokenizer.get_vocab_size(),
     )
 
     if len(train_ds) == 0:
@@ -897,10 +1007,13 @@ def smoke_test():
 
     # Build dataset
     os.makedirs(os.path.join(tmp, "sft_data", "math"), exist_ok=True)
+    cache_dir = os.path.join(tmp, "sft_packed")
     ds = SFTDataset(
         os.path.join(tmp, "sft_data"), tokenizer,
         seq_len=64, max_len_per_example=128,
+        cache_dir=cache_dir,
         split="train", val_fraction=0.1,
+        vocab_size=tokenizer.get_vocab_size(),
     )
     print(f"Dataset windows: {len(ds)}")
 
@@ -957,6 +1070,8 @@ def parse_args():
                    help="Tokenizer directory from train_tokenizer.py")
     p.add_argument("--data-dir",   default="./sft_data",
                    help="SFT data directory from download_sft_data.py")
+    p.add_argument("--cache-dir",  default="./sft_packed",
+                   help="Where to cache the packed memmap files (built once, reused)")
     p.add_argument("--out-dir",    default="./sft_checkpoints")
     p.add_argument("--resume",     default=None,
                    help="SFT checkpoint to resume from")
