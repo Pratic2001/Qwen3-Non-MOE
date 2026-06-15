@@ -29,8 +29,8 @@ Resume from checkpoint:
     python train.py --resume ./checkpoints/ckpt_step5000.pt
 
 Recommended command for RTX 4090 (0.3B model):
-    python train.py --model-size 0.3B --data-dir ./packed \\
-        --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \\
+    python train.py --model-size 0.3B --data-dir ./packed \
+        --seq-len 2048 --batch-size 32 --grad-accum-steps 4 \
         --compile --out-dir ./checkpoints
 """
 

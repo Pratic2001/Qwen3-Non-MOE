@@ -36,26 +36,26 @@ Template produced for each record:
 
 Usage:
     # Full fine-tune (small model / LoRA for large)
-    python sft.py \\
-        --checkpoint ./checkpoints/latest.pt \\
-        --tokenizer  ./tokenizer \\
-        --data-dir   ./sft_data \\
+    python sft.py \
+        --checkpoint ./checkpoints/latest.pt \
+        --tokenizer  ./tokenizer \
+        --data-dir   ./sft_data \
         --out-dir    ./sft_checkpoints
 
     # LoRA fine-tune (recommended for 1B+ on a single 4090)
-    python sft.py \\
-        --checkpoint ./checkpoints/latest.pt \\
-        --tokenizer  ./tokenizer \\
-        --data-dir   ./sft_data \\
-        --lora --lora-rank 64 --lora-alpha 128 \\
+    python sft.py \
+        --checkpoint ./checkpoints/latest.pt \
+        --tokenizer  ./tokenizer \
+        --data-dir   ./sft_data \
+        --lora --lora-rank 64 --lora-alpha 128 \
         --out-dir    ./sft_checkpoints
 
     # Multi-GPU
     torchrun --nproc_per_node=4 sft.py --checkpoint ... --lora
 
     # Merge LoRA weights back into the base model after training
-    python sft.py --merge-lora \\
-        --checkpoint ./sft_checkpoints/latest.pt \\
+    python sft.py --merge-lora \
+        --checkpoint ./sft_checkpoints/latest.pt \
         --out-dir    ./sft_merged
 """
 
