@@ -105,10 +105,13 @@ class LoRALinear(nn.Module):
         self.rank  = rank
         self.scale = alpha / rank
 
+        device = linear.weight.device
+        dtype  = linear.weight.dtype
+
         # Kaiming initialisation for A, zero for B (so adapter starts as
         # identity — the base model is unchanged at the start of SFT)
-        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        self.lora_A = nn.Parameter(torch.empty(rank, in_f, device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, rank, device=device, dtype=dtype))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
