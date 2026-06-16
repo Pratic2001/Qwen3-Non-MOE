@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sft.py
+sft_standalone.py
 
 Supervised Fine-Tuning (SFT) script — Stage 1 of reasoning post-training.
 
@@ -36,14 +36,14 @@ Template produced for each record:
 
 Usage:
     # Full fine-tune (small model / LoRA for large)
-    python sft.py \\
+    python sft_standalone.py \\
         --checkpoint ./checkpoints/latest.pt \\
         --tokenizer  ./tokenizer \\
         --data-dir   ./sft_data \\
         --out-dir    ./sft_checkpoints
 
     # LoRA fine-tune (recommended for 1B+ on a single 4090)
-    python sft.py \\
+    python sft_standalone.py \\
         --checkpoint ./checkpoints/latest.pt \\
         --tokenizer  ./tokenizer \\
         --data-dir   ./sft_data \\
@@ -51,10 +51,10 @@ Usage:
         --out-dir    ./sft_checkpoints
 
     # Multi-GPU
-    torchrun --nproc_per_node=4 sft.py --checkpoint ... --lora
+    torchrun --nproc_per_node=4 sft_standalone.py --checkpoint ... --lora
 
     # Merge LoRA weights back into the base model after training
-    python sft.py --merge-lora \\
+    python sft_standalone.py --merge-lora \\
         --checkpoint ./sft_checkpoints/latest.pt \\
         --out-dir    ./sft_merged
 """
@@ -927,7 +927,7 @@ def train(args):
         print(f"\nSFT complete. Best val loss: {best_val_loss:.4f}")
         if is_lora:
             print(f"\nTo merge LoRA into base weights for deployment:")
-            print(f"  python sft.py --merge-lora "
+            print(f"  python sft_standalone.py --merge-lora "
                   f"--checkpoint {args.out_dir}/latest.pt "
                   f"--out-dir ./sft_merged")
 
