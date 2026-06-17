@@ -1107,6 +1107,16 @@ def parse_args():
     return p.parse_args()
 
 
+def _has_sft_manifests(cache_dir: str) -> bool:
+    """True if at least one pack_sft_data.py worker manifest is present."""
+    if not os.path.isdir(cache_dir):
+        return False
+    return any(
+        p.name.startswith("sft_manifest.w") and p.name.endswith(".json")
+        for p in Path(cache_dir).iterdir()
+    )
+
+
 # ---------------------------------------------------------------------------
 # ── ENTRY ───────────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -1153,14 +1163,3 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# ── HELPERS ─────────────────────────────────────────────────────────────────
-# ---------------------------------------------------------------------------
-
-def _has_sft_manifests(cache_dir: str) -> bool:
-    """True if at least one pack_sft_data.py worker manifest is present."""
-    if not os.path.isdir(cache_dir):
-        return False
-    return any(
-        p.name.startswith("sft_manifest.w") and p.name.endswith(".json")
-        for p in Path(cache_dir).iterdir()
-    )
