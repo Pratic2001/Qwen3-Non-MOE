@@ -1,0 +1,1132 @@
+nohup: ignoring input
+[Resume] loaded config from checkpoint
+Model params : 299,392,704  (0.299B)
+GPU          : NVIDIA GeForce RTX 4090
+VRAM         : 23.5 GB total, ~3.3 GB for model+grads+optimizer
+[compile] torch.compile(mode='default')…
+          First step will be slow (~60-120s). Subsequent steps are fast.
+[DataLoader rank 0] ./packed/train.bin: 272,474,131 tokens, shard [0:272474131]
+[DataLoader rank 0] ./packed/val.bin: 1,369,216 tokens, shard [0:1369216]
+[Optimizer] decay=276,824,064  no_decay=22,568,640
+[Checkpoint] resumed from ./checkpoints/latest.pt at step 47700
+GPU peak bf16: 165.2 TFLOP/s
+
+Tokens / optimizer step : 32,768
+Effective batch size    : 32
+Max steps               : 100,000
+Checkpoint every        : 150 steps
+Total tokens (planned)  : 3,276,800,000
+
+step   47700 | loss 1.4684 | lr 1.79e-04 | grad 0.075 | 113.4k tok/s | mfu 114.07%
+step   47710 | loss 13.8450 | lr 1.79e-04 | grad 0.768 | 37.5k tok/s | mfu 37.67%
+step   47720 | loss 13.9949 | lr 1.79e-04 | grad 0.732 | 37.4k tok/s | mfu 37.60%
+step   47730 | loss 14.4119 | lr 1.79e-04 | grad 0.728 | 37.4k tok/s | mfu 37.56%
+step   47740 | loss 14.3244 | lr 1.79e-04 | grad 0.732 | 37.3k tok/s | mfu 37.53%
+step   47750 | loss 13.9475 | lr 1.79e-04 | grad 0.721 | 37.3k tok/s | mfu 37.49%
+step   47760 | loss 14.8256 | lr 1.79e-04 | grad 0.740 | 37.3k tok/s | mfu 37.50%
+step   47770 | loss 14.1456 | lr 1.79e-04 | grad 0.842 | 37.3k tok/s | mfu 37.47%
+step   47780 | loss 14.7685 | lr 1.79e-04 | grad 0.734 | 37.3k tok/s | mfu 37.46%
+step   47790 | loss 14.5188 | lr 1.79e-04 | grad 0.723 | 37.2k tok/s | mfu 37.44%
+step   47800 | loss 14.4103 | lr 1.79e-04 | grad 0.773 | 37.2k tok/s | mfu 37.44%
+step   47810 | loss 13.5458 | lr 1.79e-04 | grad 0.841 | 37.2k tok/s | mfu 37.42%
+step   47820 | loss 14.1011 | lr 1.79e-04 | grad 0.738 | 37.2k tok/s | mfu 37.40%
+step   47830 | loss 14.0247 | lr 1.79e-04 | grad 0.718 | 37.2k tok/s | mfu 37.42%
+step   47840 | loss 14.4484 | lr 1.79e-04 | grad 0.733 | 37.2k tok/s | mfu 37.41%
+step   47850 | loss 14.0481 | lr 1.79e-04 | grad 0.753 | 37.2k tok/s | mfu 37.40%
+[Checkpoint] saved ./checkpoints/ckpt_step0047850.pt
+[Checkpoint] pruned checkpoints/ckpt_step0047400.pt
+step   47860 | loss 14.1817 | lr 1.79e-04 | grad 0.733 | 32.0k tok/s | mfu 32.19%
+step   47870 | loss 13.9838 | lr 1.79e-04 | grad 0.734 | 37.2k tok/s | mfu 37.43%
+step   47880 | loss 14.3564 | lr 1.78e-04 | grad 0.739 | 37.2k tok/s | mfu 37.43%
+step   47890 | loss 14.1828 | lr 1.78e-04 | grad 0.757 | 37.2k tok/s | mfu 37.41%
+step   47900 | loss 14.6527 | lr 1.78e-04 | grad 0.748 | 37.2k tok/s | mfu 37.42%
+step   47910 | loss 14.1174 | lr 1.78e-04 | grad 0.722 | 37.2k tok/s | mfu 37.42%
+step   47920 | loss 14.0983 | lr 1.78e-04 | grad 0.747 | 37.2k tok/s | mfu 37.42%
+step   47930 | loss 13.9435 | lr 1.78e-04 | grad 0.749 | 37.2k tok/s | mfu 37.41%
+step   47940 | loss 14.6960 | lr 1.78e-04 | grad 0.734 | 37.2k tok/s | mfu 37.40%
+step   47950 | loss 14.4317 | lr 1.78e-04 | grad 0.744 | 37.2k tok/s | mfu 37.40%
+step   47960 | loss 13.2881 | lr 1.78e-04 | grad 0.713 | 37.2k tok/s | mfu 37.40%
+step   47970 | loss 13.7430 | lr 1.78e-04 | grad 0.724 | 37.2k tok/s | mfu 37.41%
+step   47980 | loss 14.4354 | lr 1.78e-04 | grad 0.762 | 37.2k tok/s | mfu 37.39%
+step   47990 | loss 13.9239 | lr 1.78e-04 | grad 0.734 | 37.2k tok/s | mfu 37.40%
+step   48000 | loss 13.7167 | lr 1.78e-04 | grad 0.728 | 37.2k tok/s | mfu 37.40%
+  [eval] step   48000 | val_loss 4.0749
+[Checkpoint] saved ./checkpoints/ckpt_step0048000.pt
+[Checkpoint] pruned checkpoints/ckpt_step0047550.pt
+step   48010 | loss 14.5656 | lr 1.78e-04 | grad 0.740 | 21.6k tok/s | mfu 21.67%
+step   48020 | loss 14.4065 | lr 1.78e-04 | grad 0.741 | 36.4k tok/s | mfu 36.58%
+step   48030 | loss 14.0960 | lr 1.78e-04 | grad 0.724 | 37.2k tok/s | mfu 37.42%
+step   48040 | loss 13.6917 | lr 1.78e-04 | grad 0.719 | 37.2k tok/s | mfu 37.40%
+step   48050 | loss 14.0178 | lr 1.78e-04 | grad 0.732 | 37.2k tok/s | mfu 37.39%
+step   48060 | loss 13.7057 | lr 1.78e-04 | grad 0.735 | 37.2k tok/s | mfu 37.39%
+step   48070 | loss 14.2150 | lr 1.78e-04 | grad 0.726 | 37.2k tok/s | mfu 37.39%
+step   48080 | loss 14.3867 | lr 1.78e-04 | grad 0.751 | 37.2k tok/s | mfu 37.38%
+step   48090 | loss 14.3376 | lr 1.78e-04 | grad 0.737 | 37.2k tok/s | mfu 37.38%
+step   48100 | loss 14.2791 | lr 1.78e-04 | grad 0.747 | 37.2k tok/s | mfu 37.38%
+step   48110 | loss 14.2541 | lr 1.77e-04 | grad 0.731 | 37.2k tok/s | mfu 37.39%
+step   48120 | loss 14.1219 | lr 1.77e-04 | grad 0.731 | 37.2k tok/s | mfu 37.38%
+step   48130 | loss 14.1459 | lr 1.77e-04 | grad 0.733 | 37.2k tok/s | mfu 37.39%
+step   48140 | loss 13.9617 | lr 1.77e-04 | grad 0.734 | 37.2k tok/s | mfu 37.39%
+step   48150 | loss 14.3108 | lr 1.77e-04 | grad 0.734 | 37.2k tok/s | mfu 37.39%
+[Checkpoint] saved ./checkpoints/ckpt_step0048150.pt
+[Checkpoint] pruned checkpoints/ckpt_step0047700.pt
+step   48160 | loss 14.5742 | lr 1.77e-04 | grad 0.747 | 30.8k tok/s | mfu 30.94%
+step   48170 | loss 14.0109 | lr 1.77e-04 | grad 0.721 | 37.2k tok/s | mfu 37.39%
+step   48180 | loss 14.0980 | lr 1.77e-04 | grad 0.731 | 37.2k tok/s | mfu 37.40%
+step   48190 | loss 14.2754 | lr 1.77e-04 | grad 0.721 | 37.2k tok/s | mfu 37.39%
+step   48200 | loss 13.8753 | lr 1.77e-04 | grad 0.746 | 37.2k tok/s | mfu 37.39%
+step   48210 | loss 13.7825 | lr 1.77e-04 | grad 0.737 | 37.2k tok/s | mfu 37.39%
+step   48220 | loss 13.8860 | lr 1.77e-04 | grad 0.750 | 37.2k tok/s | mfu 37.38%
+step   48230 | loss 14.9234 | lr 1.77e-04 | grad 0.743 | 37.2k tok/s | mfu 37.37%
+step   48240 | loss 13.4093 | lr 1.77e-04 | grad 0.726 | 37.2k tok/s | mfu 37.38%
+step   48250 | loss 13.6768 | lr 1.77e-04 | grad 0.736 | 37.2k tok/s | mfu 37.37%
+step   48260 | loss 14.4466 | lr 1.77e-04 | grad 0.744 | 37.2k tok/s | mfu 37.37%
+step   48270 | loss 14.2071 | lr 1.77e-04 | grad 0.740 | 37.2k tok/s | mfu 37.36%
+step   48280 | loss 14.2411 | lr 1.77e-04 | grad 0.736 | 37.2k tok/s | mfu 37.37%
+step   48290 | loss 13.7356 | lr 1.77e-04 | grad 0.714 | 37.2k tok/s | mfu 37.37%
+step   48300 | loss 13.9400 | lr 1.77e-04 | grad 0.726 | 37.2k tok/s | mfu 37.38%
+[Checkpoint] saved ./checkpoints/ckpt_step0048300.pt
+[Checkpoint] pruned checkpoints/ckpt_step0047850.pt
+step   48310 | loss 14.0456 | lr 1.77e-04 | grad 0.742 | 30.9k tok/s | mfu 31.03%
+step   48320 | loss 13.5277 | lr 1.77e-04 | grad 0.727 | 37.2k tok/s | mfu 37.39%
+step   48330 | loss 15.1945 | lr 1.77e-04 | grad 0.740 | 29.5k tok/s | mfu 29.70%
+step   48340 | loss 14.1295 | lr 1.76e-04 | grad 0.748 | 37.2k tok/s | mfu 37.42%
+step   48350 | loss 14.1804 | lr 1.76e-04 | grad 0.731 | 37.2k tok/s | mfu 37.41%
+step   48360 | loss 14.5776 | lr 1.76e-04 | grad 0.762 | 37.2k tok/s | mfu 37.41%
+step   48370 | loss 14.1125 | lr 1.76e-04 | grad 0.738 | 37.2k tok/s | mfu 37.40%
+step   48380 | loss 14.1675 | lr 1.76e-04 | grad 0.742 | 37.2k tok/s | mfu 37.41%
+step   48390 | loss 14.2108 | lr 1.76e-04 | grad 0.748 | 37.2k tok/s | mfu 37.41%
+step   48400 | loss 13.6142 | lr 1.76e-04 | grad 0.727 | 37.2k tok/s | mfu 37.41%
+step   48410 | loss 13.8184 | lr 1.76e-04 | grad 0.737 | 37.2k tok/s | mfu 37.39%
+step   48420 | loss 14.1272 | lr 1.76e-04 | grad 0.780 | 37.2k tok/s | mfu 37.37%
+step   48430 | loss 14.0369 | lr 1.76e-04 | grad 0.745 | 37.1k tok/s | mfu 37.35%
+step   48440 | loss 13.7256 | lr 1.76e-04 | grad 0.723 | 37.2k tok/s | mfu 37.36%
+step   48450 | loss 14.2026 | lr 1.76e-04 | grad 0.730 | 37.1k tok/s | mfu 37.33%
+[Checkpoint] saved ./checkpoints/ckpt_step0048450.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048000.pt
+step   48460 | loss 13.6476 | lr 1.76e-04 | grad 0.730 | 32.0k tok/s | mfu 32.17%
+step   48470 | loss 14.6208 | lr 1.76e-04 | grad 0.740 | 37.2k tok/s | mfu 37.41%
+step   48480 | loss 14.1297 | lr 1.76e-04 | grad 0.735 | 37.2k tok/s | mfu 37.40%
+step   48490 | loss 13.9580 | lr 1.76e-04 | grad 0.749 | 37.2k tok/s | mfu 37.37%
+step   48500 | loss 13.7633 | lr 1.76e-04 | grad 0.805 | 37.1k tok/s | mfu 37.35%
+  [eval] step   48500 | val_loss 4.0286
+step   48510 | loss 14.1216 | lr 1.76e-04 | grad 0.777 | 27.5k tok/s | mfu 27.65%
+step   48520 | loss 14.3605 | lr 1.76e-04 | grad 0.772 | 37.1k tok/s | mfu 37.35%
+step   48530 | loss 13.9989 | lr 1.76e-04 | grad 0.737 | 37.2k tok/s | mfu 37.36%
+step   48540 | loss 14.2007 | lr 1.76e-04 | grad 0.734 | 37.2k tok/s | mfu 37.38%
+step   48550 | loss 14.2673 | lr 1.76e-04 | grad 0.733 | 37.2k tok/s | mfu 37.38%
+step   48560 | loss 14.2576 | lr 1.76e-04 | grad 0.736 | 37.2k tok/s | mfu 37.38%
+step   48570 | loss 14.4418 | lr 1.76e-04 | grad 0.748 | 37.2k tok/s | mfu 37.37%
+step   48580 | loss 14.1834 | lr 1.75e-04 | grad 0.740 | 37.2k tok/s | mfu 37.37%
+step   48590 | loss 14.0150 | lr 1.75e-04 | grad 0.755 | 37.2k tok/s | mfu 37.37%
+step   48600 | loss 14.3840 | lr 1.75e-04 | grad 0.742 | 37.2k tok/s | mfu 37.36%
+[Checkpoint] saved ./checkpoints/ckpt_step0048600.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048150.pt
+step   48610 | loss 14.2402 | lr 1.75e-04 | grad 0.729 | 32.0k tok/s | mfu 32.17%
+step   48620 | loss 13.9979 | lr 1.75e-04 | grad 0.740 | 37.2k tok/s | mfu 37.38%
+step   48630 | loss 14.0836 | lr 1.75e-04 | grad 0.740 | 37.1k tok/s | mfu 37.34%
+step   48640 | loss 14.6199 | lr 1.75e-04 | grad 0.745 | 37.2k tok/s | mfu 37.40%
+step   48650 | loss 14.6102 | lr 1.75e-04 | grad 0.768 | 37.2k tok/s | mfu 37.40%
+step   48660 | loss 13.9704 | lr 1.75e-04 | grad 0.727 | 37.2k tok/s | mfu 37.39%
+step   48670 | loss 13.5992 | lr 1.75e-04 | grad 0.744 | 37.2k tok/s | mfu 37.39%
+step   48680 | loss 13.4708 | lr 1.75e-04 | grad 0.740 | 37.2k tok/s | mfu 37.39%
+step   48690 | loss 14.0603 | lr 1.75e-04 | grad 0.733 | 37.2k tok/s | mfu 37.39%
+step   48700 | loss 14.5638 | lr 1.75e-04 | grad 0.763 | 37.2k tok/s | mfu 37.38%
+step   48710 | loss 14.2497 | lr 1.75e-04 | grad 0.735 | 37.2k tok/s | mfu 37.38%
+step   48720 | loss 14.0180 | lr 1.75e-04 | grad 0.732 | 37.2k tok/s | mfu 37.38%
+step   48730 | loss 14.1374 | lr 1.75e-04 | grad 0.745 | 37.1k tok/s | mfu 37.34%
+step   48740 | loss 14.6517 | lr 1.75e-04 | grad 0.742 | 37.2k tok/s | mfu 37.37%
+step   48750 | loss 14.4814 | lr 1.75e-04 | grad 0.755 | 37.2k tok/s | mfu 37.37%
+[Checkpoint] saved ./checkpoints/ckpt_step0048750.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048300.pt
+step   48760 | loss 14.0232 | lr 1.75e-04 | grad 0.735 | 32.0k tok/s | mfu 32.16%
+step   48770 | loss 14.0198 | lr 1.75e-04 | grad 0.757 | 37.2k tok/s | mfu 37.37%
+step   48780 | loss 13.7502 | lr 1.75e-04 | grad 0.775 | 37.2k tok/s | mfu 37.36%
+step   48790 | loss 13.7983 | lr 1.75e-04 | grad 0.746 | 37.2k tok/s | mfu 37.36%
+step   48800 | loss 14.5628 | lr 1.75e-04 | grad 0.733 | 37.2k tok/s | mfu 37.36%
+step   48810 | loss 14.5509 | lr 1.74e-04 | grad 0.754 | 35.9k tok/s | mfu 36.08%
+step   48820 | loss 14.3506 | lr 1.74e-04 | grad 0.758 | 37.2k tok/s | mfu 37.39%
+step   48830 | loss 14.1319 | lr 1.74e-04 | grad 0.749 | 37.2k tok/s | mfu 37.38%
+step   48840 | loss 13.9410 | lr 1.74e-04 | grad 0.745 | 37.2k tok/s | mfu 37.40%
+step   48850 | loss 14.5582 | lr 1.74e-04 | grad 0.797 | 37.2k tok/s | mfu 37.39%
+step   48860 | loss 14.0874 | lr 1.74e-04 | grad 0.744 | 37.2k tok/s | mfu 37.39%
+step   48870 | loss 14.0762 | lr 1.74e-04 | grad 0.739 | 37.2k tok/s | mfu 37.37%
+step   48880 | loss 13.5557 | lr 1.74e-04 | grad 0.733 | 37.2k tok/s | mfu 37.38%
+step   48890 | loss 14.0242 | lr 1.74e-04 | grad 0.727 | 37.2k tok/s | mfu 37.40%
+step   48900 | loss 14.8633 | lr 1.74e-04 | grad 0.776 | 37.2k tok/s | mfu 37.41%
+[Checkpoint] saved ./checkpoints/ckpt_step0048900.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048450.pt
+step   48910 | loss 14.0473 | lr 1.74e-04 | grad 0.744 | 32.0k tok/s | mfu 32.16%
+step   48920 | loss 13.9403 | lr 1.74e-04 | grad 0.737 | 37.2k tok/s | mfu 37.41%
+step   48930 | loss 13.7071 | lr 1.74e-04 | grad 0.737 | 37.2k tok/s | mfu 37.39%
+step   48940 | loss 13.9368 | lr 1.74e-04 | grad 0.737 | 37.2k tok/s | mfu 37.41%
+step   48950 | loss 13.5618 | lr 1.74e-04 | grad 0.740 | 37.2k tok/s | mfu 37.40%
+step   48960 | loss 13.5399 | lr 1.74e-04 | grad 0.755 | 37.2k tok/s | mfu 37.36%
+step   48970 | loss 14.1953 | lr 1.74e-04 | grad 0.737 | 37.2k tok/s | mfu 37.36%
+step   48980 | loss 14.1832 | lr 1.74e-04 | grad 0.751 | 37.2k tok/s | mfu 37.36%
+step   48990 | loss 13.7169 | lr 1.74e-04 | grad 0.731 | 37.2k tok/s | mfu 37.37%
+step   49000 | loss 14.1830 | lr 1.74e-04 | grad 0.739 | 37.2k tok/s | mfu 37.37%
+  [eval] step   49000 | val_loss 4.0495
+step   49010 | loss 14.0743 | lr 1.74e-04 | grad 0.732 | 27.5k tok/s | mfu 27.67%
+step   49020 | loss 14.6701 | lr 1.74e-04 | grad 0.755 | 37.2k tok/s | mfu 37.37%
+step   49030 | loss 14.1748 | lr 1.74e-04 | grad 0.756 | 37.2k tok/s | mfu 37.38%
+step   49040 | loss 13.3211 | lr 1.73e-04 | grad 0.749 | 37.2k tok/s | mfu 37.38%
+step   49050 | loss 15.0252 | lr 1.73e-04 | grad 0.746 | 37.2k tok/s | mfu 37.37%
+[Checkpoint] saved ./checkpoints/ckpt_step0049050.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048600.pt
+step   49060 | loss 14.6201 | lr 1.73e-04 | grad 0.761 | 4.8k tok/s | mfu 4.78%
+step   49070 | loss 13.5423 | lr 1.73e-04 | grad 0.745 | 37.4k tok/s | mfu 37.59%
+step   49080 | loss 14.6747 | lr 1.73e-04 | grad 0.759 | 37.3k tok/s | mfu 37.55%
+step   49090 | loss 13.2857 | lr 1.73e-04 | grad 0.737 | 37.3k tok/s | mfu 37.51%
+step   49100 | loss 13.8574 | lr 1.73e-04 | grad 0.749 | 37.3k tok/s | mfu 37.51%
+step   49110 | loss 13.8431 | lr 1.73e-04 | grad 0.736 | 37.3k tok/s | mfu 37.50%
+step   49120 | loss 14.2235 | lr 1.73e-04 | grad 0.746 | 37.3k tok/s | mfu 37.48%
+step   49130 | loss 14.6434 | lr 1.73e-04 | grad 0.771 | 37.3k tok/s | mfu 37.48%
+step   49140 | loss 14.2390 | lr 1.73e-04 | grad 0.748 | 37.3k tok/s | mfu 37.47%
+step   49150 | loss 14.2035 | lr 1.73e-04 | grad 0.744 | 37.2k tok/s | mfu 37.45%
+step   49160 | loss 13.7324 | lr 1.73e-04 | grad 0.738 | 37.2k tok/s | mfu 37.43%
+step   49170 | loss 14.1521 | lr 1.73e-04 | grad 0.737 | 37.2k tok/s | mfu 37.43%
+step   49180 | loss 14.0706 | lr 1.73e-04 | grad 0.750 | 37.2k tok/s | mfu 37.43%
+step   49190 | loss 13.9908 | lr 1.73e-04 | grad 0.739 | 37.2k tok/s | mfu 37.42%
+step   49200 | loss 13.8645 | lr 1.73e-04 | grad 0.736 | 37.2k tok/s | mfu 37.42%
+[Checkpoint] saved ./checkpoints/ckpt_step0049200.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048750.pt
+step   49210 | loss 14.2158 | lr 1.73e-04 | grad 0.739 | 32.0k tok/s | mfu 32.18%
+step   49220 | loss 14.5071 | lr 1.73e-04 | grad 0.751 | 37.2k tok/s | mfu 37.44%
+step   49230 | loss 14.1679 | lr 1.73e-04 | grad 0.740 | 37.2k tok/s | mfu 37.42%
+step   49240 | loss 13.8941 | lr 1.73e-04 | grad 0.739 | 37.2k tok/s | mfu 37.42%
+step   49250 | loss 13.8115 | lr 1.73e-04 | grad 0.729 | 37.2k tok/s | mfu 37.41%
+step   49260 | loss 13.6221 | lr 1.73e-04 | grad 0.744 | 37.2k tok/s | mfu 37.40%
+step   49270 | loss 13.5646 | lr 1.72e-04 | grad 0.756 | 37.2k tok/s | mfu 37.41%
+step   49280 | loss 13.8744 | lr 1.72e-04 | grad 0.751 | 37.2k tok/s | mfu 37.41%
+step   49290 | loss 14.1561 | lr 1.72e-04 | grad 0.763 | 37.2k tok/s | mfu 37.41%
+step   49300 | loss 13.7134 | lr 1.72e-04 | grad 0.756 | 37.2k tok/s | mfu 37.42%
+step   49310 | loss 13.4678 | lr 1.72e-04 | grad 0.735 | 37.2k tok/s | mfu 37.41%
+step   49320 | loss 13.8727 | lr 1.72e-04 | grad 0.735 | 37.2k tok/s | mfu 37.40%
+step   49330 | loss 13.9842 | lr 1.72e-04 | grad 0.747 | 37.2k tok/s | mfu 37.40%
+step   49340 | loss 13.9769 | lr 1.72e-04 | grad 0.745 | 37.2k tok/s | mfu 37.40%
+step   49350 | loss 13.6503 | lr 1.72e-04 | grad 0.733 | 37.2k tok/s | mfu 37.40%
+[Checkpoint] saved ./checkpoints/ckpt_step0049350.pt
+[Checkpoint] pruned checkpoints/ckpt_step0048900.pt
+step   49360 | loss 14.4551 | lr 1.72e-04 | grad 0.760 | 27.3k tok/s | mfu 27.46%
+step   49370 | loss 14.3778 | lr 1.72e-04 | grad 0.756 | 37.2k tok/s | mfu 37.43%
+step   49380 | loss 14.3753 | lr 1.72e-04 | grad 0.753 | 37.2k tok/s | mfu 37.41%
+step   49390 | loss 14.4216 | lr 1.72e-04 | grad 0.755 | 37.2k tok/s | mfu 37.40%
+step   49400 | loss 13.7104 | lr 1.72e-04 | grad 0.727 | 37.2k tok/s | mfu 37.40%
+step   49410 | loss 14.1366 | lr 1.72e-04 | grad 0.749 | 37.2k tok/s | mfu 37.39%
+step   49420 | loss 14.1770 | lr 1.72e-04 | grad 0.753 | 37.2k tok/s | mfu 37.39%
+step   49430 | loss 13.9592 | lr 1.72e-04 | grad 0.734 | 37.2k tok/s | mfu 37.39%
+step   49440 | loss 14.4735 | lr 1.72e-04 | grad 0.745 | 37.2k tok/s | mfu 37.40%
+step   49450 | loss 13.9187 | lr 1.72e-04 | grad 0.744 | 37.2k tok/s | mfu 37.37%
+step   49460 | loss 13.7847 | lr 1.72e-04 | grad 0.736 | 37.2k tok/s | mfu 37.38%
+step   49470 | loss 13.7012 | lr 1.72e-04 | grad 0.744 | 37.2k tok/s | mfu 37.38%
+step   49480 | loss 14.5288 | lr 1.72e-04 | grad 0.768 | 37.2k tok/s | mfu 37.39%
+step   49490 | loss 13.9322 | lr 1.72e-04 | grad 0.753 | 37.2k tok/s | mfu 37.38%
+step   49500 | loss 14.2850 | lr 1.71e-04 | grad 0.746 | 37.2k tok/s | mfu 37.38%
+  [eval] step   49500 | val_loss 4.0296
+[Checkpoint] saved ./checkpoints/ckpt_step0049500.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049050.pt
+step   49510 | loss 13.4856 | lr 1.71e-04 | grad 0.766 | 24.6k tok/s | mfu 24.72%
+step   49520 | loss 13.5943 | lr 1.71e-04 | grad 0.743 | 37.2k tok/s | mfu 37.37%
+step   49530 | loss 14.3865 | lr 1.71e-04 | grad 0.752 | 37.2k tok/s | mfu 37.39%
+step   49540 | loss 14.4250 | lr 1.71e-04 | grad 0.769 | 37.2k tok/s | mfu 37.39%
+step   49550 | loss 14.3324 | lr 1.71e-04 | grad 0.738 | 37.2k tok/s | mfu 37.39%
+step   49560 | loss 14.1341 | lr 1.71e-04 | grad 0.760 | 37.2k tok/s | mfu 37.39%
+step   49570 | loss 14.0667 | lr 1.71e-04 | grad 0.748 | 37.2k tok/s | mfu 37.38%
+step   49580 | loss 14.1848 | lr 1.71e-04 | grad 0.747 | 37.2k tok/s | mfu 37.39%
+step   49590 | loss 14.3691 | lr 1.71e-04 | grad 0.770 | 37.2k tok/s | mfu 37.39%
+step   49600 | loss 14.5112 | lr 1.71e-04 | grad 0.758 | 37.2k tok/s | mfu 37.39%
+step   49610 | loss 14.1783 | lr 1.71e-04 | grad 0.751 | 37.2k tok/s | mfu 37.39%
+step   49620 | loss 14.1165 | lr 1.71e-04 | grad 0.751 | 37.2k tok/s | mfu 37.39%
+step   49630 | loss 14.1104 | lr 1.71e-04 | grad 0.742 | 37.2k tok/s | mfu 37.40%
+step   49640 | loss 13.8195 | lr 1.71e-04 | grad 0.732 | 37.2k tok/s | mfu 37.41%
+step   49650 | loss 14.4993 | lr 1.71e-04 | grad 0.743 | 37.2k tok/s | mfu 37.40%
+[Checkpoint] saved ./checkpoints/ckpt_step0049650.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049200.pt
+step   49660 | loss 13.9220 | lr 1.71e-04 | grad 0.746 | 32.0k tok/s | mfu 32.20%
+step   49670 | loss 14.3047 | lr 1.71e-04 | grad 0.757 | 37.2k tok/s | mfu 37.42%
+step   49680 | loss 14.4481 | lr 1.71e-04 | grad 0.771 | 37.2k tok/s | mfu 37.42%
+step   49690 | loss 14.0962 | lr 1.71e-04 | grad 0.744 | 37.2k tok/s | mfu 37.42%
+step   49700 | loss 13.2104 | lr 1.71e-04 | grad 0.732 | 37.2k tok/s | mfu 37.43%
+step   49710 | loss 13.5758 | lr 1.71e-04 | grad 0.746 | 37.2k tok/s | mfu 37.42%
+step   49720 | loss 13.6138 | lr 1.71e-04 | grad 0.744 | 37.2k tok/s | mfu 37.42%
+step   49730 | loss 13.9855 | lr 1.70e-04 | grad 0.761 | 37.2k tok/s | mfu 37.43%
+step   49740 | loss 13.8143 | lr 1.70e-04 | grad 0.748 | 37.2k tok/s | mfu 37.41%
+step   49750 | loss 13.4764 | lr 1.70e-04 | grad 0.732 | 37.2k tok/s | mfu 37.42%
+step   49760 | loss 13.3178 | lr 1.70e-04 | grad 0.737 | 37.2k tok/s | mfu 37.41%
+step   49770 | loss 13.9349 | lr 1.70e-04 | grad 0.749 | 37.2k tok/s | mfu 37.42%
+step   49780 | loss 13.9249 | lr 1.70e-04 | grad 0.746 | 37.2k tok/s | mfu 37.42%
+step   49790 | loss 14.3424 | lr 1.70e-04 | grad 0.786 | 37.2k tok/s | mfu 37.42%
+step   49800 | loss 14.4425 | lr 1.70e-04 | grad 0.779 | 37.2k tok/s | mfu 37.43%
+[Checkpoint] saved ./checkpoints/ckpt_step0049800.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049350.pt
+step   49810 | loss 13.9596 | lr 1.70e-04 | grad 0.801 | 28.2k tok/s | mfu 28.35%
+step   49820 | loss 13.9120 | lr 1.70e-04 | grad 0.751 | 37.2k tok/s | mfu 37.44%
+step   49830 | loss 14.3096 | lr 1.70e-04 | grad 0.763 | 37.2k tok/s | mfu 37.45%
+step   49840 | loss 14.4172 | lr 1.70e-04 | grad 0.748 | 37.2k tok/s | mfu 37.44%
+step   49850 | loss 14.4925 | lr 1.70e-04 | grad 0.748 | 37.2k tok/s | mfu 37.44%
+step   49860 | loss 13.8200 | lr 1.70e-04 | grad 0.748 | 37.2k tok/s | mfu 37.42%
+step   49870 | loss 13.7789 | lr 1.70e-04 | grad 0.751 | 37.2k tok/s | mfu 37.42%
+step   49880 | loss 13.6004 | lr 1.70e-04 | grad 0.744 | 37.2k tok/s | mfu 37.45%
+step   49890 | loss 14.0332 | lr 1.70e-04 | grad 0.757 | 37.2k tok/s | mfu 37.44%
+step   49900 | loss 13.9138 | lr 1.70e-04 | grad 0.771 | 37.2k tok/s | mfu 37.43%
+step   49910 | loss 14.1259 | lr 1.70e-04 | grad 0.754 | 37.2k tok/s | mfu 37.43%
+step   49920 | loss 14.0442 | lr 1.70e-04 | grad 0.747 | 37.2k tok/s | mfu 37.43%
+step   49930 | loss 14.4051 | lr 1.70e-04 | grad 0.747 | 37.2k tok/s | mfu 37.42%
+step   49940 | loss 13.7946 | lr 1.70e-04 | grad 0.753 | 37.2k tok/s | mfu 37.42%
+step   49950 | loss 14.4113 | lr 1.70e-04 | grad 0.772 | 37.2k tok/s | mfu 37.42%
+[Checkpoint] saved ./checkpoints/ckpt_step0049950.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049500.pt
+step   49960 | loss 13.8496 | lr 1.69e-04 | grad 0.750 | 32.1k tok/s | mfu 32.24%
+step   49970 | loss 14.1195 | lr 1.69e-04 | grad 0.763 | 37.2k tok/s | mfu 37.43%
+step   49980 | loss 13.5874 | lr 1.69e-04 | grad 0.767 | 37.2k tok/s | mfu 37.45%
+step   49990 | loss 13.7976 | lr 1.69e-04 | grad 0.748 | 37.2k tok/s | mfu 37.45%
+step   50000 | loss 14.4216 | lr 1.69e-04 | grad 0.760 | 37.3k tok/s | mfu 37.46%
+  [eval] step   50000 | val_loss 4.0619
+step   50010 | loss 13.4499 | lr 1.69e-04 | grad 0.755 | 27.6k tok/s | mfu 27.73%
+step   50020 | loss 13.7369 | lr 1.69e-04 | grad 0.746 | 37.2k tok/s | mfu 37.46%
+step   50030 | loss 13.7022 | lr 1.69e-04 | grad 0.762 | 37.2k tok/s | mfu 37.45%
+step   50040 | loss 13.5698 | lr 1.69e-04 | grad 0.743 | 37.2k tok/s | mfu 37.45%
+step   50050 | loss 13.4519 | lr 1.69e-04 | grad 0.752 | 37.2k tok/s | mfu 37.44%
+step   50060 | loss 13.7533 | lr 1.69e-04 | grad 0.826 | 37.2k tok/s | mfu 37.44%
+step   50070 | loss 14.4459 | lr 1.69e-04 | grad 0.744 | 37.2k tok/s | mfu 37.43%
+step   50080 | loss 14.0347 | lr 1.69e-04 | grad 0.742 | 37.2k tok/s | mfu 37.44%
+step   50090 | loss 14.0865 | lr 1.69e-04 | grad 0.748 | 37.2k tok/s | mfu 37.44%
+step   50100 | loss 14.3355 | lr 1.69e-04 | grad 0.756 | 37.2k tok/s | mfu 37.43%
+[Checkpoint] saved ./checkpoints/ckpt_step0050100.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049650.pt
+step   50110 | loss 14.1891 | lr 1.69e-04 | grad 0.851 | 32.0k tok/s | mfu 32.18%
+step   50120 | loss 13.7242 | lr 1.69e-04 | grad 0.751 | 37.2k tok/s | mfu 37.46%
+step   50130 | loss 14.1104 | lr 1.69e-04 | grad 0.748 | 37.2k tok/s | mfu 37.45%
+step   50140 | loss 14.2512 | lr 1.69e-04 | grad 0.794 | 37.2k tok/s | mfu 37.45%
+step   50150 | loss 13.4712 | lr 1.69e-04 | grad 0.744 | 37.2k tok/s | mfu 37.45%
+step   50160 | loss 14.2297 | lr 1.69e-04 | grad 0.762 | 37.3k tok/s | mfu 37.46%
+step   50170 | loss 13.8079 | lr 1.69e-04 | grad 0.748 | 37.2k tok/s | mfu 37.45%
+step   50180 | loss 13.4495 | lr 1.69e-04 | grad 0.743 | 37.3k tok/s | mfu 37.46%
+step   50190 | loss 14.1034 | lr 1.69e-04 | grad 0.765 | 37.3k tok/s | mfu 37.47%
+step   50200 | loss 14.1993 | lr 1.68e-04 | grad 0.766 | 37.3k tok/s | mfu 37.46%
+step   50210 | loss 13.8103 | lr 1.68e-04 | grad 0.745 | 37.3k tok/s | mfu 37.46%
+step   50220 | loss 13.9148 | lr 1.68e-04 | grad 0.758 | 37.2k tok/s | mfu 37.45%
+step   50230 | loss 13.4652 | lr 1.68e-04 | grad 0.762 | 37.3k tok/s | mfu 37.46%
+step   50240 | loss 14.0130 | lr 1.68e-04 | grad 0.763 | 37.3k tok/s | mfu 37.47%
+step   50250 | loss 14.4523 | lr 1.68e-04 | grad 0.761 | 37.3k tok/s | mfu 37.46%
+[Checkpoint] saved ./checkpoints/ckpt_step0050250.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049800.pt
+step   50260 | loss 13.6279 | lr 1.68e-04 | grad 0.742 | 28.4k tok/s | mfu 28.57%
+step   50270 | loss 13.6141 | lr 1.68e-04 | grad 0.755 | 37.3k tok/s | mfu 37.48%
+step   50280 | loss 14.1989 | lr 1.68e-04 | grad 0.764 | 37.3k tok/s | mfu 37.47%
+step   50290 | loss 13.5776 | lr 1.68e-04 | grad 0.758 | 37.3k tok/s | mfu 37.47%
+step   50300 | loss 14.0979 | lr 1.68e-04 | grad 0.767 | 37.2k tok/s | mfu 37.45%
+step   50310 | loss 14.2023 | lr 1.68e-04 | grad 0.760 | 37.3k tok/s | mfu 37.47%
+step   50320 | loss 13.7371 | lr 1.68e-04 | grad 0.747 | 37.3k tok/s | mfu 37.47%
+step   50330 | loss 13.8553 | lr 1.68e-04 | grad 0.768 | 37.3k tok/s | mfu 37.47%
+step   50340 | loss 13.5769 | lr 1.68e-04 | grad 0.750 | 37.3k tok/s | mfu 37.47%
+step   50350 | loss 13.5865 | lr 1.68e-04 | grad 0.758 | 37.3k tok/s | mfu 37.47%
+step   50360 | loss 13.8429 | lr 1.68e-04 | grad 0.756 | 37.3k tok/s | mfu 37.46%
+step   50370 | loss 13.7171 | lr 1.68e-04 | grad 0.760 | 37.3k tok/s | mfu 37.47%
+step   50380 | loss 13.6572 | lr 1.68e-04 | grad 0.812 | 37.3k tok/s | mfu 37.47%
+step   50390 | loss 13.6624 | lr 1.68e-04 | grad 0.759 | 37.3k tok/s | mfu 37.46%
+step   50400 | loss 13.2854 | lr 1.68e-04 | grad 0.759 | 37.3k tok/s | mfu 37.46%
+[Checkpoint] saved ./checkpoints/ckpt_step0050400.pt
+[Checkpoint] pruned checkpoints/ckpt_step0049950.pt
+step   50410 | loss 14.0605 | lr 1.68e-04 | grad 0.760 | 32.1k tok/s | mfu 32.26%
+step   50420 | loss 13.8757 | lr 1.68e-04 | grad 0.765 | 37.3k tok/s | mfu 37.47%
+step   50430 | loss 14.3563 | lr 1.67e-04 | grad 0.767 | 37.3k tok/s | mfu 37.46%
+step   50440 | loss 13.6416 | lr 1.67e-04 | grad 0.755 | 37.2k tok/s | mfu 37.44%
+step   50450 | loss 13.7641 | lr 1.67e-04 | grad 0.755 | 37.3k tok/s | mfu 37.46%
+step   50460 | loss 13.2108 | lr 1.67e-04 | grad 0.739 | 37.2k tok/s | mfu 37.45%
+step   50470 | loss 13.5753 | lr 1.67e-04 | grad 0.747 | 37.2k tok/s | mfu 37.45%
+step   50480 | loss 14.0644 | lr 1.67e-04 | grad 0.757 | 37.2k tok/s | mfu 37.45%
+step   50490 | loss 14.3333 | lr 1.67e-04 | grad 0.754 | 37.2k tok/s | mfu 37.45%
+step   50500 | loss 14.1354 | lr 1.67e-04 | grad 0.776 | 37.3k tok/s | mfu 37.46%
+  [eval] step   50500 | val_loss 4.0715
+step   50510 | loss 13.6694 | lr 1.67e-04 | grad 0.767 | 27.6k tok/s | mfu 27.73%
+step   50520 | loss 13.8007 | lr 1.67e-04 | grad 0.772 | 37.2k tok/s | mfu 37.45%
+step   50530 | loss 13.7262 | lr 1.67e-04 | grad 0.748 | 37.2k tok/s | mfu 37.45%
+step   50540 | loss 13.5788 | lr 1.67e-04 | grad 1.126 | 37.2k tok/s | mfu 37.45%
+step   50550 | loss 13.7454 | lr 1.67e-04 | grad 0.760 | 37.3k tok/s | mfu 37.46%
+[Checkpoint] saved ./checkpoints/ckpt_step0050550.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050100.pt
+step   50560 | loss 14.0547 | lr 1.67e-04 | grad 0.759 | 32.0k tok/s | mfu 32.22%
+step   50570 | loss 13.6809 | lr 1.67e-04 | grad 0.756 | 37.3k tok/s | mfu 37.47%
+step   50580 | loss 13.6427 | lr 1.67e-04 | grad 0.752 | 37.3k tok/s | mfu 37.48%
+step   50590 | loss 13.5089 | lr 1.67e-04 | grad 0.752 | 37.3k tok/s | mfu 37.47%
+step   50600 | loss 13.5406 | lr 1.67e-04 | grad 0.784 | 37.3k tok/s | mfu 37.48%
+step   50610 | loss 13.4538 | lr 1.67e-04 | grad 0.746 | 37.3k tok/s | mfu 37.48%
+step   50620 | loss 14.2624 | lr 1.67e-04 | grad 0.748 | 37.3k tok/s | mfu 37.47%
+step   50630 | loss 14.1021 | lr 1.67e-04 | grad 0.751 | 37.3k tok/s | mfu 37.46%
+step   50640 | loss 13.8869 | lr 1.67e-04 | grad 0.762 | 37.3k tok/s | mfu 37.46%
+step   50650 | loss 14.4594 | lr 1.67e-04 | grad 0.767 | 37.2k tok/s | mfu 37.46%
+step   50660 | loss 14.3990 | lr 1.66e-04 | grad 0.767 | 37.3k tok/s | mfu 37.46%
+step   50670 | loss 13.6598 | lr 1.66e-04 | grad 0.763 | 37.3k tok/s | mfu 37.47%
+step   50680 | loss 13.4297 | lr 1.66e-04 | grad 0.744 | 37.3k tok/s | mfu 37.46%
+step   50690 | loss 13.5978 | lr 1.66e-04 | grad 0.872 | 37.3k tok/s | mfu 37.46%
+step   50700 | loss 14.7997 | lr 1.66e-04 | grad 0.768 | 37.3k tok/s | mfu 37.47%
+[Checkpoint] saved ./checkpoints/ckpt_step0050700.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050250.pt
+step   50710 | loss 13.7211 | lr 1.66e-04 | grad 0.750 | 32.1k tok/s | mfu 32.29%
+step   50720 | loss 13.7343 | lr 1.66e-04 | grad 0.753 | 37.3k tok/s | mfu 37.51%
+step   50730 | loss 13.4878 | lr 1.66e-04 | grad 0.750 | 37.3k tok/s | mfu 37.50%
+step   50740 | loss 13.7090 | lr 1.66e-04 | grad 0.757 | 37.3k tok/s | mfu 37.49%
+step   50750 | loss 13.6560 | lr 1.66e-04 | grad 0.766 | 37.3k tok/s | mfu 37.50%
+step   50760 | loss 13.9621 | lr 1.66e-04 | grad 0.760 | 33.7k tok/s | mfu 33.92%
+step   50770 | loss 13.2782 | lr 1.66e-04 | grad 0.745 | 37.3k tok/s | mfu 37.50%
+step   50780 | loss 13.7695 | lr 1.66e-04 | grad 0.764 | 37.3k tok/s | mfu 37.50%
+step   50790 | loss 13.9955 | lr 1.66e-04 | grad 0.775 | 37.3k tok/s | mfu 37.50%
+step   50800 | loss 13.5978 | lr 1.66e-04 | grad 0.765 | 37.3k tok/s | mfu 37.50%
+step   50810 | loss 14.2942 | lr 1.66e-04 | grad 0.794 | 37.3k tok/s | mfu 37.50%
+step   50820 | loss 13.3261 | lr 1.66e-04 | grad 0.746 | 37.3k tok/s | mfu 37.50%
+step   50830 | loss 14.1539 | lr 1.66e-04 | grad 0.769 | 37.3k tok/s | mfu 37.49%
+step   50840 | loss 13.4029 | lr 1.66e-04 | grad 0.763 | 37.3k tok/s | mfu 37.49%
+step   50850 | loss 14.4629 | lr 1.66e-04 | grad 0.772 | 37.3k tok/s | mfu 37.48%
+[Checkpoint] saved ./checkpoints/ckpt_step0050850.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050400.pt
+step   50860 | loss 13.5012 | lr 1.66e-04 | grad 0.774 | 29.0k tok/s | mfu 29.13%
+step   50870 | loss 13.7452 | lr 1.66e-04 | grad 0.751 | 37.3k tok/s | mfu 37.52%
+step   50880 | loss 13.8379 | lr 1.66e-04 | grad 0.756 | 37.3k tok/s | mfu 37.52%
+step   50890 | loss 14.8546 | lr 1.65e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+step   50900 | loss 13.9244 | lr 1.65e-04 | grad 0.756 | 37.3k tok/s | mfu 37.51%
+step   50910 | loss 13.7592 | lr 1.65e-04 | grad 0.782 | 37.3k tok/s | mfu 37.50%
+step   50920 | loss 13.9524 | lr 1.65e-04 | grad 0.765 | 37.3k tok/s | mfu 37.48%
+step   50930 | loss 13.6970 | lr 1.65e-04 | grad 0.762 | 37.3k tok/s | mfu 37.49%
+step   50940 | loss 13.6888 | lr 1.65e-04 | grad 0.766 | 37.3k tok/s | mfu 37.48%
+step   50950 | loss 14.3050 | lr 1.65e-04 | grad 0.773 | 37.3k tok/s | mfu 37.50%
+step   50960 | loss 13.8701 | lr 1.65e-04 | grad 0.774 | 37.3k tok/s | mfu 37.50%
+step   50970 | loss 13.9250 | lr 1.65e-04 | grad 0.758 | 37.3k tok/s | mfu 37.51%
+step   50980 | loss 14.1610 | lr 1.65e-04 | grad 0.793 | 37.3k tok/s | mfu 37.50%
+step   50990 | loss 13.8740 | lr 1.65e-04 | grad 0.750 | 37.3k tok/s | mfu 37.50%
+step   51000 | loss 13.5333 | lr 1.65e-04 | grad 0.844 | 37.3k tok/s | mfu 37.50%
+  [eval] step   51000 | val_loss 4.0186
+[Checkpoint] saved ./checkpoints/ckpt_step0051000.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050550.pt
+step   51010 | loss 13.7221 | lr 1.65e-04 | grad 0.808 | 22.6k tok/s | mfu 22.71%
+step   51020 | loss 14.2495 | lr 1.65e-04 | grad 0.772 | 37.3k tok/s | mfu 37.52%
+step   51030 | loss 13.9049 | lr 1.65e-04 | grad 0.781 | 37.3k tok/s | mfu 37.52%
+step   51040 | loss 14.2430 | lr 1.65e-04 | grad 0.760 | 37.3k tok/s | mfu 37.52%
+step   51050 | loss 13.6415 | lr 1.65e-04 | grad 0.777 | 37.3k tok/s | mfu 37.52%
+step   51060 | loss 14.0612 | lr 1.65e-04 | grad 0.768 | 37.3k tok/s | mfu 37.51%
+step   51070 | loss 13.9087 | lr 1.65e-04 | grad 0.755 | 37.3k tok/s | mfu 37.52%
+step   51080 | loss 13.6944 | lr 1.65e-04 | grad 0.788 | 37.3k tok/s | mfu 37.49%
+step   51090 | loss 13.6077 | lr 1.65e-04 | grad 0.769 | 37.3k tok/s | mfu 37.51%
+step   51100 | loss 14.2705 | lr 1.65e-04 | grad 0.769 | 37.3k tok/s | mfu 37.51%
+step   51110 | loss 14.1285 | lr 1.65e-04 | grad 0.777 | 37.3k tok/s | mfu 37.51%
+step   51120 | loss 13.9701 | lr 1.64e-04 | grad 0.779 | 37.3k tok/s | mfu 37.51%
+step   51130 | loss 13.7910 | lr 1.64e-04 | grad 0.795 | 37.3k tok/s | mfu 37.52%
+step   51140 | loss 13.9348 | lr 1.64e-04 | grad 0.784 | 37.3k tok/s | mfu 37.52%
+step   51150 | loss 13.9703 | lr 1.64e-04 | grad 0.759 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0051150.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050700.pt
+step   51160 | loss 14.0664 | lr 1.64e-04 | grad 0.763 | 28.8k tok/s | mfu 28.93%
+step   51170 | loss 14.3188 | lr 1.64e-04 | grad 0.796 | 37.3k tok/s | mfu 37.52%
+step   51180 | loss 13.7033 | lr 1.64e-04 | grad 1.226 | 37.3k tok/s | mfu 37.51%
+step   51190 | loss 13.8207 | lr 1.64e-04 | grad 0.792 | 37.3k tok/s | mfu 37.51%
+step   51200 | loss 14.2907 | lr 1.64e-04 | grad 0.770 | 37.3k tok/s | mfu 37.50%
+step   51210 | loss 13.8002 | lr 1.64e-04 | grad 0.794 | 37.3k tok/s | mfu 37.50%
+step   51220 | loss 13.9625 | lr 1.64e-04 | grad 0.766 | 37.3k tok/s | mfu 37.51%
+step   51230 | loss 13.3143 | lr 1.64e-04 | grad 1.060 | 37.3k tok/s | mfu 37.51%
+step   51240 | loss 13.9115 | lr 1.64e-04 | grad 0.766 | 37.3k tok/s | mfu 37.51%
+step   51250 | loss 13.4906 | lr 1.64e-04 | grad 0.753 | 37.3k tok/s | mfu 37.48%
+step   51260 | loss 14.5133 | lr 1.64e-04 | grad 0.806 | 37.3k tok/s | mfu 37.50%
+step   51270 | loss 13.9247 | lr 1.64e-04 | grad 0.798 | 37.3k tok/s | mfu 37.50%
+step   51280 | loss 13.1040 | lr 1.64e-04 | grad 0.745 | 37.3k tok/s | mfu 37.50%
+step   51290 | loss 13.5863 | lr 1.64e-04 | grad 0.772 | 37.3k tok/s | mfu 37.51%
+step   51300 | loss 14.0493 | lr 1.64e-04 | grad 0.783 | 37.3k tok/s | mfu 37.51%
+[Checkpoint] saved ./checkpoints/ckpt_step0051300.pt
+[Checkpoint] pruned checkpoints/ckpt_step0050850.pt
+step   51310 | loss 14.2432 | lr 1.64e-04 | grad 0.761 | 32.1k tok/s | mfu 32.29%
+step   51320 | loss 13.9344 | lr 1.64e-04 | grad 0.759 | 37.3k tok/s | mfu 37.52%
+step   51330 | loss 14.1101 | lr 1.64e-04 | grad 0.762 | 37.3k tok/s | mfu 37.51%
+step   51340 | loss 13.7673 | lr 1.64e-04 | grad 0.759 | 37.3k tok/s | mfu 37.50%
+step   51350 | loss 14.3149 | lr 1.63e-04 | grad 0.768 | 37.3k tok/s | mfu 37.50%
+step   51360 | loss 14.1384 | lr 1.63e-04 | grad 0.768 | 37.3k tok/s | mfu 37.49%
+step   51370 | loss 13.4972 | lr 1.63e-04 | grad 0.763 | 37.3k tok/s | mfu 37.49%
+step   51380 | loss 13.8723 | lr 1.63e-04 | grad 0.767 | 37.3k tok/s | mfu 37.50%
+step   51390 | loss 13.4693 | lr 1.63e-04 | grad 0.769 | 37.3k tok/s | mfu 37.50%
+step   51400 | loss 14.4986 | lr 1.63e-04 | grad 0.786 | 37.3k tok/s | mfu 37.50%
+step   51410 | loss 14.3210 | lr 1.63e-04 | grad 0.779 | 37.3k tok/s | mfu 37.50%
+step   51420 | loss 14.2183 | lr 1.63e-04 | grad 0.756 | 37.3k tok/s | mfu 37.50%
+step   51430 | loss 13.3587 | lr 1.63e-04 | grad 0.767 | 37.3k tok/s | mfu 37.50%
+step   51440 | loss 13.4012 | lr 1.63e-04 | grad 0.776 | 37.3k tok/s | mfu 37.51%
+step   51450 | loss 14.0017 | lr 1.63e-04 | grad 0.778 | 37.3k tok/s | mfu 37.49%
+[Checkpoint] saved ./checkpoints/ckpt_step0051450.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051000.pt
+step   51460 | loss 14.4326 | lr 1.63e-04 | grad 0.766 | 29.0k tok/s | mfu 29.14%
+step   51470 | loss 14.0994 | lr 1.63e-04 | grad 0.786 | 37.3k tok/s | mfu 37.53%
+step   51480 | loss 13.6941 | lr 1.63e-04 | grad 0.761 | 37.3k tok/s | mfu 37.53%
+step   51490 | loss 13.9849 | lr 1.63e-04 | grad 0.770 | 37.3k tok/s | mfu 37.52%
+step   51500 | loss 13.9867 | lr 1.63e-04 | grad 0.754 | 37.3k tok/s | mfu 37.53%
+  [eval] step   51500 | val_loss 4.0379
+step   51510 | loss 14.4388 | lr 1.63e-04 | grad 0.772 | 27.6k tok/s | mfu 27.78%
+step   51520 | loss 13.9225 | lr 1.63e-04 | grad 0.766 | 37.3k tok/s | mfu 37.51%
+step   51530 | loss 13.4609 | lr 1.63e-04 | grad 0.755 | 37.3k tok/s | mfu 37.50%
+step   51540 | loss 13.6971 | lr 1.63e-04 | grad 0.750 | 37.3k tok/s | mfu 37.51%
+step   51550 | loss 13.3739 | lr 1.63e-04 | grad 0.757 | 37.3k tok/s | mfu 37.52%
+step   51560 | loss 13.3463 | lr 1.63e-04 | grad 0.761 | 37.3k tok/s | mfu 37.51%
+step   51570 | loss 13.8044 | lr 1.63e-04 | grad 0.771 | 37.3k tok/s | mfu 37.51%
+step   51580 | loss 13.8716 | lr 1.62e-04 | grad 0.764 | 37.3k tok/s | mfu 37.53%
+step   51590 | loss 14.1842 | lr 1.62e-04 | grad 0.768 | 37.3k tok/s | mfu 37.52%
+step   51600 | loss 14.2090 | lr 1.62e-04 | grad 0.799 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0051600.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051150.pt
+step   51610 | loss 14.1656 | lr 1.62e-04 | grad 0.783 | 32.2k tok/s | mfu 32.34%
+step   51620 | loss 13.9847 | lr 1.62e-04 | grad 1.089 | 37.3k tok/s | mfu 37.53%
+step   51630 | loss 13.6648 | lr 1.62e-04 | grad 0.771 | 37.3k tok/s | mfu 37.52%
+step   51640 | loss 13.7646 | lr 1.62e-04 | grad 0.765 | 37.3k tok/s | mfu 37.53%
+step   51650 | loss 13.6737 | lr 1.62e-04 | grad 0.961 | 37.3k tok/s | mfu 37.53%
+step   51660 | loss 13.7906 | lr 1.62e-04 | grad 0.768 | 37.3k tok/s | mfu 37.52%
+step   51670 | loss 13.8947 | lr 1.62e-04 | grad 0.765 | 37.3k tok/s | mfu 37.52%
+step   51680 | loss 13.8847 | lr 1.62e-04 | grad 0.802 | 37.3k tok/s | mfu 37.49%
+step   51690 | loss 14.3397 | lr 1.62e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+step   51700 | loss 13.5270 | lr 1.62e-04 | grad 0.760 | 37.3k tok/s | mfu 37.50%
+step   51710 | loss 13.8996 | lr 1.62e-04 | grad 0.839 | 37.3k tok/s | mfu 37.49%
+step   51720 | loss 14.4961 | lr 1.62e-04 | grad 0.784 | 37.3k tok/s | mfu 37.46%
+step   51730 | loss 13.7729 | lr 1.62e-04 | grad 5.104 | 37.3k tok/s | mfu 37.50%
+step   51740 | loss 13.3963 | lr 1.62e-04 | grad 0.758 | 37.3k tok/s | mfu 37.51%
+step   51750 | loss 14.3301 | lr 1.62e-04 | grad 0.777 | 37.3k tok/s | mfu 37.48%
+[Checkpoint] saved ./checkpoints/ckpt_step0051750.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051300.pt
+step   51760 | loss 14.0910 | lr 1.62e-04 | grad 0.781 | 32.1k tok/s | mfu 32.31%
+step   51770 | loss 13.5072 | lr 1.62e-04 | grad 0.758 | 37.3k tok/s | mfu 37.55%
+step   51780 | loss 13.1611 | lr 1.62e-04 | grad 0.761 | 37.3k tok/s | mfu 37.55%
+step   51790 | loss 14.0545 | lr 1.62e-04 | grad 0.769 | 37.3k tok/s | mfu 37.54%
+step   51800 | loss 13.9018 | lr 1.62e-04 | grad 0.764 | 37.3k tok/s | mfu 37.53%
+step   51810 | loss 13.5940 | lr 1.61e-04 | grad 0.770 | 37.3k tok/s | mfu 37.54%
+step   51820 | loss 14.1189 | lr 1.61e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+step   51830 | loss 13.5711 | lr 1.61e-04 | grad 0.769 | 37.3k tok/s | mfu 37.53%
+step   51840 | loss 13.3846 | lr 1.61e-04 | grad 0.791 | 37.3k tok/s | mfu 37.53%
+step   51850 | loss 13.9627 | lr 1.61e-04 | grad 0.773 | 37.3k tok/s | mfu 37.53%
+step   51860 | loss 13.8183 | lr 1.61e-04 | grad 0.763 | 37.3k tok/s | mfu 37.53%
+step   51870 | loss 14.0249 | lr 1.61e-04 | grad 0.775 | 37.3k tok/s | mfu 37.54%
+step   51880 | loss 13.6294 | lr 1.61e-04 | grad 0.773 | 37.3k tok/s | mfu 37.53%
+step   51890 | loss 14.1977 | lr 1.61e-04 | grad 0.772 | 37.3k tok/s | mfu 37.53%
+step   51900 | loss 14.0546 | lr 1.61e-04 | grad 0.779 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0051900.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051450.pt
+step   51910 | loss 14.7087 | lr 1.61e-04 | grad 0.785 | 32.1k tok/s | mfu 32.28%
+step   51920 | loss 13.5381 | lr 1.61e-04 | grad 0.762 | 37.3k tok/s | mfu 37.53%
+step   51930 | loss 13.7860 | lr 1.61e-04 | grad 0.762 | 37.3k tok/s | mfu 37.53%
+step   51940 | loss 13.4011 | lr 1.61e-04 | grad 0.759 | 37.3k tok/s | mfu 37.52%
+step   51950 | loss 13.6536 | lr 1.61e-04 | grad 0.767 | 37.3k tok/s | mfu 37.52%
+step   51960 | loss 14.1201 | lr 1.61e-04 | grad 0.779 | 37.3k tok/s | mfu 37.51%
+step   51970 | loss 13.6140 | lr 1.61e-04 | grad 0.764 | 37.3k tok/s | mfu 37.52%
+step   51980 | loss 13.8813 | lr 1.61e-04 | grad 0.771 | 37.3k tok/s | mfu 37.50%
+step   51990 | loss 13.7306 | lr 1.61e-04 | grad 0.773 | 37.3k tok/s | mfu 37.52%
+step   52000 | loss 14.1324 | lr 1.61e-04 | grad 0.777 | 37.3k tok/s | mfu 37.52%
+  [eval] step   52000 | val_loss 4.0414
+step   52010 | loss 13.9322 | lr 1.61e-04 | grad 0.785 | 27.6k tok/s | mfu 27.79%
+step   52020 | loss 14.4496 | lr 1.61e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   52030 | loss 13.9894 | lr 1.61e-04 | grad 0.780 | 37.3k tok/s | mfu 37.54%
+step   52040 | loss 13.9200 | lr 1.61e-04 | grad 0.779 | 37.3k tok/s | mfu 37.53%
+step   52050 | loss 13.9996 | lr 1.60e-04 | grad 0.776 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0052050.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051600.pt
+step   52060 | loss 13.1640 | lr 1.60e-04 | grad 0.751 | 32.1k tok/s | mfu 32.30%
+step   52070 | loss 13.7595 | lr 1.60e-04 | grad 0.768 | 37.3k tok/s | mfu 37.55%
+step   52080 | loss 13.9898 | lr 1.60e-04 | grad 0.815 | 37.3k tok/s | mfu 37.53%
+step   52090 | loss 13.9775 | lr 1.60e-04 | grad 0.766 | 37.3k tok/s | mfu 37.53%
+step   52100 | loss 13.8626 | lr 1.60e-04 | grad 0.790 | 37.3k tok/s | mfu 37.54%
+step   52110 | loss 13.3360 | lr 1.60e-04 | grad 0.755 | 37.3k tok/s | mfu 37.53%
+step   52120 | loss 14.0807 | lr 1.60e-04 | grad 0.766 | 37.3k tok/s | mfu 37.52%
+step   52130 | loss 13.8085 | lr 1.60e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+step   52140 | loss 14.2157 | lr 1.60e-04 | grad 0.773 | 37.3k tok/s | mfu 37.52%
+step   52150 | loss 14.1141 | lr 1.60e-04 | grad 0.781 | 37.3k tok/s | mfu 37.54%
+step   52160 | loss 13.9410 | lr 1.60e-04 | grad 0.801 | 37.3k tok/s | mfu 37.54%
+step   52170 | loss 13.7501 | lr 1.60e-04 | grad 0.769 | 37.3k tok/s | mfu 37.52%
+step   52180 | loss 13.7047 | lr 1.60e-04 | grad 0.771 | 37.3k tok/s | mfu 37.51%
+step   52190 | loss 13.7241 | lr 1.60e-04 | grad 0.773 | 37.3k tok/s | mfu 37.53%
+step   52200 | loss 14.0359 | lr 1.60e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0052200.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051750.pt
+step   52210 | loss 14.0250 | lr 1.60e-04 | grad 0.808 | 29.9k tok/s | mfu 30.03%
+step   52220 | loss 13.3963 | lr 1.60e-04 | grad 0.764 | 37.3k tok/s | mfu 37.55%
+step   52230 | loss 14.0259 | lr 1.60e-04 | grad 0.784 | 37.3k tok/s | mfu 37.55%
+step   52240 | loss 13.6071 | lr 1.60e-04 | grad 0.780 | 37.3k tok/s | mfu 37.54%
+step   52250 | loss 14.2706 | lr 1.60e-04 | grad 0.787 | 37.3k tok/s | mfu 37.54%
+step   52260 | loss 14.3400 | lr 1.60e-04 | grad 0.772 | 37.3k tok/s | mfu 37.54%
+step   52270 | loss 13.8627 | lr 1.60e-04 | grad 0.779 | 37.3k tok/s | mfu 37.53%
+step   52280 | loss 14.0277 | lr 1.59e-04 | grad 0.774 | 37.3k tok/s | mfu 37.52%
+step   52290 | loss 13.5914 | lr 1.59e-04 | grad 0.783 | 37.3k tok/s | mfu 37.54%
+step   52300 | loss 13.4262 | lr 1.59e-04 | grad 0.768 | 37.3k tok/s | mfu 37.52%
+step   52310 | loss 13.8521 | lr 1.59e-04 | grad 0.775 | 37.3k tok/s | mfu 37.54%
+step   52320 | loss 13.2911 | lr 1.59e-04 | grad 0.772 | 37.3k tok/s | mfu 37.54%
+step   52330 | loss 13.9666 | lr 1.59e-04 | grad 0.781 | 37.3k tok/s | mfu 37.53%
+step   52340 | loss 13.9564 | lr 1.59e-04 | grad 0.792 | 37.3k tok/s | mfu 37.53%
+step   52350 | loss 14.5035 | lr 1.59e-04 | grad 0.779 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0052350.pt
+[Checkpoint] pruned checkpoints/ckpt_step0051900.pt
+step   52360 | loss 13.9362 | lr 1.59e-04 | grad 0.788 | 32.1k tok/s | mfu 32.30%
+step   52370 | loss 13.7477 | lr 1.59e-04 | grad 0.770 | 37.3k tok/s | mfu 37.54%
+step   52380 | loss 14.5159 | lr 1.59e-04 | grad 0.781 | 37.3k tok/s | mfu 37.55%
+step   52390 | loss 14.1782 | lr 1.59e-04 | grad 0.777 | 37.3k tok/s | mfu 37.56%
+step   52400 | loss 13.9036 | lr 1.59e-04 | grad 0.792 | 37.3k tok/s | mfu 37.54%
+step   52410 | loss 13.9600 | lr 1.59e-04 | grad 0.772 | 37.3k tok/s | mfu 37.54%
+step   52420 | loss 13.8768 | lr 1.59e-04 | grad 0.776 | 37.3k tok/s | mfu 37.53%
+step   52430 | loss 14.3606 | lr 1.59e-04 | grad 0.779 | 37.3k tok/s | mfu 37.55%
+step   52440 | loss 13.1962 | lr 1.59e-04 | grad 0.765 | 37.3k tok/s | mfu 37.54%
+step   52450 | loss 13.8173 | lr 1.59e-04 | grad 0.768 | 37.3k tok/s | mfu 37.51%
+step   52460 | loss 13.7445 | lr 1.59e-04 | grad 0.771 | 37.3k tok/s | mfu 37.54%
+step   52470 | loss 13.9893 | lr 1.59e-04 | grad 0.798 | 37.3k tok/s | mfu 37.54%
+step   52480 | loss 13.7288 | lr 1.59e-04 | grad 0.777 | 37.3k tok/s | mfu 37.54%
+step   52490 | loss 14.0994 | lr 1.59e-04 | grad 0.801 | 37.3k tok/s | mfu 37.54%
+step   52500 | loss 14.0666 | lr 1.59e-04 | grad 0.785 | 37.3k tok/s | mfu 37.54%
+  [eval] step   52500 | val_loss 4.1011
+[Checkpoint] saved ./checkpoints/ckpt_step0052500.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052050.pt
+step   52510 | loss 14.0096 | lr 1.58e-04 | grad 0.785 | 22.2k tok/s | mfu 22.28%
+step   52520 | loss 13.9337 | lr 1.58e-04 | grad 0.789 | 37.4k tok/s | mfu 37.57%
+step   52530 | loss 13.1947 | lr 1.58e-04 | grad 0.766 | 37.4k tok/s | mfu 37.56%
+step   52540 | loss 13.5906 | lr 1.58e-04 | grad 0.771 | 37.3k tok/s | mfu 37.54%
+step   52550 | loss 14.1801 | lr 1.58e-04 | grad 0.784 | 37.3k tok/s | mfu 37.53%
+step   52560 | loss 13.8485 | lr 1.58e-04 | grad 0.789 | 37.3k tok/s | mfu 37.51%
+step   52570 | loss 13.4975 | lr 1.58e-04 | grad 0.797 | 37.3k tok/s | mfu 37.51%
+step   52580 | loss 13.9189 | lr 1.58e-04 | grad 0.811 | 37.3k tok/s | mfu 37.52%
+step   52590 | loss 13.9117 | lr 1.58e-04 | grad 0.782 | 37.3k tok/s | mfu 37.50%
+step   52600 | loss 13.4658 | lr 1.58e-04 | grad 0.763 | 37.3k tok/s | mfu 37.48%
+step   52610 | loss 13.4869 | lr 1.58e-04 | grad 0.778 | 37.3k tok/s | mfu 37.48%
+step   52620 | loss 13.3830 | lr 1.58e-04 | grad 0.788 | 37.3k tok/s | mfu 37.49%
+step   52630 | loss 13.6293 | lr 1.58e-04 | grad 0.778 | 37.3k tok/s | mfu 37.51%
+step   52640 | loss 13.3286 | lr 1.58e-04 | grad 0.779 | 37.3k tok/s | mfu 37.50%
+step   52650 | loss 13.3818 | lr 1.58e-04 | grad 1.144 | 37.3k tok/s | mfu 37.51%
+[Checkpoint] saved ./checkpoints/ckpt_step0052650.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052200.pt
+step   52660 | loss 13.5706 | lr 1.58e-04 | grad 0.773 | 32.1k tok/s | mfu 32.29%
+step   52670 | loss 13.9344 | lr 1.58e-04 | grad 0.800 | 37.3k tok/s | mfu 37.53%
+step   52680 | loss 13.3207 | lr 1.58e-04 | grad 0.792 | 37.3k tok/s | mfu 37.52%
+step   52690 | loss 14.2309 | lr 1.58e-04 | grad 0.809 | 37.3k tok/s | mfu 37.50%
+step   52700 | loss 14.1668 | lr 1.58e-04 | grad 0.787 | 37.3k tok/s | mfu 37.51%
+step   52710 | loss 13.0005 | lr 1.58e-04 | grad 0.764 | 37.3k tok/s | mfu 37.52%
+step   52720 | loss 14.2113 | lr 1.58e-04 | grad 0.782 | 37.3k tok/s | mfu 37.52%
+step   52730 | loss 13.5641 | lr 1.58e-04 | grad 0.766 | 37.3k tok/s | mfu 37.52%
+step   52740 | loss 13.1832 | lr 1.57e-04 | grad 0.753 | 37.3k tok/s | mfu 37.51%
+step   52750 | loss 13.7334 | lr 1.57e-04 | grad 0.778 | 37.3k tok/s | mfu 37.49%
+step   52760 | loss 13.8102 | lr 1.57e-04 | grad 0.772 | 37.3k tok/s | mfu 37.51%
+step   52770 | loss 14.0978 | lr 1.57e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+step   52780 | loss 14.0923 | lr 1.57e-04 | grad 0.774 | 37.3k tok/s | mfu 37.52%
+step   52790 | loss 13.5399 | lr 1.57e-04 | grad 0.780 | 37.3k tok/s | mfu 37.51%
+step   52800 | loss 13.4382 | lr 1.57e-04 | grad 0.800 | 37.3k tok/s | mfu 37.51%
+[Checkpoint] saved ./checkpoints/ckpt_step0052800.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052350.pt
+step   52810 | loss 14.0004 | lr 1.57e-04 | grad 0.789 | 29.4k tok/s | mfu 29.52%
+step   52820 | loss 13.9477 | lr 1.57e-04 | grad 0.778 | 37.3k tok/s | mfu 37.54%
+step   52830 | loss 13.7080 | lr 1.57e-04 | grad 0.790 | 37.3k tok/s | mfu 37.55%
+step   52840 | loss 14.0086 | lr 1.57e-04 | grad 0.787 | 37.3k tok/s | mfu 37.53%
+step   52850 | loss 13.4997 | lr 1.57e-04 | grad 0.780 | 37.3k tok/s | mfu 37.53%
+step   52860 | loss 13.4671 | lr 1.57e-04 | grad 0.779 | 37.3k tok/s | mfu 37.54%
+step   52870 | loss 13.2610 | lr 1.57e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   52880 | loss 13.4072 | lr 1.57e-04 | grad 0.784 | 37.3k tok/s | mfu 37.52%
+step   52890 | loss 13.9658 | lr 1.57e-04 | grad 0.774 | 37.3k tok/s | mfu 37.53%
+step   52900 | loss 13.5586 | lr 1.57e-04 | grad 0.803 | 37.3k tok/s | mfu 37.53%
+step   52910 | loss 13.9517 | lr 1.57e-04 | grad 0.804 | 37.3k tok/s | mfu 37.54%
+step   52920 | loss 14.2734 | lr 1.57e-04 | grad 0.823 | 37.3k tok/s | mfu 37.54%
+step   52930 | loss 13.3560 | lr 1.57e-04 | grad 0.773 | 37.3k tok/s | mfu 37.51%
+step   52940 | loss 13.5092 | lr 1.57e-04 | grad 0.785 | 37.3k tok/s | mfu 37.53%
+step   52950 | loss 13.8868 | lr 1.57e-04 | grad 0.774 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0052950.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052500.pt
+step   52960 | loss 13.5470 | lr 1.57e-04 | grad 0.779 | 32.1k tok/s | mfu 32.30%
+step   52970 | loss 13.5197 | lr 1.56e-04 | grad 0.793 | 37.3k tok/s | mfu 37.53%
+step   52980 | loss 13.8707 | lr 1.56e-04 | grad 0.786 | 37.3k tok/s | mfu 37.53%
+step   52990 | loss 13.9199 | lr 1.56e-04 | grad 0.817 | 37.3k tok/s | mfu 37.55%
+step   53000 | loss 13.0273 | lr 1.56e-04 | grad 0.760 | 37.3k tok/s | mfu 37.55%
+  [eval] step   53000 | val_loss 4.0544
+step   53010 | loss 14.0091 | lr 1.56e-04 | grad 0.804 | 27.6k tok/s | mfu 27.80%
+step   53020 | loss 14.0475 | lr 1.56e-04 | grad 0.869 | 37.3k tok/s | mfu 37.53%
+step   53030 | loss 13.9504 | lr 1.56e-04 | grad 0.787 | 37.3k tok/s | mfu 37.53%
+step   53040 | loss 13.9297 | lr 1.56e-04 | grad 0.776 | 37.3k tok/s | mfu 37.52%
+step   53050 | loss 14.1700 | lr 1.56e-04 | grad 0.794 | 37.3k tok/s | mfu 37.51%
+step   53060 | loss 14.4931 | lr 1.56e-04 | grad 0.791 | 37.3k tok/s | mfu 37.52%
+step   53070 | loss 14.3932 | lr 1.56e-04 | grad 0.814 | 37.3k tok/s | mfu 37.53%
+step   53080 | loss 14.2808 | lr 1.56e-04 | grad 0.801 | 37.3k tok/s | mfu 37.52%
+step   53090 | loss 13.6959 | lr 1.56e-04 | grad 0.782 | 37.3k tok/s | mfu 37.52%
+step   53100 | loss 13.7990 | lr 1.56e-04 | grad 0.793 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0053100.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052650.pt
+step   53110 | loss 13.7842 | lr 1.56e-04 | grad 0.772 | 32.1k tok/s | mfu 32.31%
+step   53120 | loss 13.9542 | lr 1.56e-04 | grad 0.777 | 37.3k tok/s | mfu 37.53%
+step   53130 | loss 13.7648 | lr 1.56e-04 | grad 0.775 | 37.3k tok/s | mfu 37.51%
+step   53140 | loss 13.5397 | lr 1.56e-04 | grad 0.775 | 37.3k tok/s | mfu 37.51%
+step   53150 | loss 14.3099 | lr 1.56e-04 | grad 0.787 | 37.3k tok/s | mfu 37.51%
+step   53160 | loss 14.7528 | lr 1.56e-04 | grad 0.788 | 37.3k tok/s | mfu 37.51%
+step   53170 | loss 13.2628 | lr 1.56e-04 | grad 0.792 | 37.3k tok/s | mfu 37.51%
+step   53180 | loss 13.9715 | lr 1.56e-04 | grad 0.797 | 37.3k tok/s | mfu 37.51%
+step   53190 | loss 13.4556 | lr 1.56e-04 | grad 0.779 | 37.3k tok/s | mfu 37.50%
+step   53200 | loss 13.7919 | lr 1.55e-04 | grad 0.808 | 37.3k tok/s | mfu 37.51%
+step   53210 | loss 13.4314 | lr 1.55e-04 | grad 0.806 | 37.3k tok/s | mfu 37.51%
+step   53220 | loss 13.7043 | lr 1.55e-04 | grad 0.764 | 37.3k tok/s | mfu 37.51%
+step   53230 | loss 13.4146 | lr 1.55e-04 | grad 0.782 | 37.3k tok/s | mfu 37.52%
+step   53240 | loss 13.6975 | lr 1.55e-04 | grad 0.771 | 37.3k tok/s | mfu 37.51%
+step   53250 | loss 13.8929 | lr 1.55e-04 | grad 0.787 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0053250.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052800.pt
+step   53260 | loss 13.9141 | lr 1.55e-04 | grad 0.788 | 32.2k tok/s | mfu 32.33%
+step   53270 | loss 13.7470 | lr 1.55e-04 | grad 0.767 | 37.3k tok/s | mfu 37.55%
+step   53280 | loss 13.9414 | lr 1.55e-04 | grad 0.773 | 37.3k tok/s | mfu 37.53%
+step   53290 | loss 14.0402 | lr 1.55e-04 | grad 0.788 | 37.3k tok/s | mfu 37.52%
+step   53300 | loss 13.5159 | lr 1.55e-04 | grad 0.789 | 37.3k tok/s | mfu 37.52%
+step   53310 | loss 13.4800 | lr 1.55e-04 | grad 0.767 | 34.1k tok/s | mfu 34.26%
+step   53320 | loss 13.7454 | lr 1.55e-04 | grad 0.783 | 37.3k tok/s | mfu 37.53%
+step   53330 | loss 14.1805 | lr 1.55e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+step   53340 | loss 13.7917 | lr 1.55e-04 | grad 0.782 | 37.3k tok/s | mfu 37.52%
+step   53350 | loss 13.4309 | lr 1.55e-04 | grad 0.792 | 37.3k tok/s | mfu 37.54%
+step   53360 | loss 13.3989 | lr 1.55e-04 | grad 0.777 | 37.3k tok/s | mfu 37.54%
+step   53370 | loss 13.6584 | lr 1.55e-04 | grad 0.792 | 37.3k tok/s | mfu 37.55%
+step   53380 | loss 13.7259 | lr 1.55e-04 | grad 0.808 | 37.3k tok/s | mfu 37.55%
+step   53390 | loss 13.5988 | lr 1.55e-04 | grad 0.784 | 37.3k tok/s | mfu 37.53%
+step   53400 | loss 13.5027 | lr 1.55e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0053400.pt
+[Checkpoint] pruned checkpoints/ckpt_step0052950.pt
+step   53410 | loss 14.8028 | lr 1.55e-04 | grad 0.804 | 30.8k tok/s | mfu 30.98%
+step   53420 | loss 13.8616 | lr 1.55e-04 | grad 0.781 | 37.3k tok/s | mfu 37.53%
+step   53430 | loss 14.4863 | lr 1.54e-04 | grad 0.798 | 37.3k tok/s | mfu 37.54%
+step   53440 | loss 14.0264 | lr 1.54e-04 | grad 0.796 | 37.3k tok/s | mfu 37.54%
+step   53450 | loss 13.4312 | lr 1.54e-04 | grad 0.777 | 37.3k tok/s | mfu 37.53%
+step   53460 | loss 13.3604 | lr 1.54e-04 | grad 0.801 | 37.3k tok/s | mfu 37.50%
+step   53470 | loss 13.9746 | lr 1.54e-04 | grad 0.791 | 37.3k tok/s | mfu 37.53%
+step   53480 | loss 13.9143 | lr 1.54e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   53490 | loss 13.5432 | lr 1.54e-04 | grad 0.782 | 37.3k tok/s | mfu 37.52%
+step   53500 | loss 13.1300 | lr 1.54e-04 | grad 0.780 | 37.3k tok/s | mfu 37.53%
+  [eval] step   53500 | val_loss 4.0877
+step   53510 | loss 13.4816 | lr 1.54e-04 | grad 0.785 | 27.6k tok/s | mfu 27.79%
+step   53520 | loss 13.4250 | lr 1.54e-04 | grad 0.804 | 37.3k tok/s | mfu 37.52%
+step   53530 | loss 13.9063 | lr 1.54e-04 | grad 0.802 | 37.3k tok/s | mfu 37.53%
+step   53540 | loss 14.1591 | lr 1.54e-04 | grad 0.789 | 37.3k tok/s | mfu 37.52%
+step   53550 | loss 13.5079 | lr 1.54e-04 | grad 0.795 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0053550.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053100.pt
+step   53560 | loss 13.4253 | lr 1.54e-04 | grad 0.770 | 32.1k tok/s | mfu 32.32%
+step   53570 | loss 13.8963 | lr 1.54e-04 | grad 0.783 | 37.3k tok/s | mfu 37.55%
+step   53580 | loss 13.6836 | lr 1.54e-04 | grad 0.791 | 37.3k tok/s | mfu 37.55%
+step   53590 | loss 13.1356 | lr 1.54e-04 | grad 0.776 | 37.3k tok/s | mfu 37.55%
+step   53600 | loss 13.5839 | lr 1.54e-04 | grad 0.783 | 37.3k tok/s | mfu 37.54%
+step   53610 | loss 13.4874 | lr 1.54e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   53620 | loss 13.5586 | lr 1.54e-04 | grad 0.803 | 37.3k tok/s | mfu 37.53%
+step   53630 | loss 13.4839 | lr 1.54e-04 | grad 0.792 | 37.3k tok/s | mfu 37.53%
+step   53640 | loss 13.4848 | lr 1.54e-04 | grad 0.796 | 37.3k tok/s | mfu 37.53%
+step   53650 | loss 13.1702 | lr 1.54e-04 | grad 0.764 | 37.3k tok/s | mfu 37.54%
+step   53660 | loss 13.8745 | lr 1.54e-04 | grad 0.780 | 37.3k tok/s | mfu 37.52%
+step   53670 | loss 13.6938 | lr 1.53e-04 | grad 0.788 | 37.3k tok/s | mfu 37.52%
+step   53680 | loss 13.7160 | lr 1.53e-04 | grad 0.808 | 37.3k tok/s | mfu 37.52%
+step   53690 | loss 13.9107 | lr 1.53e-04 | grad 0.813 | 37.3k tok/s | mfu 37.53%
+step   53700 | loss 13.2281 | lr 1.53e-04 | grad 0.779 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0053700.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053250.pt
+step   53710 | loss 13.5810 | lr 1.53e-04 | grad 0.789 | 32.1k tok/s | mfu 32.32%
+step   53720 | loss 14.4431 | lr 1.53e-04 | grad 0.809 | 37.3k tok/s | mfu 37.54%
+step   53730 | loss 14.1147 | lr 1.53e-04 | grad 0.789 | 37.3k tok/s | mfu 37.53%
+step   53740 | loss 13.9358 | lr 1.53e-04 | grad 0.790 | 37.3k tok/s | mfu 37.52%
+step   53750 | loss 13.8405 | lr 1.53e-04 | grad 0.786 | 37.3k tok/s | mfu 37.50%
+step   53760 | loss 13.3552 | lr 1.53e-04 | grad 0.791 | 37.3k tok/s | mfu 37.51%
+step   53770 | loss 14.2320 | lr 1.53e-04 | grad 0.789 | 37.3k tok/s | mfu 37.52%
+step   53780 | loss 13.6241 | lr 1.53e-04 | grad 0.800 | 37.3k tok/s | mfu 37.52%
+step   53790 | loss 13.0447 | lr 1.53e-04 | grad 0.769 | 37.3k tok/s | mfu 37.53%
+step   53800 | loss 14.3268 | lr 1.53e-04 | grad 0.789 | 37.3k tok/s | mfu 37.54%
+step   53810 | loss 13.1842 | lr 1.53e-04 | grad 0.818 | 37.3k tok/s | mfu 37.54%
+step   53820 | loss 13.5146 | lr 1.53e-04 | grad 0.795 | 37.3k tok/s | mfu 37.54%
+step   53830 | loss 14.2098 | lr 1.53e-04 | grad 0.801 | 37.3k tok/s | mfu 37.51%
+step   53840 | loss 13.8937 | lr 1.53e-04 | grad 0.821 | 37.3k tok/s | mfu 37.47%
+step   53850 | loss 13.9697 | lr 1.53e-04 | grad 0.839 | 37.3k tok/s | mfu 37.50%
+[Checkpoint] saved ./checkpoints/ckpt_step0053850.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053400.pt
+step   53860 | loss 13.6528 | lr 1.53e-04 | grad 0.811 | 32.1k tok/s | mfu 32.32%
+step   53870 | loss 14.0009 | lr 1.53e-04 | grad 0.803 | 37.3k tok/s | mfu 37.52%
+step   53880 | loss 13.6368 | lr 1.53e-04 | grad 0.785 | 37.3k tok/s | mfu 37.52%
+step   53890 | loss 13.7877 | lr 1.53e-04 | grad 0.792 | 37.3k tok/s | mfu 37.48%
+step   53900 | loss 14.0071 | lr 1.52e-04 | grad 0.801 | 37.3k tok/s | mfu 37.52%
+step   53910 | loss 14.0391 | lr 1.52e-04 | grad 0.804 | 37.3k tok/s | mfu 37.52%
+step   53920 | loss 13.2082 | lr 1.52e-04 | grad 0.785 | 37.3k tok/s | mfu 37.53%
+step   53930 | loss 14.0913 | lr 1.52e-04 | grad 0.798 | 37.3k tok/s | mfu 37.53%
+step   53940 | loss 12.8459 | lr 1.52e-04 | grad 0.797 | 37.3k tok/s | mfu 37.52%
+step   53950 | loss 13.5225 | lr 1.52e-04 | grad 0.778 | 37.3k tok/s | mfu 37.52%
+step   53960 | loss 14.4477 | lr 1.52e-04 | grad 0.804 | 37.3k tok/s | mfu 37.50%
+step   53970 | loss 13.9058 | lr 1.52e-04 | grad 0.805 | 37.3k tok/s | mfu 37.52%
+step   53980 | loss 13.1301 | lr 1.52e-04 | grad 0.769 | 37.3k tok/s | mfu 37.52%
+step   53990 | loss 13.9625 | lr 1.52e-04 | grad 0.808 | 37.3k tok/s | mfu 37.52%
+step   54000 | loss 14.1762 | lr 1.52e-04 | grad 0.800 | 37.3k tok/s | mfu 37.51%
+  [eval] step   54000 | val_loss 4.1047
+[Checkpoint] saved ./checkpoints/ckpt_step0054000.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053550.pt
+step   54010 | loss 14.4944 | lr 1.52e-04 | grad 0.801 | 24.1k tok/s | mfu 24.24%
+step   54020 | loss 13.7480 | lr 1.52e-04 | grad 0.788 | 37.3k tok/s | mfu 37.54%
+step   54030 | loss 13.5699 | lr 1.52e-04 | grad 0.787 | 36.7k tok/s | mfu 36.90%
+step   54040 | loss 13.7716 | lr 1.52e-04 | grad 0.789 | 37.3k tok/s | mfu 37.54%
+step   54050 | loss 13.9804 | lr 1.52e-04 | grad 0.796 | 37.3k tok/s | mfu 37.54%
+step   54060 | loss 13.3361 | lr 1.52e-04 | grad 0.794 | 37.3k tok/s | mfu 37.54%
+step   54070 | loss 13.0873 | lr 1.52e-04 | grad 0.798 | 37.3k tok/s | mfu 37.53%
+step   54080 | loss 14.2186 | lr 1.52e-04 | grad 0.804 | 37.3k tok/s | mfu 37.55%
+step   54090 | loss 13.9235 | lr 1.52e-04 | grad 0.792 | 37.3k tok/s | mfu 37.54%
+step   54100 | loss 13.8333 | lr 1.52e-04 | grad 0.813 | 37.3k tok/s | mfu 37.53%
+step   54110 | loss 13.7188 | lr 1.52e-04 | grad 0.786 | 37.3k tok/s | mfu 37.51%
+step   54120 | loss 13.4049 | lr 1.52e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+step   54130 | loss 14.0430 | lr 1.51e-04 | grad 0.797 | 37.3k tok/s | mfu 37.54%
+step   54140 | loss 14.3101 | lr 1.51e-04 | grad 0.822 | 37.3k tok/s | mfu 37.54%
+step   54150 | loss 13.9647 | lr 1.51e-04 | grad 0.791 | 37.3k tok/s | mfu 37.54%
+[Checkpoint] saved ./checkpoints/ckpt_step0054150.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053700.pt
+step   54160 | loss 13.8524 | lr 1.51e-04 | grad 0.779 | 31.9k tok/s | mfu 32.11%
+step   54170 | loss 13.2784 | lr 1.51e-04 | grad 0.789 | 37.3k tok/s | mfu 37.54%
+step   54180 | loss 13.7346 | lr 1.51e-04 | grad 0.802 | 37.3k tok/s | mfu 37.53%
+step   54190 | loss 14.0195 | lr 1.51e-04 | grad 0.791 | 37.3k tok/s | mfu 37.53%
+step   54200 | loss 13.9390 | lr 1.51e-04 | grad 0.791 | 37.3k tok/s | mfu 37.54%
+step   54210 | loss 13.6560 | lr 1.51e-04 | grad 0.810 | 37.3k tok/s | mfu 37.53%
+step   54220 | loss 13.4352 | lr 1.51e-04 | grad 0.786 | 37.3k tok/s | mfu 37.54%
+step   54230 | loss 13.2905 | lr 1.51e-04 | grad 0.793 | 37.3k tok/s | mfu 37.53%
+step   54240 | loss 13.1349 | lr 1.51e-04 | grad 0.792 | 37.3k tok/s | mfu 37.54%
+step   54250 | loss 13.3636 | lr 1.51e-04 | grad 0.778 | 37.3k tok/s | mfu 37.53%
+step   54260 | loss 14.1621 | lr 1.51e-04 | grad 0.806 | 37.3k tok/s | mfu 37.54%
+step   54270 | loss 13.7692 | lr 1.51e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   54280 | loss 13.8961 | lr 1.51e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   54290 | loss 13.1233 | lr 1.51e-04 | grad 0.790 | 37.3k tok/s | mfu 37.54%
+step   54300 | loss 13.9420 | lr 1.51e-04 | grad 0.830 | 37.3k tok/s | mfu 37.55%
+[Checkpoint] saved ./checkpoints/ckpt_step0054300.pt
+[Checkpoint] pruned checkpoints/ckpt_step0053850.pt
+step   54310 | loss 13.7907 | lr 1.51e-04 | grad 0.822 | 31.0k tok/s | mfu 31.13%
+step   54320 | loss 13.9425 | lr 1.51e-04 | grad 0.804 | 37.4k tok/s | mfu 37.56%
+step   54330 | loss 13.8788 | lr 1.51e-04 | grad 0.801 | 37.4k tok/s | mfu 37.56%
+step   54340 | loss 13.2571 | lr 1.51e-04 | grad 0.802 | 37.3k tok/s | mfu 37.55%
+step   54350 | loss 13.9009 | lr 1.51e-04 | grad 0.808 | 37.3k tok/s | mfu 37.54%
+step   54360 | loss 14.0390 | lr 1.50e-04 | grad 0.827 | 37.3k tok/s | mfu 37.53%
+step   54370 | loss 13.5544 | lr 1.50e-04 | grad 0.793 | 37.3k tok/s | mfu 37.53%
+step   54380 | loss 13.7766 | lr 1.50e-04 | grad 0.797 | 37.3k tok/s | mfu 37.52%
+step   54390 | loss 14.1837 | lr 1.50e-04 | grad 0.807 | 37.3k tok/s | mfu 37.53%
+step   54400 | loss 13.9469 | lr 1.50e-04 | grad 0.787 | 37.3k tok/s | mfu 37.53%
+step   54410 | loss 13.5823 | lr 1.50e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+step   54420 | loss 13.9572 | lr 1.50e-04 | grad 0.850 | 37.3k tok/s | mfu 37.53%
+step   54430 | loss 13.8962 | lr 1.50e-04 | grad 0.803 | 37.3k tok/s | mfu 37.53%
+step   54440 | loss 14.3721 | lr 1.50e-04 | grad 0.814 | 37.3k tok/s | mfu 37.53%
+step   54450 | loss 13.8295 | lr 1.50e-04 | grad 0.796 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0054450.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054000.pt
+step   54460 | loss 13.6735 | lr 1.50e-04 | grad 0.899 | 31.8k tok/s | mfu 32.01%
+step   54470 | loss 13.9515 | lr 1.50e-04 | grad 0.782 | 37.3k tok/s | mfu 37.53%
+step   54480 | loss 13.6255 | lr 1.50e-04 | grad 0.785 | 37.3k tok/s | mfu 37.55%
+step   54490 | loss 13.7091 | lr 1.50e-04 | grad 0.802 | 37.3k tok/s | mfu 37.53%
+step   54500 | loss 14.2241 | lr 1.50e-04 | grad 0.805 | 37.3k tok/s | mfu 37.54%
+  [eval] step   54500 | val_loss 4.1315
+step   54510 | loss 13.4661 | lr 1.50e-04 | grad 0.877 | 27.7k tok/s | mfu 27.81%
+step   54520 | loss 14.2184 | lr 1.50e-04 | grad 0.807 | 37.3k tok/s | mfu 37.54%
+step   54530 | loss 13.4543 | lr 1.50e-04 | grad 0.788 | 37.3k tok/s | mfu 37.53%
+step   54540 | loss 13.8055 | lr 1.50e-04 | grad 0.800 | 37.3k tok/s | mfu 37.53%
+step   54550 | loss 12.8493 | lr 1.50e-04 | grad 0.790 | 37.3k tok/s | mfu 37.54%
+step   54560 | loss 13.4499 | lr 1.50e-04 | grad 0.809 | 37.3k tok/s | mfu 37.53%
+step   54570 | loss 13.5341 | lr 1.50e-04 | grad 0.816 | 37.3k tok/s | mfu 37.53%
+step   54580 | loss 13.7720 | lr 1.50e-04 | grad 0.782 | 37.3k tok/s | mfu 37.53%
+step   54590 | loss 13.4821 | lr 1.49e-04 | grad 0.810 | 37.3k tok/s | mfu 37.54%
+step   54600 | loss 13.4296 | lr 1.49e-04 | grad 0.871 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0054600.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054150.pt
+step   54610 | loss 13.7243 | lr 1.49e-04 | grad 0.798 | 32.1k tok/s | mfu 32.30%
+step   54620 | loss 13.0743 | lr 1.49e-04 | grad 0.791 | 37.3k tok/s | mfu 37.56%
+step   54630 | loss 13.6341 | lr 1.49e-04 | grad 0.816 | 37.3k tok/s | mfu 37.52%
+step   54640 | loss 13.7587 | lr 1.49e-04 | grad 0.805 | 37.3k tok/s | mfu 37.55%
+step   54650 | loss 13.6859 | lr 1.49e-04 | grad 0.787 | 37.3k tok/s | mfu 37.54%
+step   54660 | loss 13.6041 | lr 1.49e-04 | grad 0.812 | 37.3k tok/s | mfu 37.53%
+step   54670 | loss 13.4047 | lr 1.49e-04 | grad 0.806 | 37.3k tok/s | mfu 37.52%
+step   54680 | loss 13.7229 | lr 1.49e-04 | grad 0.788 | 37.3k tok/s | mfu 37.51%
+step   54690 | loss 13.7093 | lr 1.49e-04 | grad 0.812 | 37.3k tok/s | mfu 37.52%
+step   54700 | loss 13.3406 | lr 1.49e-04 | grad 0.791 | 37.3k tok/s | mfu 37.52%
+step   54710 | loss 13.8775 | lr 1.49e-04 | grad 0.801 | 37.3k tok/s | mfu 37.52%
+step   54720 | loss 14.0002 | lr 1.49e-04 | grad 0.801 | 37.3k tok/s | mfu 37.51%
+step   54730 | loss 13.4313 | lr 1.49e-04 | grad 0.836 | 37.3k tok/s | mfu 37.53%
+step   54740 | loss 13.3957 | lr 1.49e-04 | grad 0.779 | 37.3k tok/s | mfu 37.51%
+step   54750 | loss 13.7726 | lr 1.49e-04 | grad 0.806 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0054750.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054300.pt
+step   54760 | loss 13.8196 | lr 1.49e-04 | grad 0.804 | 32.1k tok/s | mfu 32.29%
+step   54770 | loss 13.5327 | lr 1.49e-04 | grad 0.800 | 37.3k tok/s | mfu 37.54%
+step   54780 | loss 13.1594 | lr 1.49e-04 | grad 0.776 | 37.3k tok/s | mfu 37.53%
+step   54790 | loss 13.8122 | lr 1.49e-04 | grad 0.841 | 37.3k tok/s | mfu 37.54%
+step   54800 | loss 13.4171 | lr 1.49e-04 | grad 0.781 | 37.3k tok/s | mfu 37.54%
+step   54810 | loss 13.3582 | lr 1.49e-04 | grad 0.801 | 37.3k tok/s | mfu 37.53%
+step   54820 | loss 13.7327 | lr 1.49e-04 | grad 0.846 | 37.3k tok/s | mfu 37.49%
+step   54830 | loss 13.8919 | lr 1.48e-04 | grad 0.803 | 37.3k tok/s | mfu 37.51%
+step   54840 | loss 13.9793 | lr 1.48e-04 | grad 0.796 | 37.3k tok/s | mfu 37.53%
+step   54850 | loss 13.8686 | lr 1.48e-04 | grad 0.803 | 37.3k tok/s | mfu 37.53%
+step   54860 | loss 13.1115 | lr 1.48e-04 | grad 0.783 | 37.3k tok/s | mfu 37.52%
+step   54870 | loss 14.0661 | lr 1.48e-04 | grad 0.809 | 37.3k tok/s | mfu 37.52%
+step   54880 | loss 14.0766 | lr 1.48e-04 | grad 0.808 | 37.3k tok/s | mfu 37.51%
+step   54890 | loss 14.0355 | lr 1.48e-04 | grad 0.808 | 37.3k tok/s | mfu 37.53%
+step   54900 | loss 13.8739 | lr 1.48e-04 | grad 0.798 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0054900.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054450.pt
+step   54910 | loss 13.3706 | lr 1.48e-04 | grad 0.788 | 30.2k tok/s | mfu 30.36%
+step   54920 | loss 14.3986 | lr 1.48e-04 | grad 0.814 | 37.3k tok/s | mfu 37.52%
+step   54930 | loss 13.8680 | lr 1.48e-04 | grad 0.815 | 37.3k tok/s | mfu 37.53%
+step   54940 | loss 14.3898 | lr 1.48e-04 | grad 0.799 | 37.3k tok/s | mfu 37.53%
+step   54950 | loss 13.5895 | lr 1.48e-04 | grad 0.793 | 37.3k tok/s | mfu 37.55%
+step   54960 | loss 13.9427 | lr 1.48e-04 | grad 0.851 | 37.3k tok/s | mfu 37.53%
+step   54970 | loss 13.7981 | lr 1.48e-04 | grad 1.076 | 37.3k tok/s | mfu 37.50%
+step   54980 | loss 13.1928 | lr 1.48e-04 | grad 0.802 | 37.3k tok/s | mfu 37.53%
+step   54990 | loss 13.5979 | lr 1.48e-04 | grad 0.809 | 37.3k tok/s | mfu 37.53%
+step   55000 | loss 13.7647 | lr 1.48e-04 | grad 0.806 | 37.3k tok/s | mfu 37.54%
+  [eval] step   55000 | val_loss 4.0223
+step   55010 | loss 14.0348 | lr 1.48e-04 | grad 0.816 | 27.6k tok/s | mfu 27.80%
+step   55020 | loss 13.8882 | lr 1.48e-04 | grad 0.805 | 37.3k tok/s | mfu 37.54%
+step   55030 | loss 13.3630 | lr 1.48e-04 | grad 0.788 | 37.3k tok/s | mfu 37.52%
+step   55040 | loss 14.0071 | lr 1.48e-04 | grad 0.808 | 37.3k tok/s | mfu 37.53%
+step   55050 | loss 13.9083 | lr 1.48e-04 | grad 0.810 | 37.3k tok/s | mfu 37.54%
+[Checkpoint] saved ./checkpoints/ckpt_step0055050.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054600.pt
+step   55060 | loss 13.4089 | lr 1.47e-04 | grad 0.796 | 31.7k tok/s | mfu 31.85%
+step   55070 | loss 14.0951 | lr 1.47e-04 | grad 0.811 | 37.3k tok/s | mfu 37.49%
+step   55080 | loss 13.5708 | lr 1.47e-04 | grad 0.809 | 37.3k tok/s | mfu 37.50%
+step   55090 | loss 13.9330 | lr 1.47e-04 | grad 0.803 | 37.3k tok/s | mfu 37.50%
+step   55100 | loss 13.6372 | lr 1.47e-04 | grad 0.822 | 37.3k tok/s | mfu 37.50%
+step   55110 | loss 14.2701 | lr 1.47e-04 | grad 0.823 | 37.3k tok/s | mfu 37.51%
+step   55120 | loss 13.6883 | lr 1.47e-04 | grad 0.801 | 37.3k tok/s | mfu 37.51%
+step   55130 | loss 13.9199 | lr 1.47e-04 | grad 0.829 | 37.3k tok/s | mfu 37.51%
+step   55140 | loss 13.5064 | lr 1.47e-04 | grad 0.829 | 37.3k tok/s | mfu 37.51%
+step   55150 | loss 13.4738 | lr 1.47e-04 | grad 0.828 | 37.3k tok/s | mfu 37.49%
+step   55160 | loss 13.7686 | lr 1.47e-04 | grad 0.823 | 37.3k tok/s | mfu 37.50%
+step   55170 | loss 13.4537 | lr 1.47e-04 | grad 0.813 | 37.3k tok/s | mfu 37.50%
+step   55180 | loss 14.0447 | lr 1.47e-04 | grad 0.810 | 37.3k tok/s | mfu 37.49%
+step   55190 | loss 13.8513 | lr 1.47e-04 | grad 0.821 | 37.3k tok/s | mfu 37.52%
+step   55200 | loss 13.8439 | lr 1.47e-04 | grad 0.817 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0055200.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054750.pt
+step   55210 | loss 14.1904 | lr 1.47e-04 | grad 0.805 | 31.0k tok/s | mfu 31.14%
+step   55220 | loss 13.2104 | lr 1.47e-04 | grad 0.802 | 37.3k tok/s | mfu 37.52%
+step   55230 | loss 13.5014 | lr 1.47e-04 | grad 0.794 | 37.3k tok/s | mfu 37.51%
+step   55240 | loss 13.6977 | lr 1.47e-04 | grad 0.817 | 37.3k tok/s | mfu 37.52%
+step   55250 | loss 13.3039 | lr 1.47e-04 | grad 0.801 | 37.3k tok/s | mfu 37.52%
+step   55260 | loss 13.8402 | lr 1.47e-04 | grad 0.814 | 37.3k tok/s | mfu 37.52%
+step   55270 | loss 14.2460 | lr 1.47e-04 | grad 0.815 | 37.3k tok/s | mfu 37.52%
+step   55280 | loss 13.6209 | lr 1.47e-04 | grad 0.800 | 37.3k tok/s | mfu 37.51%
+step   55290 | loss 13.8481 | lr 1.46e-04 | grad 0.812 | 37.3k tok/s | mfu 37.52%
+step   55300 | loss 12.9605 | lr 1.46e-04 | grad 0.808 | 37.3k tok/s | mfu 37.52%
+step   55310 | loss 13.5301 | lr 1.46e-04 | grad 0.976 | 37.3k tok/s | mfu 37.53%
+step   55320 | loss 13.8429 | lr 1.46e-04 | grad 0.803 | 37.3k tok/s | mfu 37.52%
+step   55330 | loss 13.5842 | lr 1.46e-04 | grad 0.805 | 37.3k tok/s | mfu 37.52%
+step   55340 | loss 14.2225 | lr 1.46e-04 | grad 0.844 | 37.3k tok/s | mfu 37.51%
+step   55350 | loss 13.1892 | lr 1.46e-04 | grad 0.793 | 37.3k tok/s | mfu 37.52%
+[Checkpoint] saved ./checkpoints/ckpt_step0055350.pt
+[Checkpoint] pruned checkpoints/ckpt_step0054900.pt
+step   55360 | loss 13.8606 | lr 1.46e-04 | grad 0.824 | 32.1k tok/s | mfu 32.33%
+step   55370 | loss 13.3728 | lr 1.46e-04 | grad 0.803 | 37.0k tok/s | mfu 37.21%
+step   55380 | loss 13.3121 | lr 1.46e-04 | grad 0.810 | 37.3k tok/s | mfu 37.53%
+step   55390 | loss 14.0676 | lr 1.46e-04 | grad 0.823 | 37.3k tok/s | mfu 37.54%
+step   55400 | loss 14.0221 | lr 1.46e-04 | grad 0.823 | 37.3k tok/s | mfu 37.53%
+step   55410 | loss 14.0056 | lr 1.46e-04 | grad 0.799 | 37.3k tok/s | mfu 37.54%
+step   55420 | loss 13.6901 | lr 1.46e-04 | grad 0.801 | 37.3k tok/s | mfu 37.53%
+step   55430 | loss 14.2500 | lr 1.46e-04 | grad 0.821 | 37.3k tok/s | mfu 37.50%
+step   55440 | loss 13.6167 | lr 1.46e-04 | grad 0.813 | 37.3k tok/s | mfu 37.51%
+step   55450 | loss 12.9503 | lr 1.46e-04 | grad 0.809 | 37.3k tok/s | mfu 37.52%
+step   55460 | loss 13.6198 | lr 1.46e-04 | grad 0.813 | 37.3k tok/s | mfu 37.51%
+step   55470 | loss 13.9255 | lr 1.46e-04 | grad 0.819 | 37.3k tok/s | mfu 37.53%
+step   55480 | loss 13.7993 | lr 1.46e-04 | grad 0.848 | 37.3k tok/s | mfu 37.53%
+step   55490 | loss 13.5858 | lr 1.46e-04 | grad 0.827 | 37.3k tok/s | mfu 37.53%
+step   55500 | loss 13.8218 | lr 1.46e-04 | grad 0.806 | 37.3k tok/s | mfu 37.53%
+  [eval] step   55500 | val_loss 4.0425
+[Checkpoint] saved ./checkpoints/ckpt_step0055500.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055050.pt
+step   55510 | loss 13.1055 | lr 1.46e-04 | grad 0.799 | 22.0k tok/s | mfu 22.15%
+step   55520 | loss 13.1835 | lr 1.46e-04 | grad 0.793 | 37.3k tok/s | mfu 37.54%
+step   55530 | loss 13.3873 | lr 1.45e-04 | grad 0.811 | 37.3k tok/s | mfu 37.53%
+step   55540 | loss 13.5547 | lr 1.45e-04 | grad 0.820 | 37.3k tok/s | mfu 37.54%
+step   55550 | loss 13.8831 | lr 1.45e-04 | grad 0.812 | 37.3k tok/s | mfu 37.54%
+step   55560 | loss 13.4655 | lr 1.45e-04 | grad 0.837 | 37.3k tok/s | mfu 37.53%
+step   55570 | loss 13.8249 | lr 1.45e-04 | grad 0.811 | 37.3k tok/s | mfu 37.52%
+step   55580 | loss 13.8953 | lr 1.45e-04 | grad 0.812 | 37.3k tok/s | mfu 37.53%
+step   55590 | loss 13.9134 | lr 1.45e-04 | grad 0.804 | 37.3k tok/s | mfu 37.52%
+step   55600 | loss 13.7080 | lr 1.45e-04 | grad 0.805 | 37.3k tok/s | mfu 37.53%
+step   55610 | loss 13.0030 | lr 1.45e-04 | grad 0.802 | 37.3k tok/s | mfu 37.51%
+step   55620 | loss 13.1396 | lr 1.45e-04 | grad 0.814 | 37.3k tok/s | mfu 37.52%
+step   55630 | loss 13.7042 | lr 1.45e-04 | grad 0.824 | 37.3k tok/s | mfu 37.52%
+step   55640 | loss 13.3578 | lr 1.45e-04 | grad 0.862 | 37.3k tok/s | mfu 37.52%
+step   55650 | loss 13.6718 | lr 1.45e-04 | grad 0.804 | 37.3k tok/s | mfu 37.53%
+[Checkpoint] saved ./checkpoints/ckpt_step0055650.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055200.pt
+step   55660 | loss 14.0937 | lr 1.45e-04 | grad 0.989 | 32.1k tok/s | mfu 32.32%
+step   55670 | loss 13.3535 | lr 1.45e-04 | grad 0.810 | 37.3k tok/s | mfu 37.50%
+step   55680 | loss 12.8765 | lr 1.45e-04 | grad 0.797 | 37.3k tok/s | mfu 37.52%
+step   55690 | loss 13.0638 | lr 1.45e-04 | grad 0.814 | 37.3k tok/s | mfu 37.53%
+step   55700 | loss 13.5746 | lr 1.45e-04 | grad 0.797 | 37.3k tok/s | mfu 37.50%
+step   55710 | loss 14.5344 | lr 1.45e-04 | grad 0.816 | 37.3k tok/s | mfu 37.53%
+step   55720 | loss 12.9554 | lr 1.45e-04 | grad 0.809 | 37.3k tok/s | mfu 37.48%
+step   55730 | loss 13.1073 | lr 1.45e-04 | grad 0.799 | 37.3k tok/s | mfu 37.51%
+step   55740 | loss 13.5336 | lr 1.45e-04 | grad 0.808 | 37.3k tok/s | mfu 37.49%
+step   55750 | loss 12.9988 | lr 1.45e-04 | grad 0.801 | 37.3k tok/s | mfu 37.52%
+step   55760 | loss 13.4389 | lr 1.44e-04 | grad 0.824 | 37.3k tok/s | mfu 37.49%
+step   55770 | loss 13.7314 | lr 1.44e-04 | grad 0.815 | 37.3k tok/s | mfu 37.50%
+step   55780 | loss 12.3433 | lr 1.44e-04 | grad 0.798 | 37.3k tok/s | mfu 37.51%
+step   55790 | loss 13.1298 | lr 1.44e-04 | grad 0.790 | 37.3k tok/s | mfu 37.50%
+step   55800 | loss 13.4899 | lr 1.44e-04 | grad 0.805 | 37.3k tok/s | mfu 37.51%
+[Checkpoint] saved ./checkpoints/ckpt_step0055800.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055350.pt
+step   55810 | loss 13.9150 | lr 1.44e-04 | grad 0.806 | 31.0k tok/s | mfu 31.18%
+step   55820 | loss 13.4972 | lr 1.44e-04 | grad 0.799 | 37.0k tok/s | mfu 37.19%
+step   55830 | loss 13.4154 | lr 1.44e-04 | grad 0.798 | 37.3k tok/s | mfu 37.53%
+step   55840 | loss 13.6636 | lr 1.44e-04 | grad 0.831 | 37.3k tok/s | mfu 37.52%
+step   55850 | loss 13.8327 | lr 1.44e-04 | grad 0.847 | 37.3k tok/s | mfu 37.53%
+step   55860 | loss 14.3776 | lr 1.44e-04 | grad 0.816 | 37.3k tok/s | mfu 37.53%
+step   55870 | loss 13.3988 | lr 1.44e-04 | grad 0.809 | 37.3k tok/s | mfu 37.52%
+step   55880 | loss 13.9140 | lr 1.44e-04 | grad 0.814 | 37.3k tok/s | mfu 37.51%
+step   55890 | loss 13.8535 | lr 1.44e-04 | grad 0.811 | 37.3k tok/s | mfu 37.52%
+step   55900 | loss 13.9082 | lr 1.44e-04 | grad 0.816 | 37.3k tok/s | mfu 37.53%
+step   55910 | loss 13.1346 | lr 1.44e-04 | grad 0.797 | 37.3k tok/s | mfu 37.53%
+step   55920 | loss 13.7258 | lr 1.44e-04 | grad 0.806 | 37.3k tok/s | mfu 37.52%
+step   55930 | loss 14.1342 | lr 1.44e-04 | grad 0.808 | 37.3k tok/s | mfu 37.52%
+step   55940 | loss 13.3369 | lr 1.44e-04 | grad 0.827 | 37.3k tok/s | mfu 37.52%
+step   55950 | loss 13.3289 | lr 1.44e-04 | grad 0.832 | 37.3k tok/s | mfu 37.51%
+[Checkpoint] saved ./checkpoints/ckpt_step0055950.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055500.pt
+step   55960 | loss 13.3594 | lr 1.44e-04 | grad 0.808 | 30.4k tok/s | mfu 30.61%
+step   55970 | loss 14.2457 | lr 1.44e-04 | grad 0.842 | 37.3k tok/s | mfu 37.53%
+step   55980 | loss 13.8724 | lr 1.44e-04 | grad 0.825 | 37.3k tok/s | mfu 37.52%
+step   55990 | loss 14.0175 | lr 1.43e-04 | grad 0.813 | 37.3k tok/s | mfu 37.52%
+step   56000 | loss 13.2840 | lr 1.43e-04 | grad 0.811 | 37.3k tok/s | mfu 37.52%
+  [eval] step   56000 | val_loss 4.0429
+step   56010 | loss 13.6931 | lr 1.43e-04 | grad 0.812 | 27.6k tok/s | mfu 27.77%
+step   56020 | loss 13.6116 | lr 1.43e-04 | grad 0.827 | 37.3k tok/s | mfu 37.52%
+step   56030 | loss 13.9331 | lr 1.43e-04 | grad 0.876 | 37.3k tok/s | mfu 37.53%
+step   56040 | loss 13.0816 | lr 1.43e-04 | grad 0.804 | 37.3k tok/s | mfu 37.50%
+step   56050 | loss 13.4841 | lr 1.43e-04 | grad 0.811 | 37.3k tok/s | mfu 37.52%
+step   56060 | loss 13.1664 | lr 1.43e-04 | grad 0.819 | 37.3k tok/s | mfu 37.53%
+step   56070 | loss 13.7373 | lr 1.43e-04 | grad 0.814 | 37.3k tok/s | mfu 37.52%
+step   56080 | loss 13.1355 | lr 1.43e-04 | grad 0.800 | 37.3k tok/s | mfu 37.51%
+step   56090 | loss 14.6980 | lr 1.43e-04 | grad 0.826 | 37.3k tok/s | mfu 37.51%
+step   56100 | loss 13.6890 | lr 1.43e-04 | grad 0.816 | 37.3k tok/s | mfu 37.49%
+[Checkpoint] saved ./checkpoints/ckpt_step0056100.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055650.pt
+step   56110 | loss 13.4447 | lr 1.43e-04 | grad 0.837 | 30.2k tok/s | mfu 30.37%
+step   56120 | loss 13.6645 | lr 1.43e-04 | grad 0.827 | 37.3k tok/s | mfu 37.51%
+step   56130 | loss 13.5875 | lr 1.43e-04 | grad 0.811 | 37.3k tok/s | mfu 37.51%
+step   56140 | loss 14.0622 | lr 1.43e-04 | grad 0.832 | 37.3k tok/s | mfu 37.51%
+step   56150 | loss 13.6458 | lr 1.43e-04 | grad 0.807 | 37.3k tok/s | mfu 37.50%
+step   56160 | loss 13.6133 | lr 1.43e-04 | grad 0.815 | 37.3k tok/s | mfu 37.48%
+step   56170 | loss 13.1607 | lr 1.43e-04 | grad 0.821 | 37.3k tok/s | mfu 37.49%
+step   56180 | loss 12.9801 | lr 1.43e-04 | grad 0.807 | 37.3k tok/s | mfu 37.49%
+step   56190 | loss 13.8400 | lr 1.43e-04 | grad 0.819 | 37.3k tok/s | mfu 37.48%
+step   56200 | loss 13.4102 | lr 1.43e-04 | grad 0.816 | 37.3k tok/s | mfu 37.49%
+step   56210 | loss 13.6611 | lr 1.43e-04 | grad 0.823 | 37.3k tok/s | mfu 37.47%
+step   56220 | loss 13.6271 | lr 1.43e-04 | grad 0.810 | 37.3k tok/s | mfu 37.48%
+step   56230 | loss 13.5175 | lr 1.42e-04 | grad 0.818 | 37.3k tok/s | mfu 37.47%
+step   56240 | loss 13.7208 | lr 1.42e-04 | grad 0.826 | 37.3k tok/s | mfu 37.47%
+step   56250 | loss 13.1285 | lr 1.42e-04 | grad 0.813 | 37.3k tok/s | mfu 37.46%
+[Checkpoint] saved ./checkpoints/ckpt_step0056250.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055800.pt
+step   56260 | loss 13.5314 | lr 1.42e-04 | grad 0.809 | 32.1k tok/s | mfu 32.28%
+step   56270 | loss 13.3999 | lr 1.42e-04 | grad 0.823 | 37.3k tok/s | mfu 37.49%
+step   56280 | loss 13.2125 | lr 1.42e-04 | grad 0.815 | 37.3k tok/s | mfu 37.48%
+step   56290 | loss 13.6240 | lr 1.42e-04 | grad 0.820 | 37.3k tok/s | mfu 37.47%
+step   56300 | loss 12.9701 | lr 1.42e-04 | grad 0.797 | 37.3k tok/s | mfu 37.46%
+step   56310 | loss 13.4404 | lr 1.42e-04 | grad 0.832 | 37.3k tok/s | mfu 37.47%
+step   56320 | loss 13.1952 | lr 1.42e-04 | grad 0.809 | 37.3k tok/s | mfu 37.48%
+step   56330 | loss 13.7084 | lr 1.42e-04 | grad 0.814 | 37.3k tok/s | mfu 37.47%
+step   56340 | loss 13.5572 | lr 1.42e-04 | grad 0.821 | 37.3k tok/s | mfu 37.47%
+step   56350 | loss 14.3086 | lr 1.42e-04 | grad 0.815 | 37.3k tok/s | mfu 37.47%
+step   56360 | loss 13.2980 | lr 1.42e-04 | grad 0.815 | 37.3k tok/s | mfu 37.47%
+step   56370 | loss 13.8650 | lr 1.42e-04 | grad 0.841 | 37.3k tok/s | mfu 37.47%
+step   56380 | loss 13.3197 | lr 1.42e-04 | grad 0.816 | 37.3k tok/s | mfu 37.48%
+step   56390 | loss 13.8401 | lr 1.42e-04 | grad 0.829 | 37.3k tok/s | mfu 37.47%
+step   56400 | loss 13.4411 | lr 1.42e-04 | grad 0.818 | 37.3k tok/s | mfu 37.47%
+[Checkpoint] saved ./checkpoints/ckpt_step0056400.pt
+[Checkpoint] pruned checkpoints/ckpt_step0055950.pt
+step   56410 | loss 13.8092 | lr 1.42e-04 | grad 0.835 | 30.4k tok/s | mfu 30.57%
+step   56420 | loss 14.1684 | lr 1.42e-04 | grad 0.828 | 37.3k tok/s | mfu 37.48%
+step   56430 | loss 13.4482 | lr 1.42e-04 | grad 0.814 | 37.3k tok/s | mfu 37.48%
+step   56440 | loss 13.3091 | lr 1.42e-04 | grad 0.822 | 37.3k tok/s | mfu 37.48%
+step   56450 | loss 13.3274 | lr 1.42e-04 | grad 0.809 | 37.3k tok/s | mfu 37.47%
+step   56460 | loss 13.7370 | lr 1.41e-04 | grad 0.891 | 37.2k tok/s | mfu 37.45%
+step   56470 | loss 13.4979 | lr 1.41e-04 | grad 0.805 | 37.3k tok/s | mfu 37.46%
+step   56480 | loss 13.6754 | lr 1.41e-04 | grad 0.820 | 37.2k tok/s | mfu 37.44%
+step   56490 | loss 14.1332 | lr 1.41e-04 | grad 0.850 | 37.2k tok/s | mfu 37.46%
+step   56500 | loss 13.7281 | lr 1.41e-04 | grad 0.825 | 37.2k tok/s | mfu 37.45%
+  [eval] step   56500 | val_loss 3.9992
+step   56510 | loss 14.3611 | lr 1.41e-04 | grad 0.834 | 27.6k tok/s | mfu 27.71%
+step   56520 | loss 14.0331 | lr 1.41e-04 | grad 0.822 | 37.2k tok/s | mfu 37.45%
+step   56530 | loss 13.6119 | lr 1.41e-04 | grad 0.821 | 37.2k tok/s | mfu 37.42%
+step   56540 | loss 13.9849 | lr 1.41e-04 | grad 0.820 | 37.2k tok/s | mfu 37.44%
+step   56550 | loss 13.5783 | lr 1.41e-04 | grad 0.820 | 37.2k tok/s | mfu 37.45%
+[Checkpoint] saved ./checkpoints/ckpt_step0056550.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056100.pt
+step   56560 | loss 14.3721 | lr 1.41e-04 | grad 0.846 | 32.1k tok/s | mfu 32.25%
+step   56570 | loss 13.8994 | lr 1.41e-04 | grad 0.845 | 37.3k tok/s | mfu 37.47%
+step   56580 | loss 13.7150 | lr 1.41e-04 | grad 0.822 | 37.3k tok/s | mfu 37.46%
+step   56590 | loss 13.7600 | lr 1.41e-04 | grad 0.830 | 37.2k tok/s | mfu 37.45%
+step   56600 | loss 13.5831 | lr 1.41e-04 | grad 0.844 | 37.3k tok/s | mfu 37.46%
+step   56610 | loss 13.9613 | lr 1.41e-04 | grad 0.835 | 37.3k tok/s | mfu 37.46%
+step   56620 | loss 13.8621 | lr 1.41e-04 | grad 0.840 | 37.2k tok/s | mfu 37.45%
+step   56630 | loss 14.0719 | lr 1.41e-04 | grad 0.832 | 37.2k tok/s | mfu 37.45%
+step   56640 | loss 14.6139 | lr 1.41e-04 | grad 0.826 | 37.3k tok/s | mfu 37.46%
+step   56650 | loss 13.6327 | lr 1.41e-04 | grad 0.820 | 37.2k tok/s | mfu 37.45%
+step   56660 | loss 13.3223 | lr 1.41e-04 | grad 0.808 | 37.3k tok/s | mfu 37.46%
+step   56670 | loss 14.2434 | lr 1.41e-04 | grad 0.833 | 37.3k tok/s | mfu 37.46%
+step   56680 | loss 12.9222 | lr 1.41e-04 | grad 0.815 | 37.2k tok/s | mfu 37.45%
+step   56690 | loss 13.1450 | lr 1.41e-04 | grad 0.803 | 37.2k tok/s | mfu 37.44%
+step   56700 | loss 13.3598 | lr 1.40e-04 | grad 0.817 | 37.2k tok/s | mfu 37.44%
+[Checkpoint] saved ./checkpoints/ckpt_step0056700.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056250.pt
+step   56710 | loss 13.5478 | lr 1.40e-04 | grad 0.819 | 31.3k tok/s | mfu 31.49%
+step   56720 | loss 13.4559 | lr 1.40e-04 | grad 0.815 | 37.2k tok/s | mfu 37.46%
+step   56730 | loss 14.0815 | lr 1.40e-04 | grad 0.839 | 34.2k tok/s | mfu 34.36%
+step   56740 | loss 13.8078 | lr 1.40e-04 | grad 0.825 | 37.3k tok/s | mfu 37.48%
+step   56750 | loss 14.0069 | lr 1.40e-04 | grad 0.825 | 37.3k tok/s | mfu 37.49%
+step   56760 | loss 13.4780 | lr 1.40e-04 | grad 0.806 | 37.3k tok/s | mfu 37.48%
+step   56770 | loss 13.5307 | lr 1.40e-04 | grad 0.826 | 37.3k tok/s | mfu 37.47%
+step   56780 | loss 14.1534 | lr 1.40e-04 | grad 0.844 | 37.3k tok/s | mfu 37.48%
+step   56790 | loss 13.3573 | lr 1.40e-04 | grad 0.823 | 37.3k tok/s | mfu 37.48%
+step   56800 | loss 13.4609 | lr 1.40e-04 | grad 0.813 | 37.3k tok/s | mfu 37.47%
+step   56810 | loss 13.2093 | lr 1.40e-04 | grad 0.813 | 37.3k tok/s | mfu 37.47%
+step   56820 | loss 13.4037 | lr 1.40e-04 | grad 0.823 | 37.3k tok/s | mfu 37.47%
+step   56830 | loss 14.0807 | lr 1.40e-04 | grad 0.823 | 37.3k tok/s | mfu 37.46%
+step   56840 | loss 13.6376 | lr 1.40e-04 | grad 0.822 | 37.2k tok/s | mfu 37.46%
+step   56850 | loss 13.1971 | lr 1.40e-04 | grad 0.818 | 37.2k tok/s | mfu 37.45%
+[Checkpoint] saved ./checkpoints/ckpt_step0056850.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056400.pt
+step   56860 | loss 13.5921 | lr 1.40e-04 | grad 0.824 | 31.9k tok/s | mfu 32.07%
+step   56870 | loss 14.3369 | lr 1.40e-04 | grad 0.844 | 37.2k tok/s | mfu 37.43%
+step   56880 | loss 13.3932 | lr 1.40e-04 | grad 0.823 | 35.2k tok/s | mfu 35.37%
+step   56890 | loss 13.4517 | lr 1.40e-04 | grad 0.825 | 37.3k tok/s | mfu 37.46%
+step   56900 | loss 14.0712 | lr 1.40e-04 | grad 0.830 | 37.2k tok/s | mfu 37.44%
+step   56910 | loss 13.2238 | lr 1.40e-04 | grad 0.817 | 37.3k tok/s | mfu 37.46%
+step   56920 | loss 13.8589 | lr 1.40e-04 | grad 0.842 | 37.3k tok/s | mfu 37.46%
+step   56930 | loss 13.7180 | lr 1.39e-04 | grad 0.817 | 37.2k tok/s | mfu 37.45%
+step   56940 | loss 13.3759 | lr 1.39e-04 | grad 0.819 | 37.2k tok/s | mfu 37.42%
+step   56950 | loss 13.6596 | lr 1.39e-04 | grad 0.827 | 37.2k tok/s | mfu 37.45%
+step   56960 | loss 13.5416 | lr 1.39e-04 | grad 0.820 | 37.2k tok/s | mfu 37.45%
+step   56970 | loss 13.1407 | lr 1.39e-04 | grad 0.826 | 37.2k tok/s | mfu 37.45%
+step   56980 | loss 13.9675 | lr 1.39e-04 | grad 0.860 | 37.2k tok/s | mfu 37.46%
+step   56990 | loss 13.7909 | lr 1.39e-04 | grad 0.833 | 37.2k tok/s | mfu 37.45%
+step   57000 | loss 13.7245 | lr 1.39e-04 | grad 0.822 | 37.2k tok/s | mfu 37.42%
+  [eval] step   57000 | val_loss 4.0668
+[Checkpoint] saved ./checkpoints/ckpt_step0057000.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056550.pt
+step   57010 | loss 13.6907 | lr 1.39e-04 | grad 0.824 | 24.6k tok/s | mfu 24.78%
+step   57020 | loss 14.0913 | lr 1.39e-04 | grad 0.823 | 37.2k tok/s | mfu 37.45%
+step   57030 | loss 13.1296 | lr 1.39e-04 | grad 0.811 | 37.2k tok/s | mfu 37.44%
+step   57040 | loss 13.4109 | lr 1.39e-04 | grad 0.823 | 37.2k tok/s | mfu 37.44%
+step   57050 | loss 13.5082 | lr 1.39e-04 | grad 0.811 | 37.3k tok/s | mfu 37.46%
+step   57060 | loss 13.7558 | lr 1.39e-04 | grad 0.824 | 37.2k tok/s | mfu 37.45%
+step   57070 | loss 13.8434 | lr 1.39e-04 | grad 0.824 | 37.2k tok/s | mfu 37.44%
+step   57080 | loss 12.8868 | lr 1.39e-04 | grad 0.827 | 37.2k tok/s | mfu 37.44%
+step   57090 | loss 13.8396 | lr 1.39e-04 | grad 0.827 | 37.2k tok/s | mfu 37.44%
+step   57100 | loss 13.3837 | lr 1.39e-04 | grad 0.813 | 37.2k tok/s | mfu 37.42%
+step   57110 | loss 13.6276 | lr 1.39e-04 | grad 0.824 | 37.2k tok/s | mfu 37.42%
+step   57120 | loss 13.6435 | lr 1.39e-04 | grad 0.822 | 37.2k tok/s | mfu 37.42%
+step   57130 | loss 13.5770 | lr 1.39e-04 | grad 0.839 | 37.2k tok/s | mfu 37.43%
+step   57140 | loss 13.6822 | lr 1.39e-04 | grad 0.830 | 37.2k tok/s | mfu 37.42%
+step   57150 | loss 13.1600 | lr 1.39e-04 | grad 0.813 | 37.2k tok/s | mfu 37.42%
+[Checkpoint] saved ./checkpoints/ckpt_step0057150.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056700.pt
+step   57160 | loss 14.1588 | lr 1.39e-04 | grad 0.829 | 30.9k tok/s | mfu 31.08%
+step   57170 | loss 13.4314 | lr 1.38e-04 | grad 0.843 | 37.2k tok/s | mfu 37.43%
+step   57180 | loss 13.6694 | lr 1.38e-04 | grad 0.832 | 37.2k tok/s | mfu 37.43%
+step   57190 | loss 13.4577 | lr 1.38e-04 | grad 0.830 | 33.9k tok/s | mfu 34.06%
+step   57200 | loss 14.0156 | lr 1.38e-04 | grad 0.835 | 37.2k tok/s | mfu 37.45%
+step   57210 | loss 14.1193 | lr 1.38e-04 | grad 0.856 | 37.2k tok/s | mfu 37.45%
+step   57220 | loss 12.4726 | lr 1.38e-04 | grad 0.809 | 37.2k tok/s | mfu 37.44%
+step   57230 | loss 13.8644 | lr 1.38e-04 | grad 0.842 | 36.2k tok/s | mfu 36.37%
+step   57240 | loss 13.3786 | lr 1.38e-04 | grad 0.837 | 37.2k tok/s | mfu 37.45%
+step   57250 | loss 13.7184 | lr 1.38e-04 | grad 0.823 | 37.2k tok/s | mfu 37.44%
+step   57260 | loss 13.3558 | lr 1.38e-04 | grad 0.870 | 37.2k tok/s | mfu 37.44%
+step   57270 | loss 14.3188 | lr 1.38e-04 | grad 0.845 | 37.2k tok/s | mfu 37.44%
+step   57280 | loss 13.4701 | lr 1.38e-04 | grad 0.823 | 37.2k tok/s | mfu 37.44%
+step   57290 | loss 13.2053 | lr 1.38e-04 | grad 0.828 | 37.2k tok/s | mfu 37.43%
+step   57300 | loss 13.6729 | lr 1.38e-04 | grad 0.832 | 37.2k tok/s | mfu 37.43%
+[Checkpoint] saved ./checkpoints/ckpt_step0057300.pt
+[Checkpoint] pruned checkpoints/ckpt_step0056850.pt
+step   57310 | loss 13.4190 | lr 1.38e-04 | grad 0.829 | 31.2k tok/s | mfu 31.33%
+step   57320 | loss 13.2814 | lr 1.38e-04 | grad 0.839 | 37.2k tok/s | mfu 37.43%
+step   57330 | loss 13.8073 | lr 1.38e-04 | grad 0.835 | 37.2k tok/s | mfu 37.42%
+step   57340 | loss 13.8064 | lr 1.38e-04 | grad 0.830 | 37.2k tok/s | mfu 37.43%
+step   57350 | loss 13.5626 | lr 1.38e-04 | grad 0.820 | 37.2k tok/s | mfu 37.42%
