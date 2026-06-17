@@ -209,10 +209,12 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight.to(dtype) * x.to(dtype)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x32 = x.float()
+            variance = x32.pow(2).mean(-1, keepdim=True)
+            x32 = x32 * torch.rsqrt(variance + self.eps)
+            out = self.weight.float() * x32
+        return out.to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +310,14 @@ class Qwen3Attention(nn.Module):
         v = v.transpose(1, 2)
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Defensive: q/k must match v's dtype going into SDPA. RMSNorm (and any
+        # autocast interaction around it) can otherwise silently promote q/k to
+        # fp32 while v stays in the engine's compute dtype.
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
 
         if past_key_value is not None:
             past_k, past_v = past_key_value

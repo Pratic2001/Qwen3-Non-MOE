@@ -873,6 +873,15 @@ def train(args):
     tokens_per_step = (
         args.batch_size * args.seq_len * args.grad_accum_steps * world_size
     )
+    # Tokens consumed by a single loop iteration (one micro-batch / one call
+    # to engine(x, labels=y)). DeepSpeed only performs an optimizer step once
+    # every grad_accum_steps iterations, but the logging loop below counts
+    # *iterations*, not optimizer steps -- so throughput must be computed
+    # from the micro-batch token count, not tokens_per_step (which already
+    # has grad_accum_steps folded in). Multiplying tokens_per_step by the
+    # iteration count double-counts grad_accum_steps and inflates tok/s
+    # (and therefore MFU) by that factor.
+    tokens_per_microbatch = args.batch_size * args.seq_len * world_size
     if master:
         print(f"Tokens / optimizer step : {tokens_per_step:,}")
         print(f"Effective batch size    : {args.batch_size * args.grad_accum_steps * world_size}")
@@ -910,7 +919,7 @@ def train(args):
         # ---- logging
         if master and step % args.log_interval == 0:
             t1          = time.perf_counter()
-            tok_per_sec = tokens_per_step * args.log_interval / max(t1 - t0, 1e-9)
+            tok_per_sec = tokens_per_microbatch * args.log_interval / max(t1 - t0, 1e-9)
             mfu         = estimate_mfu(engine, tok_per_sec, hw["gpus"])
             loss_display = loss_accum / args.log_interval
             loss_accum   = 0.0

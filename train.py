@@ -588,8 +588,14 @@ def train(args):
             tok_per_sec = tokens_per_step * args.log_interval / dt
             mfu         = estimate_mfu(model, tok_per_sec, gpu_peak_tflops)
 
-            # un-scale the accumulated loss for display
-            loss_display      = loss_accum * args.grad_accum_steps / args.log_interval
+            # loss_accum already holds the sum, over log_interval optimizer
+            # steps, of each step's true average loss (the per-micro-step
+            # division by grad_accum_steps is canceled out by summing
+            # grad_accum_steps of them inside the inner loop). Only the
+            # log_interval averaging is needed here -- multiplying by
+            # grad_accum_steps again was double-counting that scaling and
+            # inflated the displayed loss by a factor of grad_accum_steps.
+            loss_display      = loss_accum / args.log_interval
             grad_norm_display = grad_norm_accum / args.log_interval
             loss_accum        = 0.0
             grad_norm_accum   = 0.0
