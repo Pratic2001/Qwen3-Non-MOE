@@ -888,7 +888,6 @@ def train(args):
     tokens_per_step = (
         args.batch_size * args.seq_len * args.grad_accum_steps * world_size
     )
-    tokens_per_microbatch = args.batch_size * args.seq_len * world_size
     if master:
         print(f"\nTokens / optimizer step : {tokens_per_step:,}")
         print(f"Effective batch size    : {tokens_per_step // args.seq_len:,} samples")
@@ -907,26 +906,34 @@ def train(args):
         for pg in engine.optimizer.param_groups:
             pg["lr"] = lr
 
-        # engine.backward + engine.step replace the manual
-        # micro-step + accumulation loop from train_sft.py; DeepSpeed
-        # counts micro-steps itself and only steps the optimizer at the
-        # end of the configured accumulation window.
-        x, y, m = train_ds.get_batch(args.batch_size, device)
-        out     = engine(x)
-        # masked cross entropy: only assistant tokens contribute
-        loss    = masked_cross_entropy(out["logits"], y, m)
+        # One outer iteration == one optimizer step. We drive the
+        # grad-accumulation loop by hand (mirroring train_sft.py) and
+        # only call engine.step() on the last micro-batch — DeepSpeed's
+        # built-in accumulation would otherwise advance its internal
+        # step counter faster than ours, breaking the per-step loss
+        # accounting below.
+        for micro in range(args.grad_accum_steps):
+            x, y, m = train_ds.get_batch(args.batch_size, device)
+            out     = engine(x)
+            # masked cross entropy: only assistant tokens contribute
+            loss    = masked_cross_entropy(out["logits"], y, m) / args.grad_accum_steps
+            engine.backward(loss)
 
-        engine.backward(loss)
+            loss_accum += loss.item()
+
         engine.step()
-
-        loss_accum += loss.item()
 
         # ---- logging
         if master and step % args.log_interval == 0:
             t1          = time.perf_counter()
-            tok_per_sec = tokens_per_microbatch * args.log_interval / max(t1 - t0, 1e-9)
-            mfu         = estimate_mfu(engine, tok_per_sec, hw["gpus"])
-            loss_display = loss_accum / args.log_interval
+            # tokens_per_step accounts for grad accum, so per optimizer
+            # step is the right unit here (matches train_sft.py).
+            tok_per_sec  = tokens_per_step * args.log_interval / max(t1 - t0, 1e-9)
+            mfu          = estimate_mfu(engine, tok_per_sec, hw["gpus"])
+            # Per micro-batch we divided by grad_accum_steps; multiply
+            # back so the displayed value is the mean per-optimizer-step
+            # loss, directly comparable to train_sft.py.
+            loss_display = loss_accum * args.grad_accum_steps / args.log_interval
             loss_accum   = 0.0
             grad_norm    = engine.get_global_grad_norm() or 0.0
 

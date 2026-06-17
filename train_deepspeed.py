@@ -873,15 +873,9 @@ def train(args):
     tokens_per_step = (
         args.batch_size * args.seq_len * args.grad_accum_steps * world_size
     )
-    # Tokens consumed by a single loop iteration (one micro-batch / one call
-    # to engine(x, labels=y)). DeepSpeed only performs an optimizer step once
-    # every grad_accum_steps iterations, but the logging loop below counts
-    # *iterations*, not optimizer steps -- so throughput must be computed
-    # from the micro-batch token count, not tokens_per_step (which already
-    # has grad_accum_steps folded in). Multiplying tokens_per_step by the
-    # iteration count double-counts grad_accum_steps and inflates tok/s
-    # (and therefore MFU) by that factor.
-    tokens_per_microbatch = args.batch_size * args.seq_len * world_size
+    # Each outer loop iteration is now one optimizer step (grad accum
+    # is driven by hand inside the loop), so tokens_per_step is the
+    # right unit for both loss averaging and throughput reporting.
     if master:
         print(f"Tokens / optimizer step : {tokens_per_step:,}")
         print(f"Effective batch size    : {args.batch_size * args.grad_accum_steps * world_size}")
@@ -904,23 +898,40 @@ def train(args):
             pg["lr"] = lr
 
         # ---- forward + backward + step
-        # engine.backward and engine.step replace the manual
-        # micro-step loop from train.py; DeepSpeed handles gradient
-        # accumulation internally (counting micro-steps itself).
-        x, y = train_loader.next_batch(device)
-        out  = engine(x, labels=y)
-        loss = out["loss"]
+        # Drive the grad-accumulation loop by hand (mirroring train.py)
+        # so each outer iteration here is exactly one optimizer step.
+        # DeepSpeed's built-in accumulation would otherwise advance its
+        # internal step counter faster than ours, breaking the per-step
+        # loss accounting below. We only call engine.step() on the last
+        # micro-batch; the manual loop guarantees the optimizer fires
+        # once per `step` of the outer `for step in range(...)`.
+        for micro_step in range(args.grad_accum_steps):
+            x, y = train_loader.next_batch(device)
+            out  = engine(x, labels=y)
+            # Divide by grad_accum_steps so the sum over the inner
+            # loop is the true mean loss over one effective batch
+            # (= one optimizer step), exactly like train.py.
+            loss = out["loss"] / args.grad_accum_steps
+            engine.backward(loss)
 
-        engine.backward(loss)
+            loss_accum += loss.item()
+
         engine.step()
-
-        loss_accum += loss.item()
 
         # ---- logging
         if master and step % args.log_interval == 0:
             t1          = time.perf_counter()
-            tok_per_sec = tokens_per_microbatch * args.log_interval / max(t1 - t0, 1e-9)
-            mfu         = estimate_mfu(engine, tok_per_sec, hw["gpus"])
+            # tokens_per_step accounts for grad accum; the outer loop now
+            # advances once per optimizer step, so this is the right unit
+            # (matches train.py exactly).
+            tok_per_sec  = tokens_per_step * args.log_interval / max(t1 - t0, 1e-9)
+            mfu          = estimate_mfu(engine, tok_per_sec, hw["gpus"])
+            # Per micro-batch we divided by grad_accum_steps; the inner
+            # sum over grad_accum_steps micro-batches already reconstructs
+            # the mean per-optimizer-step loss. Only the log_interval
+            # averaging is left — dividing by grad_accum_steps here
+            # would double-count and inflate the displayed loss by that
+            # factor.
             loss_display = loss_accum / args.log_interval
             loss_accum   = 0.0
 
