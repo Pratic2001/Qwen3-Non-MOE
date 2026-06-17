@@ -216,10 +216,10 @@ def pack_worker_shard(
     os.makedirs(cache_dir, exist_ok=True)
 
     shard_paths = select_shards_for_worker(data_dir, worker, num_workers)
-    print(f"[pack worker {worker}/{num_workers}] {len(shard_paths)} shard(s) "
+    print(f"[pack worker {worker + 1}/{num_workers}] {len(shard_paths)} shard(s) "
           f"assigned out of {len(glob.glob(os.path.join(data_dir, '*', '*.jsonl')))} total")
     if not shard_paths:
-        print(f"[pack worker {worker}/{num_workers}] no shards assigned "
+        print(f"[pack worker {worker + 1}/{num_workers}] no shards assigned "
               f"(num_workers > number of input files) — writing empty output")
 
     eos_id     = get_special_token_id(tokenizer, "<|endoftext|>")
@@ -234,7 +234,7 @@ def pack_worker_shard(
     val_mask_path   = os.path.join(cache_dir, f"sft_val_mask.{suffix}.bin")
     manifest_path   = os.path.join(cache_dir, f"sft_manifest.{suffix}.json")
 
-    print(f"[pack worker {worker}/{num_workers}] this streams records "
+    print(f"[pack worker {worker + 1}/{num_workers}] this streams records "
           f"one-by-one (constant RAM)")
 
     # ---- first pass: count tokens so we can pre-allocate mmaps
@@ -260,9 +260,9 @@ def pack_worker_shard(
                     total_train += n_tok
                 n_records += 1
 
-    print(f"[pack worker {worker}/{num_workers}] counted {n_records:,} records "
+    print(f"[pack worker {worker + 1}/{num_workers}] counted {n_records:,} records "
           f"in {time.time()-t0:.1f}s")
-    print(f"[pack worker {worker}/{num_workers}] train tokens: {total_train:,}  "
+    print(f"[pack worker {worker + 1}/{num_workers}] train tokens: {total_train:,}  "
           f"val tokens: {total_val:,}")
 
     # ---- allocate memmap files on disk (no RAM)
@@ -314,13 +314,13 @@ def pack_worker_shard(
 
                 n_records += 1
                 if time.time() - last_print > 5:
-                    print(f"[pack worker {worker}/{num_workers}] packing … "
+                    print(f"[pack worker {worker + 1}/{num_workers}] packing … "
                           f"{n_records:,} records written", end="\r")
                     last_print = time.time()
 
     train_tok.flush(); train_mask.flush()
     val_tok.flush();   val_mask.flush()
-    print(f"\n[pack worker {worker}/{num_workers}] packed {n_records:,} records "
+    print(f"\n[pack worker {worker + 1}/{num_workers}] packed {n_records:,} records "
           f"in {time.time()-t0:.1f}s total")
 
     manifest = {
@@ -342,7 +342,7 @@ def pack_worker_shard(
     }
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"[pack worker {worker}/{num_workers}] wrote manifest to {manifest_path}")
+    print(f"[pack worker {worker + 1}/{num_workers}] wrote manifest to {manifest_path}")
 
     return manifest
 
