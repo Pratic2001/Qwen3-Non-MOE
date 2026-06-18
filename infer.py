@@ -515,19 +515,17 @@ def _prepare_inputs(
 
     max_len = max(len(x) for x in ids_list)
     input_ids = torch.full((len(prompts), max_len), pad_id, dtype=torch.long)
-    # SDPA only accepts bool, float, or query-dtype masks.  Build the
-    # mask as a float additive mask: 0.0 for real tokens, -inf for pad.
-    # Casting the long 0/1 mask to float gives 0.0/1.0, which masks
-    # nothing — we want the inverse, so multiply pad-positions by -inf.
-    attn_float = torch.zeros((len(prompts), max_len), dtype=torch.float)
+    # SDPA only accepts bool, float, or query-dtype masks.  We build a
+    # float additive mask: 0.0 for real tokens, -inf for pad.  The
+    # caller casts it onto the model's compute device + dtype so SDPA
+    # sees a dtype match against the query.
+    attn_mask = torch.zeros((len(prompts), max_len), dtype=torch.float)
     for i, ids in enumerate(ids_list):
         offset = max_len - len(ids)
         input_ids[i, offset:] = torch.tensor(ids, dtype=torch.long)
-        attn_float[i, :offset] = float("-inf")  # mask left-pad
+        attn_mask[i, :offset] = float("-inf")  # mask left-pad
 
-    input_ids = input_ids.to(device)
-    attn_float = attn_float.to(device)
-    return input_ids, attn_float, max_len
+    return input_ids, attn_mask, max_len
 
 
 @torch.inference_mode()
@@ -543,11 +541,17 @@ def _step(
     token (decode step).  Returns the next-token logits at the last
     position and the updated KV cache.
     """
+    if attention_mask is not None:
+        # SDPA requires the additive mask dtype to match the query
+        # dtype, which equals the model's parameter dtype (bf16 by
+        # default).  Cast if needed.
+        model_dtype = next(model.parameters()).dtype
+        if attention_mask.dtype != model_dtype:
+            attention_mask = attention_mask.to(model_dtype)
     out = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        use_cache=True,
+        past_key_values=past_key_values,        use_cache=True,
     )
     # logits at the last position: (B, V)
     next_logits = out["logits"][:, -1, :]
