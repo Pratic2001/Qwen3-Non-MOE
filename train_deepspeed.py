@@ -1037,12 +1037,12 @@ def parse_args():
     p.add_argument("--out-dir",       default="./checkpoints_ds")
     p.add_argument("--resume",        default=None,
                    help="Path to a DeepSpeed checkpoint directory to resume from")
-    p.add_argument("--ckpt-interval", type=int, default=5_000)
+    p.add_argument("--ckpt-interval", type=int, default=100)
     p.add_argument("--keep-ckpts",    type=int, default=3)
 
     # logging / eval
     p.add_argument("--log-interval",  type=int, default=10)
-    p.add_argument("--eval-interval", type=int, default=500)
+    p.add_argument("--eval-interval", type=int, default=50)
     p.add_argument("--eval-steps",    type=int, default=50)
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--wandb-run-name",default=None)
