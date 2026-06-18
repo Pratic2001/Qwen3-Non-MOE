@@ -514,16 +514,20 @@ def _prepare_inputs(
     )
 
     max_len = max(len(x) for x in ids_list)
-    input_ids      = torch.full((len(prompts), max_len), pad_id, dtype=torch.long)
-    attention_mask = torch.zeros((len(prompts), max_len), dtype=torch.long)
+    input_ids = torch.full((len(prompts), max_len), pad_id, dtype=torch.long)
+    # SDPA only accepts bool, float, or query-dtype masks.  Build the
+    # mask as a float additive mask: 0.0 for real tokens, -inf for pad.
+    # Casting the long 0/1 mask to float gives 0.0/1.0, which masks
+    # nothing — we want the inverse, so multiply pad-positions by -inf.
+    attn_float = torch.zeros((len(prompts), max_len), dtype=torch.float)
     for i, ids in enumerate(ids_list):
         offset = max_len - len(ids)
-        input_ids[i, offset:]      = torch.tensor(ids, dtype=torch.long)
-        attention_mask[i, offset:] = 1
+        input_ids[i, offset:] = torch.tensor(ids, dtype=torch.long)
+        attn_float[i, :offset] = float("-inf")  # mask left-pad
 
-    input_ids      = input_ids.to(device)
-    attention_mask = attention_mask.to(device)
-    return input_ids, attention_mask, max_len
+    input_ids = input_ids.to(device)
+    attn_float = attn_float.to(device)
+    return input_ids, attn_float, max_len
 
 
 @torch.inference_mode()
