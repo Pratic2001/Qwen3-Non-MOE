@@ -525,7 +525,7 @@ def _prepare_inputs(
         input_ids[i, offset:] = torch.tensor(ids, dtype=torch.long)
         attn_mask[i, :offset] = float("-inf")  # mask left-pad
 
-    return input_ids, attn_mask, max_len
+    return input_ids.to(device), attn_mask.to(device), max_len
 
 
 @torch.inference_mode()
@@ -542,12 +542,11 @@ def _step(
     position and the updated KV cache.
     """
     if attention_mask is not None:
-        # SDPA requires the additive mask dtype to match the query
-        # dtype, which equals the model's parameter dtype (bf16 by
-        # default).  Cast if needed.
-        model_dtype = next(model.parameters()).dtype
-        if attention_mask.dtype != model_dtype:
-            attention_mask = attention_mask.to(model_dtype)
+        # SDPA requires the additive mask to be on the same device as the
+        # query and its dtype must match.  Cast both at once.
+        model_param = next(model.parameters())
+        attention_mask = attention_mask.to(device=model_param.device,
+                                           dtype=model_param.dtype)
     out = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -597,7 +596,7 @@ def generate_batch(
     # (we'll trim it from the output later).  We track this for
     # repetition penalty and for stop-token detection.
     generated = input_ids.clone()
-    finished  = torch.zeros(input_ids.size(0), dtype=torch.bool, device=device)
+    finished  = torch.zeros(input_ids.size(0), dtype=torch.bool, device=input_ids.device)
 
     for step in range(max_new_tokens):
         # stop emitting if every sequence is finished
