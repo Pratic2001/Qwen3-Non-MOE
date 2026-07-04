@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+download_grpo_data.py
+
+Downloads and formats GRPO training data from HuggingFace, writing structured
+JSONL shards to ./grpo_data/<category>/.
+
+GRPO needs `{prompt, answer}` pairs (no thinking field needed at storage time —
+the model generates its own reasoning at rollout). The reward function in
+train_grpo.py expects answers in a comparable form (numeric or boxed), so this
+script deliberately emphasises datasets that ship with clean, comparable
+ground truths (GSM8K, MATH, NuminaMath, ARC, OpenOrca, IFEval, etc).
+
+Every record is written as:
+    {"prompt": str, "answer": str, "source": str, "category": str}
+
+  prompt — the user's question / problem statement
+  answer — the canonical ground-truth answer (numeric / boxed / short string)
+           that compute_reward() can compare against
+
+Distribution (defaults, configurable via --mix):
+    math      : 50%  -> GSM8K, MetaMathQA, NuminaMath-CoT
+    code      : 20%  -> Evol-Instruct-Code, Python-Instructions
+    reasoning : 20%  -> OpenThoughts-114k, OpenHermes-2.5
+    science   : 10%  -> AI2-ARC, ScienceQA
+
+Usage:
+    python download_grpo_data.py --target-size 2GB
+    python download_grpo_data.py --target-size 500MB --mix math=0.6,code=0.4
+    python download_grpo_data.py --target-size 10GB --out-dir ./grpo_data
+"""
+
+import argparse
+import json
+import os
+import re
+import time
+from typing import Iterator, Optional
+
+from datasets import load_dataset
+
+# ---------------------------------------------------------------------------
+# Dataset source registry
+# Each entry: path, name (subset), split, extractor
+# ---------------------------------------------------------------------------
+
+SOURCES = {
+    "math": [
+        dict(
+            path="AI-MO/NuminaMath-CoT",
+            name=None,
+            split="train",
+            extractor="numina_math",
+        ),
+        dict(
+            path="meta-math/MetaMathQA",
+            name=None,
+            split="train",
+            extractor="metamath",
+        ),
+        dict(
+            path="openai/gsm8k",
+            name="main",
+            split="train",
+            extractor="gsm8k",
+        ),
+    ],
+    "code": [
+        dict(
+            path="nickrosh/Evol-Instruct-Code-80k-v1",
+            name=None,
+            split="train",
+            extractor="instruction_output",
+        ),
+        dict(
+            path="iamtarun/python_code_instructions_18k_alpaca",
+            name=None,
+            split="train",
+            extractor="alpaca_code",
+        ),
+    ],
+    "reasoning": [
+        dict(
+            path="open-thoughts/OpenThoughts-114k",
+            name=None,
+            split="train",
+            extractor="open_thoughts",
+        ),
+        dict(
+            path="teknium/OpenHermes-2.5",
+            name=None,
+            split="train",
+            extractor="open_hermes",
+        ),
+    ],
+    "science": [
+        dict(
+            path="allenai/ai2_arc",
+            name="ARC-Challenge",
+            split="train",
+            extractor="arc",
+        ),
+        dict(
+            path="derek-thomas/ScienceQA",
+            name=None,
+            split="train",
+            extractor="science_qa",
+        ),
+    ],
+}
+
+DEFAULT_MIX = {
+    "math":      0.50,
+    "code":      0.20,
+    "reasoning": 0.20,
+    "science":   0.10,
+}
+
+SHARD_MAX_BYTES = 128 * 1024 * 1024   # 128 MB per shard
+MIN_PROMPT_CHARS = 10
+MIN_ANSWER_CHARS = 1
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset extractors  ->  {"prompt", "answer"} or None
+# ---------------------------------------------------------------------------
+
+def _gsm8k_extract_answer(raw_answer: str) -> str:
+    """GSM8K answers are 'reasoning\n#### final_num'. Return just the number."""
+    if "####" in raw_answer:
+        return raw_answer.split("####", 1)[1].strip()
+    return raw_answer.strip()
+
+
+def extract_record(example: dict, extractor: str) -> Optional[dict]:
+    """
+    Convert a raw HuggingFace dataset row into a normalised GRPO record.
+    Returns None if the row should be skipped.
+
+    GRPO records deliberately drop the thinking trace: the model is supposed
+    to generate the reasoning itself at rollout time. The reward function
+    compares completions against the canonical `answer` only.
+    """
+    try:
+        # ---- Math ----
+        if extractor == "numina_math":
+            prompt  = (example.get("problem") or "").strip()
+            solution = (example.get("solution") or "").strip()
+            if not prompt or not solution:
+                return None
+            # Pull the final boxed answer when present, otherwise fall back
+            # to the last line of the solution.
+            boxed = re.findall(r"\\boxed\{([^}]+)\}", solution)
+            short_ans = boxed[-1].strip() if boxed else solution.split("\n")[-1].strip()
+            if not short_ans:
+                return None
+            return {"prompt": prompt, "answer": short_ans}
+
+        if extractor == "metamath":
+            prompt  = (example.get("query") or "").strip()
+            resp    = (example.get("response") or "").strip()
+            if not prompt or not resp:
+                return None
+            # MetaMath responses include reasoning then "The answer is X."
+            m = re.search(r"[Tt]he answer is[:\s]*([^\.\n]+)", resp)
+            short_ans = m.group(1).strip() if m else resp.split("\n")[-1].strip()
+            if not short_ans:
+                return None
+            return {"prompt": prompt, "answer": short_ans}
+
+        if extractor == "gsm8k":
+            prompt   = (example.get("question") or "").strip()
+            raw      = (example.get("answer") or "").strip()
+            if not prompt or not raw:
+                return None
+            return {"prompt": prompt, "answer": _gsm8k_extract_answer(raw)}
+
+        # ---- Code ----
+        if extractor == "instruction_output":
+            prompt = (example.get("instruction") or "").strip()
+            answer = (example.get("output") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "alpaca_code":
+            instr  = (example.get("instruction") or "").strip()
+            inp    = (example.get("input") or "").strip()
+            output = (example.get("output") or "").strip()
+            prompt = f"{instr}\n\n{inp}".strip() if inp else instr
+            if not prompt or not output:
+                return None
+            return {"prompt": prompt, "answer": output}
+
+        # ---- Reasoning ----
+        if extractor == "open_thoughts":
+            # OpenThoughts-114k: 'problem' and 'solution'. solution often
+            # contains <think>...</think> followed by the final answer.
+            prompt   = (example.get("problem") or "").strip()
+            solution = (example.get("solution") or "").strip()
+            if not prompt or not solution:
+                return None
+            think_match = re.search(r"</think>(.*)$", solution, re.DOTALL)
+            if think_match:
+                tail = think_match.group(1).strip()
+                # Use the first non-empty line of the post-think tail as
+                # the canonical answer.
+                for line in tail.splitlines():
+                    line = line.strip()
+                    if line:
+                        return {"prompt": prompt, "answer": line}
+            boxed = re.findall(r"\\boxed\{([^}]+)\}", solution)
+            if boxed:
+                return {"prompt": prompt, "answer": boxed[-1].strip()}
+            return {"prompt": prompt, "answer": solution.split("\n")[-1].strip()}
+
+        if extractor == "open_hermes":
+            convs = example.get("conversations") or []
+            human_turns = [c["value"] for c in convs if c.get("from") == "human"]
+            gpt_turns   = [c["value"] for c in convs if c.get("from") == "gpt"]
+            if not human_turns or not gpt_turns:
+                return None
+            prompt = human_turns[0].strip()
+            answer = gpt_turns[0].strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        # ---- Science ----
+        if extractor == "arc":
+            question = (example.get("question") or "").strip()
+            choices  = example.get("choices") or {}
+            labels   = choices.get("label", [])
+            texts    = choices.get("text",  [])
+            ans_key  = (example.get("answerKey") or "").strip()
+            if not question or not labels or not texts:
+                return None
+            opts = "\n".join(f"  {l}. {t}" for l, t in zip(labels, texts))
+            prompt = f"{question}\n{opts}"
+            answer = ""
+            for l, t in zip(labels, texts):
+                if l == ans_key:
+                    answer = f"{l}. {t}"
+                    break
+            if not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "science_qa":
+            question = (example.get("question") or "").strip()
+            choices  = example.get("choices") or []
+            ans_idx  = example.get("answer")
+            if not question:
+                return None
+            opts   = "\n".join(f"  {chr(65+i)}. {c}" for i, c in enumerate(choices))
+            prompt = f"{question}\n{opts}".strip() if choices else question
+            answer = ""
+            if ans_idx is not None and isinstance(ans_idx, int) and ans_idx < len(choices):
+                answer = f"{chr(65+ans_idx)}. {choices[ans_idx]}"
+            if not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Size helpers  (identical interface to build_dataset.py / download_sft_data.py)
+# ---------------------------------------------------------------------------
+
+def parse_size(s: str) -> int:
+    s = s.strip().upper()
+    for unit, mult in [("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)]:
+        if s.endswith(unit):
+            return int(float(s[:-len(unit)]) * mult)
+    return int(float(s))
+
+
+def parse_mix(mix_str: Optional[str]) -> dict:
+    if mix_str is None:
+        return DEFAULT_MIX
+    mix = {}
+    for part in mix_str.split(","):
+        k, v = part.split("=")
+        mix[k.strip()] = float(v)
+    total = sum(mix.values())
+    if abs(total - 1.0) > 1e-6:
+        print(f"[warn] mix sums to {total:.4f}, normalising to 1.0")
+        mix = {k: v / total for k, v in mix.items()}
+    for k in mix:
+        if k not in SOURCES:
+            raise ValueError(f"Unknown category '{k}'. Valid: {list(SOURCES)}")
+    return mix
+
+
+# ---------------------------------------------------------------------------
+# Shard writer  (writes GRPO JSONL records, not plain text)
+# ---------------------------------------------------------------------------
+
+class ShardWriter:
+    def __init__(self, out_dir: str, category: str,
+                 max_shard_bytes: int = SHARD_MAX_BYTES):
+        self.dir = os.path.join(out_dir, category)
+        os.makedirs(self.dir, exist_ok=True)
+        self.category      = category
+        self.max_shard     = max_shard_bytes
+        self.shard_idx     = 0
+        self.bytes_in_shard = 0
+        self.total_bytes   = 0
+        self.total_docs    = 0
+        self._fh           = self._open()
+
+    def _open(self):
+        p = os.path.join(self.dir, f"{self.category}_{self.shard_idx:05d}.jsonl")
+        return open(p, "w", encoding="utf-8")
+
+    def write(self, record: dict):
+        line       = json.dumps(record, ensure_ascii=False) + "\n"
+        line_bytes = len(line.encode("utf-8"))
+        if self.bytes_in_shard + line_bytes > self.max_shard and self.bytes_in_shard > 0:
+            self._fh.close()
+            self.shard_idx     += 1
+            self.bytes_in_shard = 0
+            self._fh = self._open()
+        self._fh.write(line)
+        self.bytes_in_shard += line_bytes
+        self.total_bytes    += line_bytes
+        self.total_docs     += 1
+
+    def close(self):
+        self._fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-category streaming loop
+# ---------------------------------------------------------------------------
+
+def stream_category(category: str, byte_budget: int, out_dir: str) -> tuple:
+    sources    = SOURCES[category]
+    writer     = ShardWriter(out_dir, category)
+    src_idx    = 0
+    last_print = time.time()
+
+    print(f"\n=== [{category}] target {byte_budget / 1024**2:.1f} MB "
+          f"from {len(sources)} source(s) ===")
+
+    while writer.total_bytes < byte_budget:
+        src = sources[src_idx % len(sources)]
+        src_idx += 1
+
+        try:
+            ds = load_dataset(
+                src["path"],
+                src.get("name"),
+                split=src["split"],
+                streaming=True,
+            )
+        except Exception as e:
+            print(f"\n[error] could not open {src['path']}: {e}")
+            if src_idx >= len(sources) * 3:
+                print(f"[abort] no usable sources for '{category}'")
+                break
+            continue
+
+        try:
+            for example in ds:
+                rec = extract_record(example, src["extractor"])
+                if rec is None:
+                    continue
+                if (len(rec["prompt"]) < MIN_PROMPT_CHARS or
+                        len(rec["answer"]) < MIN_ANSWER_CHARS):
+                    continue
+                rec["source"]   = src["path"]
+                rec["category"] = category
+                writer.write(rec)
+
+                if writer.total_bytes >= byte_budget:
+                    break
+
+                if time.time() - last_print > 5:
+                    pct = 100 * writer.total_bytes / byte_budget
+                    print(f"[{category}] {writer.total_bytes / 1024**2:8.2f} MB"
+                          f" / {byte_budget / 1024**2:.1f} MB  ({pct:5.1f}%)"
+                          f"  docs={writer.total_docs:,}", end="\r")
+                    last_print = time.time()
+
+        except Exception as e:
+            print(f"\n[warn] stream error for {src['path']}: {e} — trying next source")
+            continue
+
+        if writer.total_bytes >= byte_budget:
+            break
+
+    writer.close()
+    print(f"\n[{category}] done — {writer.total_bytes / 1024**2:.2f} MB, "
+          f"{writer.total_docs:,} records, {writer.shard_idx + 1} shard(s)")
+    return writer.total_bytes, writer.total_docs
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Download and format GRPO training data from HuggingFace."
+    )
+    p.add_argument("--target-size", required=True,
+                   help="Total dataset size, e.g. 2GB, 500MB")
+    p.add_argument("--out-dir",  default="./grpo_data",
+                   help="Output directory (default ./grpo_data)")
+    p.add_argument("--mix",      default=None,
+                   help="Comma-separated category=fraction overrides, "
+                        "e.g. math=0.5,code=0.3,reasoning=0.2")
+    args = p.parse_args()
+
+    target_bytes = parse_size(args.target_size)
+    mix          = parse_mix(args.mix)
+
+    print(f"Target size      : {target_bytes / 1024**2:.1f} MB")
+    print(f"Output directory : {args.out_dir}")
+    print(f"Mix              : {mix}")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    manifest = {
+        "target_bytes": target_bytes,
+        "mix":          mix,
+        "categories":   {},
+        "format": {
+            "fields":  ["prompt", "answer", "source", "category"],
+            "note":    "GRPO needs only prompt + canonical answer (no thinking). "
+                       "Reward function in train_grpo.py compares completions "
+                       "against `answer` (boxed / numeric / short string).",
+        },
+    }
+
+    for category, frac in mix.items():
+        budget = int(target_bytes * frac)
+        if budget <= 0:
+            continue
+        actual_bytes, docs = stream_category(category, budget, args.out_dir)
+        manifest["categories"][category] = {
+            "target_bytes": budget,
+            "actual_bytes": actual_bytes,
+            "docs":         docs,
+        }
+
+    manifest_path = os.path.join(args.out_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    total = sum(c["actual_bytes"] for c in manifest["categories"].values())
+    total_docs = sum(c["docs"] for c in manifest["categories"].values())
+    print(f"\n=== Done — {total / 1024**2:.1f} MB, {total_docs:,} records ===")
+    print(f"Manifest : {manifest_path}")
+    print(f"\nNext step:\n"
+          f"  python pack_grpo_data.py --data-dir {args.out_dir} "
+          f"--tokenizer ./tokenizer --cache-dir ./grpo_packed")
+
+
+if __name__ == "__main__":
+    main()
