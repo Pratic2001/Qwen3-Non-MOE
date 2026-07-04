@@ -169,6 +169,19 @@ def pick_arch_for_params(N_target: int) -> dict[str, Any]:
     return dict(best)
 
 
+def _normalize_target_label(s: str) -> str:
+    """Normalize a user-typed size label to canonical preset form.
+    '1.7B' / '1.7 B' / '1.7b' all become '1.7B'."""
+    return s.strip().upper().replace(" ", "")
+
+
+# Set of preset labels we have a closed-form for. Used to suppress the
+# "reference" disclaimer when the user gives a target that exactly
+# matches a known preset name (e.g. --target-size 1.7B) even if the
+# preset's internal N rounds slightly differently.
+_PRESET_NAMES = {p["name"] for p in QWEN3_PRESETS}
+
+
 def pick_arch_for_budget(tokens: int) -> dict[str, Any]:
     """Inverse of the above: pick preset closest to N = tokens / 20."""
     N_star = chinchilla_params_for_tokens(tokens)
@@ -497,9 +510,22 @@ def print_plan(plan: FullPlan, args: argparse.Namespace) -> None:
         print(_bar("Target model",    f"{args.target_size} → "
                                      f"{human_params(p.N_non_embedding)} params "
                                      f"(Chinchilla N*)"))
-    print(_bar("Architecture",     f"Qwen3 {p.model_name} (H={arch['H']}, "
-                                  f"L={arch['L']}, heads={arch['heads']}, "
-                                  f"kv={arch['kv']}, I={arch['I']})"))
+    # Architecture line: if the user gave a target label that matches
+    # a known preset (or gave us a data/tokens budget from which we
+    # derived a preset), show the preset cleanly. If the user gave a
+    # non-preset --target-size, mark the preset as "reference only" so
+    # it's clear the math was done with the user's exact N.
+    if args.target_size and _normalize_target_label(args.target_size) not in _PRESET_NAMES:
+        arch_label = (
+            f"reference: Qwen3 {p.model_name} "
+            f"(H={arch['H']}, L={arch['L']}, heads={arch['heads']}, "
+            f"kv={arch['kv']}, I={arch['I']}) — math uses user's N exactly"
+        )
+    else:
+        arch_label = (f"Qwen3 {p.model_name} (H={arch['H']}, "
+                      f"L={arch['L']}, heads={arch['heads']}, "
+                      f"kv={arch['kv']}, I={arch['I']})")
+    print(_bar("Architecture",     arch_label))
     print(_bar("Tokens / param",   f"{p.D_tokens / p.N_non_embedding:.2f}× "
                                   f"(target {CHINCHILLA_RATIO}×)"))
     print(_bar("Total compute",    f"{p.flops:.2e} FLOPs"))
@@ -588,9 +614,18 @@ def print_plan(plan: FullPlan, args: argparse.Namespace) -> None:
     # ---- Command lines ----
     print()
     print("[ COMMAND LINES ]")
+    # If the user gave a --target-size, echo it back as the model-size
+    # label so the command line matches what they asked for. The plan
+    # was computed using their exact N, so this is the right number to
+    # train. (The user can swap to a real preset by re-running with
+    # --target-size <preset_name> if their target was hypothetical.)
+    if args.target_size:
+        model_label = args.target_size
+    else:
+        model_label = p.model_name
     print("# Pretrain")
     print("  " + p.command_line(
-        model_size_label=p.model_name,
+        model_size_label=model_label,
         packed_dir=args.packed_dir,
         out_dir=args.pretrain_out,
     ))
@@ -692,20 +727,29 @@ def main(argv: list[str] | None = None) -> int:
             f"{arch['name']} (N={human_params(N)})."
         )
     elif args.target_size:
+        # The user gave us an exact parameter target. We use it AS-IS for
+        # all math (D = 20N, SFT = 100N, GRPO scheduling, etc.) and do
+        # NOT snap to a preset. We only look up the nearest Qwen3 preset
+        # for display purposes (H, L, heads, I) — and we surface in a
+        # note when the user's target is meaningfully different from
+        # every actual Qwen3 architecture we have a closed-form for.
         N = parse_target_params(args.target_size)
         D_tokens = chinchilla_tokens_for_params(N)
         arch = pick_arch_for_params(N)
-        # If the preset's N differs from the user's request, snap to the
-        # preset and add a note explaining the rounding.
-        if arch["N"] != N:
+        # If the user typed a label that doesn't match any preset name
+        # (e.g. "1.5B" or "2.3B"), the preset we picked is a reference
+        # only — the math uses the user's exact N, not the preset's N.
+        if _normalize_target_label(args.target_size) not in _PRESET_NAMES:
             diff_pct = abs(arch["N"] - N) / N * 100
             notes.append(
-                f"Snapped {args.target_size} (N={human_params(N)}) to nearest "
-                f"Qwen3 preset {arch['name']} (N={human_params(arch['N'])}, "
-                f"diff {diff_pct:.1f}%)."
+                f"User target N={human_params(N)} ({args.target_size}) is not "
+                f"a standard Qwen3 preset; nearest preset is {arch['name']} "
+                f"(N={human_params(arch['N'])}, diff {diff_pct:.1f}%). "
+                f"All math uses the user's exact N. The preset dimensions "
+                f"are shown for reference only — pass "
+                f"--target-size {arch['name']} to compute for a real "
+                f"Qwen3 architecture."
             )
-            N = arch["N"]
-            D_tokens = chinchilla_tokens_for_params(N)
 
     # ---- Auto batch sizing if user didn't set them ----
     micro_batch = args.micro_batch or micro_batch_for_params(N, args.seq_len, has_grad_ckpt=True)
