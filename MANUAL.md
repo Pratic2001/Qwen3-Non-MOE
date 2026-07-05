@@ -502,6 +502,80 @@ GRPO:
 
 ---
 
+## 11. Tokenizer: one per pretrain run, shared across stages
+
+**Build exactly one tokenizer** at the start of a project, on a diverse
+sample of the **pretrain corpus**. Reuse it for SFT and GRPO.
+
+**Why one is enough**
+
+- The tokenizer is a fixed `vocab → id` mapping. Switching it mid-pipeline
+  would shift every embedding and break the learned representations.
+- The pretrain corpus is the largest and most varied data you will see,
+  so its vocabulary is the widest. Training on English-only would split
+  code identifiers into many small tokens; training on math/code only
+  would tokenize prose poorly.
+
+**Practical sequence for this repo**
+
+```bash
+# 1. Train ONE tokenizer (once per project, before everything else)
+python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./tokenizer
+
+# 2. Pretrain — uses ./tokenizer for packing and the LM head
+python build_dataset.py --target-size 50GB
+python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
+torchrun --nproc_per_node=1 train.py --model-size 0.6B --data-dir ./packed
+
+# 3. SFT — same ./tokenizer, different packed cache
+python download_sft_data.py --target-size 2GB
+python pack_sft_data.py --data-dir ./sft_data --tokenizer ./tokenizer \
+    --cache-dir ./sft_packed
+python train_sft.py --checkpoint ./checkpoints/latest.pt \
+    --tokenizer ./tokenizer --cache-dir ./sft_packed
+
+# 4. GRPO — same ./tokenizer, prompt dataset only
+# (tokenizer is loaded inside the rollout server / reward function)
+```
+
+**Vocab size trade-offs**
+
+The Qwen3 architecture allocates a `vocab_size × hidden_size` embedding
+table (tied to `lm_head` for sub-2B models):
+
+| vocab_size | hidden | embed params | % of 0.6B model |
+|-----------:|-------:|-------------:|----------------:|
+| 16 000     | 1024   | 16.4 M       | 2.7 %           |
+| 32 000     | 1024   | 32.8 M       | 5.4 %           |
+| 64 000     | 1024   | 65.5 M       | 11 %            |
+| 151 936    | 1024   | 155.6 M      | 26 %            |
+
+- **32 k** is the hobby sweet spot: small enough to keep embeddings
+  cheap, large enough to tokenize multilingual text without exploding
+  sequence length.
+- **64 k+** is what production models (Qwen3, LLaMA-3) use. Justifies
+  the embedding cost with cleaner compression on long-tail tokens.
+- **< 16 k** is rarely useful — you start seeing OOV fallback on any
+  real-world text.
+
+**When to rebuild the tokenizer**
+
+Only when starting a **new pretrain run** on a substantially different
+domain (e.g. all-Chinese, biomedical, code-only, legal). In that case:
+
+```
+new domain → train new tokenizer → pretrain from scratch
+                                            ↓
+                                same tokenizer for SFT, GRPO
+```
+
+**Never** rebuild between SFT and GRPO of the same model. That would
+invalidate the embeddings the model already learned during pretraining
+and SFT, and the model would have to re-learn tokenization implicitly
+through gradient updates — guaranteed to destroy task performance.
+
+---
+
 *All formulas in this manual are dimensionless — they apply to any
 dense transformer. Plug in your N from `python model.py` and the
 data size from your packed `meta.json`.*

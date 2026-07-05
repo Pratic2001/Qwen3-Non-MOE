@@ -62,6 +62,21 @@ _BYTES_UNITS = {
 # to 4 bytes/token as the conventional "FineWeb-like" rule of thumb.
 DEFAULT_BYTES_PER_TOKEN = 4.0
 
+# Bytes per token in the *raw download*, not the packed memmap. These vary
+# by stage because the source format differs:
+#   - pretrain: web-crawled text (FineWeb, Wikipedia, TheStack, …).
+#     JSONL with {"text": "..."} keys plus pretty-printing ≈ 5 B/tok
+#     (text itself is ~4 B/tok, JSON overhead + newlines add ~25 %).
+#   - SFT: instruction-tuning JSONL with {prompt, thinking, answer} fields
+#     and <think> markup. The thinking/answer blocks often 2-3× the raw
+#     prompt, plus JSON keys/quotes, so ≈ 8 B/tok.
+#   - GRPO: prompts only (the completions are generated, not downloaded).
+#     Short Q&A prompts ≈ 5 B/tok, but most GRPO corpora include CoT
+#     solutions as exemplars; we use 6 B/tok as a planning estimate.
+DEFAULT_BPT_PRETRAIN = 5.0
+DEFAULT_BPT_SFT     = 8.0
+DEFAULT_BPT_GRPO    = 6.0
+
 
 def parse_size_to_bytes(value: str) -> int:
     """Parse '5GB', '500MB', '1.2T' → bytes (SI)."""
@@ -108,7 +123,10 @@ def human_params(n: int) -> str:
     return str(n)
 
 
-def human_bytes(n: int) -> str:
+def human_bytes(n: int, decimal: bool = False) -> str:
+    """Format bytes. `decimal=True` forces two-decimal output regardless
+    of size (used when the same number is shown twice in different
+    units — e.g. SI GB and binary GiB — and we want the digits to align)."""
     for unit, div in (("TB", 10**12), ("GB", 10**9), ("MB", 10**6), ("KB", 10**3)):
         if n >= div:
             return f"{n / div:.2f}{unit}"
@@ -349,6 +367,9 @@ class GRPOPlan:
     lora: bool
     lora_rank: int
     lora_alpha: int
+    # Estimated token count for the prompt dataset (what you actually download).
+    # Completions are sampled at runtime, not stored on disk.
+    prompt_tokens: int = 0
 
 
 @dataclass
@@ -477,6 +498,10 @@ def build_grpo_plan(
         lora=use_lora,
         lora_rank=64,
         lora_alpha=128,
+        # Estimate total prompt tokens. Average prompt is typically
+        # ~50 % of max_prompt_len (math/code problems are usually
+        # 200-500 tokens; longer few-shot exemplars pull the mean up).
+        prompt_tokens=prompts * 512,
     )
 
 
@@ -489,7 +514,11 @@ def _bar(label: str, value: str, width: int = 36) -> str:
     return f"  {label:<{pad}}  {value}"
 
 
-def print_plan(plan: FullPlan, args: argparse.Namespace) -> None:
+def print_plan(
+    plan: FullPlan, args: argparse.Namespace,
+    pretrain_bytes: int, sft_bytes: int, grpo_bytes: int, total_bytes: int,
+    pretrain_packed: int, sft_packed: int, grpo_packed: int, total_packed: int,
+) -> None:
     p, s, g = plan.pretrain, plan.sft, plan.grpo
     arch = p.arch
 
@@ -529,6 +558,38 @@ def print_plan(plan: FullPlan, args: argparse.Namespace) -> None:
     print(_bar("Tokens / param",   f"{p.D_tokens / p.N_non_embedding:.2f}× "
                                   f"(target {CHINCHILLA_RATIO}×)"))
     print(_bar("Total compute",    f"{p.flops:.2e} FLOPs"))
+
+    # ---- Download sizes (what to actually pull from HuggingFace) ----
+    #
+    # Three different bytes/token ratios because the on-disk formats differ:
+    #   - pretrain: web text, ~5 B/tok (raw text 4 B/tok + JSON wrapper)
+    #   - SFT:      instruction JSONL with thinking/answer fields, ~8 B/tok
+    #   - GRPO:     prompts only (completions are generated at runtime),
+    #               ~6 B/tok for short Q&A-style prompts
+    # These are PLANNING estimates. After tokenization the packed memmap is
+    # 2 bytes/token (uint16) regardless of source format. The download
+    # column tells you how much raw data to fetch; the on-disk packed
+    # directory will be ~2.5× smaller.
+    print()
+    print("[ DOWNLOAD SIZES — raw data to fetch from HuggingFace ]")
+    print(_bar("Pretrain corpus",  f"{human_bytes(pretrain_bytes)}  "
+                                  f"({human_tokens(p.D_tokens)} tok × "
+                                  f"{args.pretrain_bytes_per_token} B/tok)"))
+    print(_bar("SFT corpus",       f"{human_bytes(sft_bytes)}  "
+                                  f"({human_tokens(s.D_tokens)} tok × "
+                                  f"{args.sft_bytes_per_token} B/tok)"))
+    print(_bar("GRPO prompts",     f"{human_bytes(grpo_bytes)}  "
+                                  f"({human_tokens(g.prompt_tokens)} tok × "
+                                  f"{args.grpo_bytes_per_token} B/tok)"))
+    print(_bar("Total raw data",   human_bytes(total_bytes)))
+    print()
+    print(_bar("Pretrain packed",  f"{human_bytes(pretrain_packed)}  "
+                                  f"(uint16, 2 B/tok)"))
+    print(_bar("SFT packed (t+m)", f"{human_bytes(sft_packed)}  "
+                                  f"(tokens + mask, 4 B/tok)"))
+    print(_bar("GRPO packed",      f"{human_bytes(grpo_packed)}  "
+                                  f"(uint16, 2 B/tok)"))
+    print(_bar("Total packed",     human_bytes(total_packed)))
 
     # ---- Pretrain ----
     print()
@@ -661,7 +722,16 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--target-size", type=str, default=None,
                     help="Model size, e.g. 0.6B, 1.7B, 8B")
     src.add_argument("--bytes-per-token", type=float, default=DEFAULT_BYTES_PER_TOKEN,
-                    help=f"Tokenization density (default {DEFAULT_BYTES_PER_TOKEN})")
+                    help=f"Bytes per token for --data-size input (default {DEFAULT_BYTES_PER_TOKEN})")
+    src.add_argument("--pretrain-bytes-per-token", type=float, default=DEFAULT_BPT_PRETRAIN,
+                    help=f"Bytes/token when sizing the pretrain download "
+                         f"(default {DEFAULT_BPT_PRETRAIN})")
+    src.add_argument("--sft-bytes-per-token", type=float, default=DEFAULT_BPT_SFT,
+                    help=f"Bytes/token when sizing the SFT download "
+                         f"(default {DEFAULT_BPT_SFT})")
+    src.add_argument("--grpo-bytes-per-token", type=float, default=DEFAULT_BPT_GRPO,
+                    help=f"Bytes/token when sizing the GRPO download "
+                         f"(default {DEFAULT_BPT_GRPO})")
 
     # Training knobs
     kn = p.add_argument_group("training knobs")
@@ -790,6 +860,16 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = FullPlan(pretrain=pretrain, sft=sft, grpo=grpo, notes=notes)
 
+    # ---- Compute download + packed sizes (used by both JSON and pretty print) ----
+    pretrain_bytes = int(pretrain.D_tokens * args.pretrain_bytes_per_token)
+    sft_bytes      = int(sft.D_tokens     * args.sft_bytes_per_token)
+    grpo_bytes     = int(grpo.prompt_tokens * args.grpo_bytes_per_token)
+    total_bytes    = pretrain_bytes + sft_bytes + grpo_bytes
+    pretrain_packed = pretrain.D_tokens * 2
+    sft_packed      = sft.D_tokens * 2 * 2   # tokens.bin + mask.bin
+    grpo_packed     = grpo.prompt_tokens * 2
+    total_packed    = pretrain_packed + sft_packed + grpo_packed
+
     # ---- Emit ----
     if args.json:
         out = {
@@ -803,12 +883,28 @@ def main(argv: list[str] | None = None) -> int:
             "pretrain": {k: v for k, v in asdict(pretrain).items() if k != "betas"},
             "sft": asdict(sft),
             "grpo": asdict(grpo),
+            "downloads": {
+                "pretrain_bytes": pretrain_bytes,
+                "sft_bytes":      sft_bytes,
+                "grpo_bytes":     grpo_bytes,
+                "total_bytes":    total_bytes,
+                "pretrain_packed_bytes": pretrain_packed,
+                "sft_packed_bytes":      sft_packed,
+                "grpo_packed_bytes":     grpo_packed,
+                "total_packed_bytes":    total_packed,
+            },
             "notes": notes,
         }
         print(json.dumps(out, indent=2))
     else:
         if not args.quiet:
-            print_plan(plan, args)
+            print_plan(
+                plan, args,
+                pretrain_bytes=pretrain_bytes, sft_bytes=sft_bytes,
+                grpo_bytes=grpo_bytes, total_bytes=total_bytes,
+                pretrain_packed=pretrain_packed, sft_packed=sft_packed,
+                grpo_packed=grpo_packed, total_packed=total_packed,
+            )
 
     return 0
 
