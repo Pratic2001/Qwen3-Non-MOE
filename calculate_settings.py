@@ -30,12 +30,13 @@ Outputs go to stdout. Use --json to dump a machine-readable config.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,185 @@ def human_tokens(n: int) -> str:
         if n >= div:
             return f"{n / div:.2f}{unit}"
     return str(n)
+
+
+# ---------------------------------------------------------------------------
+# Auto-measurement of bytes/token from on-disk data
+# ---------------------------------------------------------------------------
+#
+# If the user has already run build_dataset.py + pack_dataset.py
+# (or the SFT/GRPO equivalents), the JSONL shards plus the packed
+# manifest together give us an exact bytes/tok for this corpus. We
+# prefer that over the heuristic defaults, because the ratio varies
+# 2-3× between corpora (math JSONL is ~3 B/tok, multilingual chat
+# JSONL with <think> markup is ~12 B/tok).
+
+def _dir_bytes(path: str) -> Optional[int]:
+    """Sum of on-disk bytes for every regular file under `path`
+    (recursive). Returns None if the directory doesn't exist or is empty."""
+    if not path or not os.path.isdir(path):
+        return None
+    total = 0
+    found = False
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            try:
+                total += os.path.getsize(fp)
+                found = True
+            except OSError:
+                continue
+    return total if found else None
+
+
+def _read_pretrain_meta(meta_path: str) -> Optional[int]:
+    """Read total_tokens from packed/meta.json. Returns None on miss."""
+    if not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path) as f:
+            return int(json.load(f).get("total_tokens", 0)) or None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _read_sft_total_tokens(manifest_glob: str) -> Optional[int]:
+    """Sum train_tokens across all per-worker manifests."""
+    total = 0
+    found = False
+    for path in glob.glob(manifest_glob):
+        try:
+            with open(path) as f:
+                total += int(json.load(f).get("train_tokens", 0))
+                found = True
+        except (OSError, ValueError, KeyError):
+            continue
+    return total if found else None
+
+
+@dataclass
+class MeasuredBPT:
+    """Result of an on-disk bytes/tok measurement."""
+    bytes_per_token: float
+    source_bytes: int
+    source_tokens: int
+    source_path: str
+    used_fallback: bool = False   # True if we couldn't measure, used default
+
+    def explain(self) -> str:
+        if self.used_fallback:
+            return (f"no usable data on disk under {self.source_path}; "
+                    f"using heuristic default {self.bytes_per_token:.2f} B/tok")
+        return (f"measured {self.bytes_per_token:.2f} B/tok from "
+                f"{human_bytes(self.source_bytes)} of JSONL producing "
+                f"{human_tokens(self.source_tokens)} tokens at {self.source_path}")
+
+
+def measure_pretrain_bpt(
+    data_dir: str, packed_meta: str, fallback: float
+) -> MeasuredBPT:
+    """Pretrain bytes/tok: du(data_dir) / total_tokens from packed/meta.json."""
+    src_bytes = _dir_bytes(data_dir)
+    src_tokens = _read_pretrain_meta(packed_meta)
+    if src_bytes and src_tokens and src_tokens > 0:
+        return MeasuredBPT(
+            bytes_per_token=src_bytes / src_tokens,
+            source_bytes=src_bytes, source_tokens=src_tokens,
+            source_path=data_dir, used_fallback=False,
+        )
+    return MeasuredBPT(
+        bytes_per_token=fallback, source_bytes=0, source_tokens=0,
+        source_path=data_dir, used_fallback=True,
+    )
+
+
+def measure_sft_bpt(
+    data_dir: str, manifest_glob: str, fallback: float
+) -> MeasuredBPT:
+    """SFT bytes/tok: du(sft_data_dir) / sum(train_tokens) across manifests."""
+    src_bytes = _dir_bytes(data_dir)
+    src_tokens = _read_sft_total_tokens(manifest_glob)
+    if src_bytes and src_tokens and src_tokens > 0:
+        return MeasuredBPT(
+            bytes_per_token=src_bytes / src_tokens,
+            source_bytes=src_bytes, source_tokens=src_tokens,
+            source_path=data_dir, used_fallback=False,
+        )
+    return MeasuredBPT(
+        bytes_per_token=fallback, source_bytes=0, source_tokens=0,
+        source_path=data_dir, used_fallback=True,
+    )
+
+
+def measure_grpo_bpt(data_dir: str, fallback: float) -> MeasuredBPT:
+    """GRPO bytes/tok: du(grpo_data_dir) / (estimated prompt tokens).
+
+    GRPO has no packed manifest by default — the prompts are small
+    JSON files and the completions are generated. We estimate the
+    token count by re-tokenizing the prompts if a tokenizer is
+    available; otherwise we fall back to the heuristic.
+    """
+    src_bytes = _dir_bytes(data_dir)
+    if not src_bytes:
+        return MeasuredBPT(
+            bytes_per_token=fallback, source_bytes=0, source_tokens=0,
+            source_path=data_dir, used_fallback=True,
+        )
+    # Try to tokenize the prompts to get an exact token count. If the
+    # tokenizer isn't available (no `tokenizers` package, or no
+    # tokenizer on disk), we approximate with the heuristic default,
+    # which is itself calibrated for short Q&A prompts.
+    src_tokens = _tokenize_prompts_in(data_dir)
+    if src_tokens and src_tokens > 0:
+        return MeasuredBPT(
+            bytes_per_token=src_bytes / src_tokens,
+            source_bytes=src_bytes, source_tokens=src_tokens,
+            source_path=data_dir, used_fallback=False,
+        )
+    return MeasuredBPT(
+        bytes_per_token=fallback, source_bytes=src_bytes, source_tokens=0,
+        source_path=data_dir, used_fallback=True,
+    )
+
+
+def _tokenize_prompts_in(data_dir: str) -> Optional[int]:
+    """Best-effort: load the Qwen3 tokenizer and count tokens across
+    every JSON file under data_dir. Returns None if anything fails
+    (missing tokenizer, no tokenizers package, unreadable files)."""
+    # Common Qwen3 / repo layout: ./grpo_data/<category>/*.json with
+    # {prompt, ...} or {question, ...} keys. We pull any string field.
+    try:
+        from tokenizers import Tokenizer  # type: ignore
+    except ImportError:
+        return None
+    # Look for a tokenizer in the conventional locations.
+    for tok_dir in ("./tokenizer", "./sft_checkpoints/tokenizer",
+                    os.path.expanduser("~/.cache/qwen3-tokenizer")):
+        for cand in (os.path.join(tok_dir, "tokenizer.json"),
+                     os.path.join(tok_dir, "tokenizer")):
+            if os.path.isfile(cand):
+                try:
+                    tok = Tokenizer.from_file(cand)
+                except Exception:
+                    continue
+                total = 0
+                for root, _dirs, files in os.walk(data_dir):
+                    for f in files:
+                        if not f.endswith(".json"):
+                            continue
+                        fp = os.path.join(root, f)
+                        try:
+                            with open(fp) as fh:
+                                rec = json.load(fh)
+                        except (OSError, ValueError):
+                            continue
+                        # Pick the first plausible prompt field
+                        for key in ("prompt", "question", "instruction", "text"):
+                            if key in rec and isinstance(rec[key], str):
+                                total += len(tok.encode(rec[key]).ids)
+                                break
+                return total or None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +698,9 @@ def print_plan(
     plan: FullPlan, args: argparse.Namespace,
     pretrain_bytes: int, sft_bytes: int, grpo_bytes: int, total_bytes: int,
     pretrain_packed: int, sft_packed: int, grpo_packed: int, total_packed: int,
+    bpt_pretrain: "MeasuredBPT | None" = None,
+    bpt_sft:      "MeasuredBPT | None" = None,
+    bpt_grpo:     "MeasuredBPT | None" = None,
 ) -> None:
     p, s, g = plan.pretrain, plan.sft, plan.grpo
     arch = p.arch
@@ -558,6 +741,37 @@ def print_plan(
     print(_bar("Tokens / param",   f"{p.D_tokens / p.N_non_embedding:.2f}× "
                                   f"(target {CHINCHILLA_RATIO}×)"))
     print(_bar("Total compute",    f"{p.flops:.2e} FLOPs"))
+
+    # ---- Bytes/token sources (measured vs assumed) ----
+    if bpt_pretrain is not None or bpt_sft is not None or bpt_grpo is not None:
+        print()
+        print("[ BYTES/TOKEN — measured from on-disk data if available ]")
+        # We use the `_*_user_set` flags recorded in main() to decide
+        # whether the row represents a user override, a measurement,
+        # or a fallback default.
+        for label, bpt, eff_value, user_set, default in (
+            ("Pretrain BPT", bpt_pretrain, args.pretrain_bytes_per_token, args._pretrain_bpt_user_set, DEFAULT_BPT_PRETRAIN),
+            ("SFT BPT",      bpt_sft,      args.sft_bytes_per_token,      args._sft_bpt_user_set,      DEFAULT_BPT_SFT),
+            ("GRPO BPT",     bpt_grpo,     args.grpo_bytes_per_token,     args._grpo_bpt_user_set,     DEFAULT_BPT_GRPO),
+        ):
+            if bpt is None:
+                continue
+            if user_set and not args.force_default_bpt:
+                # User explicitly passed a non-default value on the CLI
+                tag = f"(user override of default {default:.2f})"
+                show_measurement = False
+            elif args.force_default_bpt:
+                tag = "(default — --force-default-bpt)"
+                show_measurement = True
+            elif bpt.used_fallback:
+                tag = "(default — no on-disk data found)"
+                show_measurement = True
+            else:
+                tag = "(measured — on-disk data)"
+                show_measurement = True
+            print(_bar(label,         f"{eff_value:.2f} B/tok  {tag}"))
+            if show_measurement:
+                print(f"    {bpt.explain()}")
 
     # ---- Download sizes (what to actually pull from HuggingFace) ----
     #
@@ -723,15 +937,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="Model size, e.g. 0.6B, 1.7B, 8B")
     src.add_argument("--bytes-per-token", type=float, default=DEFAULT_BYTES_PER_TOKEN,
                     help=f"Bytes per token for --data-size input (default {DEFAULT_BYTES_PER_TOKEN})")
-    src.add_argument("--pretrain-bytes-per-token", type=float, default=DEFAULT_BPT_PRETRAIN,
-                    help=f"Bytes/token when sizing the pretrain download "
-                         f"(default {DEFAULT_BPT_PRETRAIN})")
-    src.add_argument("--sft-bytes-per-token", type=float, default=DEFAULT_BPT_SFT,
-                    help=f"Bytes/token when sizing the SFT download "
-                         f"(default {DEFAULT_BPT_SFT})")
-    src.add_argument("--grpo-bytes-per-token", type=float, default=DEFAULT_BPT_GRPO,
-                    help=f"Bytes/token when sizing the GRPO download "
-                         f"(default {DEFAULT_BPT_GRPO})")
+    # default=None means "not specified" — we'll auto-measure or fall
+    # back to the heuristic. The numeric defaults are documented in
+    # the help text for clarity.
+    src.add_argument("--pretrain-bytes-per-token", type=float, default=None,
+                    help=f"Bytes/token when sizing the pretrain download. "
+                         f"If omitted, the calculator measures from "
+                         f"--pretrain-data-dir and --packed-dir, falling "
+                         f"back to {DEFAULT_BPT_PRETRAIN}.")
+    src.add_argument("--sft-bytes-per-token", type=float, default=None,
+                    help=f"Bytes/token when sizing the SFT download. "
+                         f"If omitted, measured from --sft-data-dir and "
+                         f"--sft-cache-dir, falling back to {DEFAULT_BPT_SFT}.")
+    src.add_argument("--grpo-bytes-per-token", type=float, default=None,
+                    help=f"Bytes/token when sizing the GRPO download. "
+                         f"If omitted, measured from --grpo-data-dir, "
+                         f"falling back to {DEFAULT_BPT_GRPO}.")
 
     # Training knobs
     kn = p.add_argument_group("training knobs")
@@ -756,6 +977,23 @@ def main(argv: list[str] | None = None) -> int:
     out.add_argument("--tokenizer-dir",   default="./tokenizer")
     out.add_argument("--sft-cache-dir",   default="./sft_packed")
     out.add_argument("--sft-out",         default="./sft_checkpoints")
+    # Source-data paths used to MEASURE bytes/tok. If these exist and
+    # contain a matching packed manifest, the calculator derives the
+    # bytes/tok ratio from the on-disk JSONL bytes and the recorded
+    # token count. Otherwise it falls back to the heuristic defaults
+    # declared at the top of this file.
+    out.add_argument("--pretrain-data-dir",   default="./data",
+                    help="Directory of JSONL shards from build_dataset.py "
+                         "(default ./data). Used to measure pretrain bytes/tok.")
+    out.add_argument("--sft-data-dir",        default="./sft_data",
+                    help="Directory of JSONL shards from download_sft_data.py "
+                         "(default ./sft_data). Used to measure SFT bytes/tok.")
+    out.add_argument("--grpo-data-dir",       default="./grpo_data",
+                    help="Directory of GRPO prompt JSONL files. "
+                         "Used to measure GRPO bytes/tok.")
+    out.add_argument("--force-default-bpt",   action="store_true",
+                    help="Skip the auto-measurement and use the heuristic "
+                         "defaults even if the data is on disk.")
 
     # Output format
     fmt = p.add_argument_group("output")
@@ -764,6 +1002,66 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
 
+    # ---- Auto-measure bytes/tok from on-disk data, if available ----
+    #
+    # We always honor an explicit --*-bytes-per-token from the user, but
+    # if the user didn't set one, we try to derive it from the actual
+    # JSONL shards and packed manifest that build_dataset.py +
+    # pack_dataset.py produced. That gives a much more accurate number
+    # than the heuristic default, because the ratio varies 2-3×
+    # between corpora (math, code, multilingual chat all differ).
+    notes: list[str] = []
+    bpt_pretrain: Optional[MeasuredBPT] = None
+    bpt_sft:      Optional[MeasuredBPT] = None
+    bpt_grpo:     Optional[MeasuredBPT] = None
+    if not args.force_default_bpt:
+        bpt_pretrain = measure_pretrain_bpt(
+            data_dir=args.pretrain_data_dir,
+            packed_meta=os.path.join(args.packed_dir, "meta.json"),
+            fallback=DEFAULT_BPT_PRETRAIN,
+        )
+        bpt_sft = measure_sft_bpt(
+            data_dir=args.sft_data_dir,
+            manifest_glob=os.path.join(args.sft_cache_dir, "*", "manifest.json"),
+            fallback=DEFAULT_BPT_SFT,
+        )
+        bpt_grpo = measure_grpo_bpt(
+            data_dir=args.grpo_data_dir,
+            fallback=DEFAULT_BPT_GRPO,
+        )
+        # Record whether the user passed the flag, BEFORE we overwrite
+        # args.* with the measured value. The print block uses these
+        # to label the row as "user override" vs "measured" vs "default".
+        args._pretrain_bpt_user_set = args.pretrain_bytes_per_token is not None
+        args._sft_bpt_user_set      = args.sft_bytes_per_token is not None
+        args._grpo_bpt_user_set     = args.grpo_bytes_per_token is not None
+        # Now resolve the effective value: user override wins, else
+        # measured/fallback from the BPT helper.
+        if args.pretrain_bytes_per_token is None:
+            args.pretrain_bytes_per_token = bpt_pretrain.bytes_per_token
+        if args.sft_bytes_per_token is None:
+            args.sft_bytes_per_token = bpt_sft.bytes_per_token
+        if args.grpo_bytes_per_token is None:
+            args.grpo_bytes_per_token = bpt_grpo.bytes_per_token
+    else:
+        # User wants defaults. We still call the measurer so the print
+        # block can show "skipped, user requested defaults".
+        bpt_pretrain = measure_pretrain_bpt(args.pretrain_data_dir,
+            os.path.join(args.packed_dir, "meta.json"), DEFAULT_BPT_PRETRAIN)
+        bpt_sft = measure_sft_bpt(args.sft_data_dir,
+            os.path.join(args.sft_cache_dir, "*", "manifest.json"), DEFAULT_BPT_SFT)
+        bpt_grpo = measure_grpo_bpt(args.grpo_data_dir, DEFAULT_BPT_GRPO)
+        # Force the *fallback* value, not the measured value. The
+        # measurement is still reported by the bpt object for display.
+        args.pretrain_bytes_per_token = bpt_pretrain.bytes_per_token if bpt_pretrain.used_fallback else DEFAULT_BPT_PRETRAIN
+        args.sft_bytes_per_token      = bpt_sft.bytes_per_token      if bpt_sft.used_fallback      else DEFAULT_BPT_SFT
+        args.grpo_bytes_per_token     = bpt_grpo.bytes_per_token     if bpt_grpo.used_fallback     else DEFAULT_BPT_GRPO
+        # The user opted out of measurement, so all three are "user
+        # requested default" for display purposes.
+        args._pretrain_bpt_user_set = True
+        args._sft_bpt_user_set      = True
+        args._grpo_bpt_user_set     = True
+
     # ---- Validate exactly one input ----
     n_inputs = sum(x is not None for x in (args.data_size, args.tokens, args.target_size))
     if n_inputs == 0:
@@ -771,8 +1069,6 @@ def main(argv: list[str] | None = None) -> int:
         args.data_size = "5GB"
     elif n_inputs > 1:
         p.error("Provide at most one of --data-size, --tokens, --target-size")
-
-    notes: list[str] = []
 
     # ---- Resolve tokens (D) and non-embedding params (N) ----
     if args.data_size:
@@ -893,6 +1189,23 @@ def main(argv: list[str] | None = None) -> int:
                 "grpo_packed_bytes":     grpo_packed,
                 "total_packed_bytes":    total_packed,
             },
+            "bytes_per_token": {
+                "pretrain": {
+                    "value":          args.pretrain_bytes_per_token,
+                    "measured":       bpt_pretrain is not None and not bpt_pretrain.used_fallback,
+                    "source_path":    bpt_pretrain.source_path if bpt_pretrain else None,
+                },
+                "sft": {
+                    "value":          args.sft_bytes_per_token,
+                    "measured":       bpt_sft is not None and not bpt_sft.used_fallback,
+                    "source_path":    bpt_sft.source_path if bpt_sft else None,
+                },
+                "grpo": {
+                    "value":          args.grpo_bytes_per_token,
+                    "measured":       bpt_grpo is not None and not bpt_grpo.used_fallback,
+                    "source_path":    bpt_grpo.source_path if bpt_grpo else None,
+                },
+            },
             "notes": notes,
         }
         print(json.dumps(out, indent=2))
@@ -904,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
                 grpo_bytes=grpo_bytes, total_bytes=total_bytes,
                 pretrain_packed=pretrain_packed, sft_packed=sft_packed,
                 grpo_packed=grpo_packed, total_packed=total_packed,
+                bpt_pretrain=bpt_pretrain, bpt_sft=bpt_sft, bpt_grpo=bpt_grpo,
             )
 
     return 0
