@@ -157,10 +157,12 @@ def _materialize_byte_alphabet() -> List[str]:
     Python list of one-character strings — owned, copy-isolated, lifetime-safe.
     """
     # The 256 byte values mapped the same way ByteLevel does.
+    # These are the codepoints the byte-level pre-tokenizer exposes as
+    # initial characters. Ranges are expressed as int code points.
     bs = (
-        list(range("!", ord("~") + 1))
-        + list(range("¡", ord("¬") + 1))
-        + list(range("®", ord("ÿ") + 1))
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
     )
     cs = [chr(c) for c in bs]
     return cs
