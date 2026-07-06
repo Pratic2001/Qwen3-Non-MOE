@@ -31,8 +31,14 @@ NEW (constant RAM, lifetime-safe):
       doesn't have to do it under the C-extension's lifetime rules.
 
 Usage:
+    # Recommended (handles 50 GB+ corpora without segfaulting):
     python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./tokenizer
-    python train_tokenizer.py --vocab-size 151643   # full Qwen3-scale vocab
+
+    # Full Qwen3-scale vocab (still memory-bounded via the new defaults):
+    python train_tokenizer.py --vocab-size 151643
+
+    # Override the cap if you want every doc seen (NOT recommended on >20 GB):
+    python train_tokenizer.py --max-docs 0 --min-frequency 2
 """
 
 import argparse
@@ -224,6 +230,14 @@ def train_tokenizer(
         For 32k vocab the BPE pair table is bounded by corpus vocabulary, not
         by corpus size, so steady-state RAM is a few hundred MB regardless
         of how big the corpus is.
+
+    Recommended environment for stability on 50 GB+ corpora:
+        RAYON_NUM_THREADS=1            # single-thread the BPE pair merge
+        TOKENIZERS_PARALLELISM=false   # no background Python threads
+    Together these prevent the intermittent SIGSEGV that occurs when
+    `BpeTrainer` parallel-reduces a multi-million-entry pair map and the
+    rayon worker pool collides with the Python GIL or runs the box out of
+    RAM mid-allocation. See README section "Intermittent segfaults".
     """
     shard_paths = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
     if not shard_paths:
@@ -396,14 +410,22 @@ def main():
                    help="Output directory for tokenizer files")
     p.add_argument("--vocab-size",     type=int, default=32000,
                    help="Target vocab size (Qwen3 uses ~151643 for full-scale)")
-    p.add_argument("--min-frequency",  type=int, default=2,
-                   help="Minimum pair frequency to merge")
-    p.add_argument("--max-docs",       type=int, default=None,
-                   help="Optional cap on number of documents (for speed on huge corpora)")
+    p.add_argument("--min-frequency",  type=int, default=10,
+                   help="Minimum pair frequency to merge. Default 10 (not 2) "
+                        "to keep the BPE pair table small and prevent intermittent "
+                        "segfaults on 50 GB+ corpora. Set to 2 only for small corpora.")
+    p.add_argument("--max-docs",       type=int, default=2_000_000,
+                   help="Cap on number of documents fed to the trainer. Default 2M — "
+                        "the published sweet spot for a 32k-vocab BBPE; quality "
+                        "plateaus well before this on well-mixed FineWeb/FineMath. "
+                        "Pass 0 to disable (use the whole corpus).")
     p.add_argument("--reader-chunk-mb", type=int, default=8,
                    help="Approx MB of text the reader holds in RAM at a time. "
                         "Lower = less RAM, more IPC overhead. Default 8 MB.")
     args = p.parse_args()
+    # argparse can't represent "unset" for type=int; 0 is the opt-out sentinel.
+    if args.max_docs == 0:
+        args.max_docs = None
 
     tokenizer = train_tokenizer(
         data_dir=args.data_dir,
@@ -417,4 +439,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Pin threading BEFORE importing tokenizers. These must be set in the
+    # environment when this script is launched, not after import — tokenizers
+    # reads RAYON_NUM_THREADS on first use of the parallel iterator and
+    # TOKENIZERS_PARALLELISM at import time. Setting them here as a fallback
+    # makes the script work even if the user forgets to `export` them.
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()
