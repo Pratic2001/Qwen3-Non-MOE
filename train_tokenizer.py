@@ -87,6 +87,44 @@ CHAT_TEMPLATE = """{% for message in messages %}\
 
 _SENTINEL = None  # end-of-corpus marker
 
+# Codepoints that the tokenizers' NFC normalizer has been known to panic on
+# (`NormalizedString bad split` in normalizer.rs). We strip them on the
+# Python side so the Rust side never sees them. These are control characters
+# (other than common whitespace), the byte-replacement marker, BOM, and
+# zero-width / formatting codepoints that confuse the alignment step.
+_BAD_CODEPOINTS = frozenset([
+    0x00,       # NUL
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x0B, 0x0C, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+    0x7F,       # DEL
+    0xFFFD,     # Unicode replacement char (often a sign of bad UTF-8)
+    0xFEFF,     # BOM / zero-width no-break space
+    0x200B,     # zero-width space
+    0x200C, 0x200D,  # ZWNJ, ZWJ
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,  # bidirectional overrides
+    0x2066, 0x2067, 0x2068, 0x2069,
+])
+
+
+def _clean_text(text: str) -> Optional[str]:
+    """
+    NFC-normalize, drop bytes/codepoints that make the Rust NFC normalizer
+    panic, and drop the doc if anything goes wrong. Returns None to signal
+    "skip this document".
+    """
+    try:
+        text = unicodedata.normalize("NFC", text)
+    except Exception:
+        return None
+    # Strip a curated set of codepoints known to trigger the panic.
+    if any(ord(c) in _BAD_CODEPOINTS for c in text):
+        text = "".join(c for c in text if ord(c) not in _BAD_CODEPOINTS)
+    if not text:
+        return None
+    return text
+
 
 def _reader_main(shard_paths: List[str], out_q: mp.Queue, max_docs: Optional[int],
                  chunk_lines: int):
@@ -95,6 +133,7 @@ def _reader_main(shard_paths: List[str], out_q: mp.Queue, max_docs: Optional[int
     buf: List[str] = []
     bytes_in_buf = 0
     target_bytes = 8 * 1024 * 1024  # ~8 MB of text per chunk -> ~30-50k docs
+    skipped = 0
 
     def flush():
         nonlocal buf, bytes_in_buf
@@ -117,14 +156,11 @@ def _reader_main(shard_paths: List[str], out_q: mp.Queue, max_docs: Optional[int
                     text = rec.get("text")
                     if not text:
                         continue
-                    # NFC-normalize ONCE on the Python side. The tokenizers
-                    # library's C-level normalizer can be a lifetime hazard
-                    # for huge strings; doing it in Python makes lifetime
-                    # ownership unambiguous.
-                    try:
-                        text = unicodedata.normalize("NFC", text)
-                    except Exception:
+                    cleaned = _clean_text(text)
+                    if cleaned is None:
+                        skipped += 1
                         continue
+                    text = cleaned
                     buf.append(text)
                     bytes_in_buf += len(text)
                     n += 1
@@ -133,9 +169,11 @@ def _reader_main(shard_paths: List[str], out_q: mp.Queue, max_docs: Optional[int
                     if max_docs is not None and n >= max_docs:
                         flush()
                         out_q.put(_SENTINEL)
+                        out_q.put(("STATS", {"kept": n, "skipped": skipped}))
                         return
         flush()
         out_q.put(_SENTINEL)
+        out_q.put(("STATS", {"kept": n, "skipped": skipped}))
     except Exception as e:
         # Send the exception back to the main process; it'll be re-raised there.
         out_q.put(("ERROR", repr(e)))
@@ -201,9 +239,19 @@ def train_tokenizer(
     # Build the tokenizer in the main process. We train it via train_from_iterator
     # using a list-iterator we control (NOT a generator that goes out of scope
     # mid-iteration).
+    #
+    # Important: the trainer's `feed()` function in tokenizers 0.22 ALWAYS
+    # calls `self.normalizer` on every input string (see tokenizer/mod.rs:
+    # `self.added_vocabulary.extract_and_normalize(self.normalizer.as_ref(), ...)`).
+    # The default normalizer is BertNormalizer, which has a known
+    # `NormalizedString bad split` panic in normalizer.rs:777 on certain
+    # inputs. We set the tokenizer's normalizer to None and pre-normalize
+    # in Python inside _clean_text() to bypass the buggy Rust code path
+    # entirely. The trainer does NOT have a `normalizer` kwarg in 0.22.
     tokenizer = Tokenizer(BPE(unk_token=None, byte_fallback=True))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.decoder       = decoders.ByteLevel()
+    tokenizer.normalizer     = None  # disable Rust-side NFC
+    tokenizer.pre_tokenizer  = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder        = decoders.ByteLevel()
 
     trainer = BpeTrainer(
         vocab_size=vocab_size,
@@ -232,13 +280,21 @@ def train_tokenizer(
     # list, and yield each string in turn. After a chunk is exhausted, the
     # list is dropped, freeing its memory before we pull the next one.
     # Peak held text: 1 chunk (≈ reader_chunk_mb MB).
+    final_stats = {"kept": 0, "skipped": 0}
+
     def bounded_iter():
+        nonlocal final_stats
         while True:
             chunk = out_q.get()
             if chunk is _SENTINEL:
                 return
-            if isinstance(chunk, tuple) and chunk and chunk[0] == "ERROR":
-                raise RuntimeError(f"Reader process failed: {chunk[1]}")
+            if isinstance(chunk, tuple) and chunk:
+                tag = chunk[0]
+                if tag == "ERROR":
+                    raise RuntimeError(f"Reader process failed: {chunk[1]}")
+                if tag == "STATS":
+                    final_stats = chunk[1]
+                    continue
             # Re-bind to a local to make sure we own it, then yield.
             owned = list(chunk)
             del chunk
@@ -253,6 +309,9 @@ def train_tokenizer(
         if reader.is_alive():
             reader.terminate()
             reader.join()
+
+    print(f"\nReader kept {final_stats['kept']:,} documents, "
+          f"skipped {final_stats['skipped']:,} as unclean.")
 
     # ---- Post-processor + save --------------------------------------------
     eos_id = tokenizer.token_to_id("<|endoftext|>")
