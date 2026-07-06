@@ -169,12 +169,15 @@ def stream_category(category: str, byte_budget: int, out_dir: str, min_doc_chars
     print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB "
           f"from {len(sources)} source(s) ===")
 
-    src_idx = 0
     last_report = time.time()
 
-    while writer.total_bytes < byte_budget:
-        src = sources[src_idx % len(sources)]
-        src_idx += 1
+    # Walk each source at most once. Re-opening a streaming dataset after it
+    # has been exhausted restarts from example 0, which silently writes the
+    # same documents again and never reaches the byte budget. Track an offset
+    # into the source list and only advance it forward.
+    for src in sources:
+        if writer.total_bytes >= byte_budget:
+            break
 
         try:
             ds = load_dataset(
@@ -185,11 +188,9 @@ def stream_category(category: str, byte_budget: int, out_dir: str, min_doc_chars
             )
         except Exception as e:
             print(f"[error] failed to open {src['path']}: {e}")
-            if src_idx > len(sources) * 3:
-                print(f"[abort] no usable sources for category '{category}'")
-                break
             continue
 
+        source_was_exhausted = False
         try:
             for example in ds:
                 text = extract_text(example, src["text_field"], category)
@@ -207,13 +208,19 @@ def stream_category(category: str, byte_budget: int, out_dir: str, min_doc_chars
                           f"/ {byte_budget / 1024**2:.1f} MB  ({pct:5.1f}%)  "
                           f"docs={writer.total_docs}", end="\r")
                     last_report = time.time()
+            else:
+                # Inner for-loop completed without `break` -> iterator is
+                # exhausted. Mark it so we don't re-open this source.
+                source_was_exhausted = True
 
         except Exception as e:
             print(f"\n[warn] stream interrupted for {src['path']}: {e} -- moving to next source")
             continue
-
-        if writer.total_bytes >= byte_budget:
-            break
+        finally:
+            if source_was_exhausted and writer.total_bytes < byte_budget:
+                print(f"\n[{category}] source {src['path']} exhausted at "
+                      f"{writer.total_bytes / 1024**2:.1f} MB "
+                      f"(target was {byte_budget / 1024**2:.1f} MB)")
 
     print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
           f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s)")
