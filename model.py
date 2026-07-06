@@ -94,6 +94,8 @@ class Qwen3Config:
         rope_theta: float = 1_000_000.0,
         tie_embeddings: Optional[bool] = None,
         verbose: bool = True,
+        quality_mode: str = "shape",
+        param_slack: float = 0.10,
     ) -> "Qwen3Config":
         """
         Search for (hidden_size, num_layers, num_heads, num_kv_heads,
@@ -107,29 +109,103 @@ class Qwen3Config:
             multiple of 256
           - embeddings tied for small models (<~2B params), untied for
             larger ones (matches Qwen3's own convention)
+
+        quality_mode:
+            "exact"  — pick the config whose parameter count is closest to
+                       target. Ties broken by quality score.
+            "shape"  — pick the config with the best quality score among all
+                       configs within ±param_slack of the target param count.
+                       Closer-to-target is used as a tie-breaker.
+                       (default — recommended for training quality)
+
+        param_slack:
+            In quality_mode="shape", the allowed param-count deviation from
+            the target as a fraction (default 0.10 = ±10%). Set higher if
+            no good-shape config exists near your target.
+
+        Quality score (higher = better):
+            - depth/width: peak at hidden_size / num_layers ≈ 35, falls off
+              linearly outside [25, 50].
+            - head count:  +0.4 per head above 4 (capped at +2.4 = 10+ heads)
+            - MLP ratio:   +0.5 if intermediate/hidden is in [2.5, 3.5],
+                           -0.5 if outside [2.0, 4.0].
+            - gqa:         +0.2 if num_kv_heads >= 2 (penalize degenerate MQA).
+            - param slack: small bonus for staying close to target so
+                           100M target doesn't pick a 60M config.
         """
         target = parse_param_count(target_params)
 
         if tie_embeddings is None:
             tie_embeddings = target < 2_000_000_000
 
-        best = None  # (sort_key, config_kwargs, actual_params)
+        if quality_mode not in ("exact", "shape"):
+            raise ValueError(
+                f"quality_mode must be 'exact' or 'shape', got {quality_mode!r}"
+            )
 
         # Candidate head counts -- Qwen3 chooses num_heads independently of
         # hidden_size (q/k/v project to num_heads*head_dim, which need not
         # equal hidden_size; o_proj maps back to hidden_size). We require
         # num_kv_heads >= 2 to avoid degenerate near-MQA shapes.
-        head_count_candidates = [4, 8, 16, 24, 32, 40, 48, 64]
+        head_count_candidates = [4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64]
 
         # Bound the search to depth/width ratios resembling real Qwen3 dense
-        # models (hidden_size / num_layers roughly in [25, 130], num_layers
-        # in [16, 64]) so we don't get pathological single-layer-but-huge or
+        # models so we don't get pathological single-layer-but-huge or
         # hundred-layer-but-tiny architectures that happen to hit the exact
-        # param count.
-        for num_layers in range(16, 65, 2):
+        # param count. We widen the upper end in quality_mode="shape" since
+        # deeper-but-narrower often wins for small models.
+        if quality_mode == "shape":
+            ratio_lo, ratio_hi = 18, 180
+        else:
+            ratio_lo, ratio_hi = 20, 150
+
+        def _quality_score(hidden_size: int, num_layers: int,
+                           num_heads: int, num_kv_heads: int,
+                           intermediate_size: int,
+                           actual_params: int) -> float:
+            """Higher is better. See docstring for the components."""
+            # 1) depth/width ratio: peak at 35, smooth falloff
+            ratio = hidden_size / num_layers
+            if 30.0 <= ratio <= 45.0:
+                ratio_score = 2.0
+            elif 25.0 <= ratio <= 50.0:
+                # linear ramp from 1.0 (at 25 or 50) to 2.0 (at 30 or 45)
+                d = min(ratio - 25.0, 50.0 - ratio)
+                ratio_score = 1.0 + d / 5.0
+            elif 18.0 <= ratio <= 65.0:
+                # outer band: 0.0 to 1.0
+                d = min(ratio - 18.0, 65.0 - ratio)
+                ratio_score = max(0.0, d / 7.0)
+            else:
+                ratio_score = -1.0  # strongly disfavor
+
+            # 2) head count: 4 is the floor, more is better (capped)
+            head_score = min(2.4, 0.4 * max(0, num_heads - 4))
+
+            # 3) MLP ratio sweet spot
+            mlp_r = intermediate_size / hidden_size
+            if 2.5 <= mlp_r <= 3.5:
+                mlp_score = 0.5
+            elif 2.0 <= mlp_r <= 4.0:
+                mlp_score = 0.0
+            else:
+                mlp_score = -0.5
+
+            # 4) gqa sanity (degenerate MQA already filtered by caller)
+            gqa_score = 0.2 if num_kv_heads >= 2 else 0.0
+
+            # 5) closeness to target: small bonus for staying on-budget
+            slack = abs(actual_params - target) / target
+            target_score = 1.0 - min(slack, 0.30) / 0.30  # 1.0 at target, 0 at 30% off
+
+            return ratio_score + head_score + mlp_score + gqa_score + target_score
+
+        # Enumerate candidates
+        candidates = []  # list of (sort_key, kwargs, actual_params, score)
+        for num_layers in range(12, 65, 2):
             for hidden_size in range(256, 8192 + 1, 64):
                 ratio = hidden_size / num_layers
-                if not (20 <= ratio <= 150):
+                if not (ratio_lo <= ratio <= ratio_hi):
                     continue
 
                 for num_heads in head_count_candidates:
@@ -143,23 +219,46 @@ class Qwen3Config:
                         hidden_size, num_layers, intermediate_size, num_heads,
                         num_kv_heads, head_dim, vocab_size, tie_embeddings,
                     )
-                    rel_diff = abs(actual - target) / target
-                    sort_key = (round(rel_diff, 4),)
 
-                    if best is None or sort_key < best[0]:
-                        best = (sort_key, dict(
+                    # Apply the quality-mode filter
+                    if quality_mode == "exact":
+                        rel_diff = abs(actual - target) / target
+                        # sort_key is (rel_diff,) — lower is better
+                        sort_key = (round(rel_diff, 4),)
+                        candidates.append((sort_key, dict(
                             hidden_size=hidden_size,
                             num_hidden_layers=num_layers,
                             num_attention_heads=num_heads,
                             num_key_value_heads=num_kv_heads,
                             intermediate_size=intermediate_size,
-                        ), actual)
+                        ), actual, 0.0))
+                    else:  # "shape"
+                        rel_diff = abs(actual - target) / target
+                        if rel_diff > param_slack:
+                            continue
+                        score = _quality_score(
+                            hidden_size, num_layers, num_heads, num_kv_heads,
+                            intermediate_size, actual,
+                        )
+                        # sort_key: maximize score, break ties by closeness to target
+                        sort_key = (-score, round(rel_diff, 4))
+                        candidates.append((sort_key, dict(
+                            hidden_size=hidden_size,
+                            num_hidden_layers=num_layers,
+                            num_attention_heads=num_heads,
+                            num_key_value_heads=num_kv_heads,
+                            intermediate_size=intermediate_size,
+                        ), actual, score))
 
-        if best is None:
-            raise ValueError(f"Could not find a config for target_params={target}")
+        if not candidates:
+            raise ValueError(
+                f"Could not find a config for target_params={target} "
+                f"(quality_mode={quality_mode!r}, param_slack={param_slack}). "
+                f"Try a larger param_slack (e.g. 0.25) or quality_mode='exact'."
+            )
 
-        _, kwargs, actual = best
-        diff = abs(actual - target)
+        candidates.sort(key=lambda t: t[0])
+        _, kwargs, actual, score = candidates[0]
         config = cls(
             vocab_size=vocab_size,
             head_dim=head_dim,
@@ -170,13 +269,16 @@ class Qwen3Config:
         )
 
         if verbose:
-            pct = 100 * diff / target
+            pct = 100 * abs(actual - target) / target
             print(f"[Qwen3Config.from_target_size] target={target:,} -> actual={actual:,} "
-                  f"(diff {pct:+.2f}%)")
+                  f"(diff {pct:+.2f}%, quality_mode={quality_mode!r}, "
+                  f"param_slack={param_slack}, score={score:.2f})")
             print(f"  hidden_size={config.hidden_size}, num_layers={config.num_hidden_layers}, "
                   f"num_heads={config.num_attention_heads}, num_kv_heads={config.num_key_value_heads}, "
                   f"head_dim={config.head_dim}, intermediate_size={config.intermediate_size}, "
-                  f"tie_embeddings={config.tie_word_embeddings}")
+                  f"tie_embeddings={config.tie_word_embeddings}, "
+                  f"H/L={config.hidden_size/config.num_hidden_layers:.1f}, "
+                  f"intermediate/H={config.intermediate_size/config.hidden_size:.2f}")
 
         return config
 

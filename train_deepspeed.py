@@ -770,7 +770,9 @@ def train(args):
         if master: print(f"[Resume] loaded config from checkpoint")
     else:
         config = Qwen3Config.from_target_size(
-            args.model_size, vocab_size=vocab_size, verbose=master,
+            args.model_size, vocab_size=vocab_size,
+            quality_mode=args.quality_mode, param_slack=args.param_slack,
+            verbose=master,
         )
 
     model    = Qwen3ForCausalLM(config)
@@ -1003,6 +1005,20 @@ def parse_args():
     # model
     p.add_argument("--model-size", default="0.6B",
                    help="Target size passed to Qwen3Config.from_target_size")
+    p.add_argument("--quality-mode", default="shape", choices=["shape", "exact"],
+                   help=(
+                       "How from_target_size picks the architecture. "
+                       "'shape' (default) — pick the best-shape config within "
+                       "±param-slack of the target (recommended for training quality). "
+                       "'exact' — pick the config whose param count is closest to the "
+                       "target (legacy behavior; can give bad shape on small models)."
+                   ))
+    p.add_argument("--param-slack", type=float, default=0.10,
+                   help=(
+                       "In quality-mode 'shape', allowed param-count deviation from "
+                       "target as a fraction (default 0.10 = ±10%%). Higher values "
+                       "expand the search space."
+                   ))
 
     # data
     p.add_argument("--data-dir", default="./packed")
