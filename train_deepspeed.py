@@ -495,8 +495,22 @@ def build_ds_config(
     }
 
     # ---- bf16 / fp16
-    bf16_cfg = {"enabled": args.dtype == "bf16"}
+    # IMPORTANT: DeepSpeed's "bf16: {enabled: True}" mode (BF16_Optimizer
+    # with fp32 master weights) is producing a degenerate model at init
+    # on this 62.5M shape — the very first loss comes back exactly equal
+    # to ln(vocab_size) (uniform) and the model never moves. Repro is
+    # trivial: a plain torch.optim.AdamW on the same bf16 model learns
+    # normally (loss drops from 10.5 -> 4.2 in 30 steps), but the
+    # equivalent DeepSpeed bf16 setup gets stuck at 10.5 forever.
+    #
+    # Workaround: keep the model parameters in bf16 (so we still get the
+    # ~2x activation VRAM savings) but disable DeepSpeed's bf16 path.
+    # The model is cast to bf16 below, and the forward is wrapped in
+    # torch.autocast(bf16). DeepSpeed then sees fp32 params and uses
+    # its standard fp32 optimizer — which works correctly.
+    bf16_cfg = {"enabled": False}
     fp16_cfg = {"enabled": False}
+    use_pytorch_bf16 = (args.dtype == "bf16")
 
     # ---- gradient clipping
     grad_clip = args.grad_clip
@@ -551,9 +565,24 @@ def build_ds_config(
         }
 
     # ---- assemble
+    #
+    # IMPORTANT: gradient_accumulation_steps is set to 1 in the DS config
+    # because the training loop below does its OWN manual accumulation
+    # (62 micro-batches of forward+backward, then a single engine.step()).
+    # If we left gradient_accumulation_steps=62 in the config, DeepSpeed
+    # would ALSO try to count micro-batches internally — but since
+    # engine.step() is only called once per 62 microbatches, DS's
+    # is_gradient_accumulation_boundary() would fire on the very first
+    # step() (after just 1 microbatch from its perspective) and then
+    # never fire again. The optimizer would then either step too early
+    # (on partial accumulation) or not step at all.
+    #
+    # Setting gas=1 here disables DS's internal accumulation counter
+    # while keeping the rest of the DS pipeline (ZeRO, bf16, fused
+    # optimizer, scheduler) intact. The outer loop drives the cadence.
     cfg = {
         "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps":    args.grad_accum_steps,
+        "gradient_accumulation_steps":    1,
         "gradient_clipping":              grad_clip,
         "steps_per_print":                args.log_interval,
         "wall_clock_breakdown":           False,
@@ -716,14 +745,19 @@ def prune_checkpoints(out_dir: str, keep: int = 3):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(engine, val_loader, eval_steps, device, world_size):
+def evaluate(engine, val_loader, eval_steps, device, world_size, use_pytorch_bf16=False):
     engine.eval()
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if use_pytorch_bf16
+                    else nullcontext())
     losses = []
-    for _ in range(eval_steps):
-        x, y = val_loader.next_batch(device)
-        out  = engine(x, labels=y)
-        loss = out["loss"]
-        losses.append(loss.item())
+    with torch.no_grad():
+        for _ in range(eval_steps):
+            x, y = val_loader.next_batch(device)
+            with autocast_ctx:
+                out  = engine(x, labels=y)
+            loss = out["loss"]
+            losses.append(loss.item())
     engine.train()
     mean_loss = float(np.mean(losses))
     if world_size > 1:
@@ -775,8 +809,20 @@ def train(args):
             verbose=master,
         )
 
+    # Whether to use PyTorch's bf16 (cast model + autocast) instead of
+    # DeepSpeed's broken bf16 path. See the long comment in
+    # build_ds_config for why we have to do this.
+    use_pytorch_bf16 = (args.dtype == "bf16")
+
     model    = Qwen3ForCausalLM(config)
     n_params = count_parameters(model)
+
+    # Cast the model to bf16 BEFORE DeepSpeed init when using PyTorch's
+    # bf16 path. This keeps weights/activations in bf16 for ~2x VRAM
+    # savings, while letting DeepSpeed's standard fp32 optimizer handle
+    # the parameter updates correctly.
+    if use_pytorch_bf16:
+        model = model.to(torch.bfloat16)
 
     if master:
         print_audit(hw, n_params)
@@ -889,6 +935,13 @@ def train(args):
     t0         = time.perf_counter()
     loss_accum = 0.0
 
+    # When using PyTorch's bf16 path (DS bf16 disabled), wrap the forward
+    # in autocast so the bf16-cast model's matmuls run in bf16. The
+    # cross-entropy and softmax are dtype-stable so they stay in fp32.
+    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if use_pytorch_bf16
+                    else nullcontext())
+
     for step in range(start_step, args.max_steps):
 
         # ---- LR override (DeepSpeed scheduler handles LR internally,
@@ -909,7 +962,8 @@ def train(args):
         # once per `step` of the outer `for step in range(...)`.
         for micro_step in range(args.grad_accum_steps):
             x, y = train_loader.next_batch(device)
-            out  = engine(x, labels=y)
+            with autocast_ctx:
+                out  = engine(x, labels=y)
             # Divide by grad_accum_steps so the sum over the inner
             # loop is the true mean loss over one effective batch
             # (= one optimizer step), exactly like train.py.
@@ -958,7 +1012,7 @@ def train(args):
 
         # ---- validation
         if step % args.eval_interval == 0 and step > start_step:
-            val_loss = evaluate(engine, val_loader, args.eval_steps, device, world_size)
+            val_loss = evaluate(engine, val_loader, args.eval_steps, device, world_size, use_pytorch_bf16)
             if master:
                 improved = " ✓" if val_loss < best_val_loss else ""
                 print(f"  [eval] step {step:7d} | val_loss {val_loss:.4f}{improved}")

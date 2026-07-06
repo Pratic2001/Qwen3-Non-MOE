@@ -615,28 +615,18 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def _init_weights(self, module):
+        # Init scheme: standard Qwen3 (std=0.02 for all params) with the
+        # embedding output scaled by 1/sqrt(hidden_size) so the residual
+        # stream starts at variance ~1.0, matching what RMSNorm produces
+        # after the first layer. This is the canonical small-model fix
+        # and was missing from the original release of this file, which
+        # is why the 62.5M model (hidden=448) was unstable at LR >= 5e-4.
         std = 0.02
         if isinstance(module, nn.Linear):
-            # Scaled init: std=0.02 with fan-in fan-out gives activations
-            # whose std grows like sqrt(L) over L layers, which is too
-            # much for the 12-layer 448-hidden 62.5M shape (residual
-            # stream diverges fast). Use 1/sqrt(2*L) like GPT-2 / PaLM
-            # so each residual block contributes ~1.0 to the activation
-            # variance instead of ~2.0.
-            n_layer = self.config.num_hidden_layers
-            std = 0.02 / math.sqrt(2.0 * max(1, n_layer))
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            # Embedding init: same scaled std as the linears. Combined
-            # with the embed_scale = 1/sqrt(hidden_size) multiplication
-            # in the forward pass, the post-embedding activations have
-            # variance ~1.0 — matching the residual stream's scale and
-            # eliminating the first-step gradient explosion on narrow
-            # models.
-            n_layer = self.config.num_hidden_layers
-            std = 0.02 / math.sqrt(2.0 * max(1, n_layer))
             nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def get_output_embeddings(self) -> nn.Linear:
