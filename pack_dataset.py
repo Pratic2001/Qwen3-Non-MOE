@@ -19,13 +19,16 @@ OLD (memory-hogging):
     called encode_batch() on all of them at once, then built a giant
     ids list — 3-5 GB per worker × N workers.
 
-NEW (streaming):
-    Workers encode documents in mini-batches of --mini-batch size and
-    write uint32 token IDs directly to a binary chunk file.
-    Peak RAM per worker ≈ mini_batch × avg_doc_tokens × 4 bytes ≈ 30–80 MB.
-
-    The main process copies each chunk into the output memmap in slices
-    of --copy-chunk-mb bytes so it never loads a full chunk into RAM either.
+NEW (constant RAM, lifetime-safe):
+    - Workers encode documents in mini-batches of --mini-batch size and
+      write uint32 token IDs directly to a binary chunk file.
+      Peak RAM per worker ≈ mini_batch × avg_doc_tokens × 4 bytes ≈ 30–80 MB.
+    - An optional --max-doc-chars cap rejects pathologically large documents
+      so a single 50 MB JSONL line can't blow the mini-batch budget.
+    - The main process copies each chunk into the output memmap in slices
+      of --copy-chunk-mb bytes so it never loads a full chunk into RAM either.
+    - Stage 1 uses 'spawn' (not 'fork') so the main process's already-loaded
+      mmap/PyTorch state isn't accidentally inherited by workers.
 
 Usage:
     python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
@@ -39,10 +42,9 @@ import json
 import os
 import struct
 import time
-from multiprocessing import Pool
+from typing import Optional
 
 import numpy as np
-from tokenizers import Tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +52,16 @@ from tokenizers import Tokenizer
 # ---------------------------------------------------------------------------
 
 _TOKENIZER = None
+_MAX_DOC_CHARS = 0
 
 
-def _init_worker(tokenizer_path: str):
-    global _TOKENIZER
+def _init_worker(tokenizer_path: str, max_doc_chars: int):
+    """Load the tokenizer once per worker. Imported lazily so workers don't
+    depend on the parent's torch / numpy state at import time."""
+    global _TOKENIZER, _MAX_DOC_CHARS
+    from tokenizers import Tokenizer
     _TOKENIZER = Tokenizer.from_file(tokenizer_path)
+    _MAX_DOC_CHARS = max_doc_chars
 
 
 def _tokenize_shard(job):
@@ -66,16 +73,19 @@ def _tokenize_shard(job):
     Returns (category, total_token_count, chunk_path).
     """
     shard_path, tmp_dir, idx, mini_batch = job
-    global _TOKENIZER
 
-    out_path    = os.path.join(tmp_dir, f"chunk_{idx:06d}.bin")
-    category    = None
-    total       = 0
-    batch_texts = []
+    out_path = os.path.join(tmp_dir, f"chunk_{idx:06d}.bin")
+    category = None
+    total    = 0
+    batch_texts: list = []
+    skipped_too_big = 0
 
     def _flush(texts, fh):
         if not texts:
             return 0
+        # encode_batch is the hot loop. tokenizers handles parallelism itself
+        # via its internal rayon pool, sized down here so a 4-worker Pool
+        # doesn't fight with N internal rayon threads for cores.
         encodings = _TOKENIZER.encode_batch(texts)
         n = 0
         for enc in encodings:
@@ -85,7 +95,7 @@ def _tokenize_shard(job):
         return n
 
     try:
-        with open(shard_path, "r", encoding="utf-8") as fin, \
+        with open(shard_path, "r", encoding="utf-8", errors="replace") as fin, \
              open(out_path, "wb") as fout:
 
             for line in fin:
@@ -102,12 +112,18 @@ def _tokenize_shard(job):
                 if category is None:
                     category = rec.get("category", "unknown")
 
+                # Cap individual document size. A single 50 MB line shouldn't
+                # be allowed to dominate the mini-batch's RAM.
+                if _MAX_DOC_CHARS and len(text) > _MAX_DOC_CHARS:
+                    skipped_too_big += 1
+                    continue
+
                 batch_texts.append(text)
                 if len(batch_texts) >= mini_batch:
-                    total      += _flush(batch_texts, fout)
+                    total += _flush(batch_texts, fout)
                     batch_texts = []
 
-            total += _flush(batch_texts, fout)   # flush remainder
+            total += _flush(batch_texts, fout)  # flush remainder
 
     except Exception as e:
         print(f"\n[worker {idx}] error: {e}")
@@ -115,9 +131,9 @@ def _tokenize_shard(job):
     if total == 0:
         if os.path.exists(out_path):
             os.remove(out_path)
-        return category or "unknown", 0, None
+        return category or "unknown", 0, None, skipped_too_big
 
-    return category or "unknown", total, out_path
+    return category or "unknown", total, out_path, skipped_too_big
 
 
 # ---------------------------------------------------------------------------
@@ -169,21 +185,27 @@ def main():
     p = argparse.ArgumentParser(
         description="Tokenize and pack JSONL corpus into memmap .bin files."
     )
-    p.add_argument("--data-dir",       default="./data")
-    p.add_argument("--tokenizer",      default="./tokenizer")
-    p.add_argument("--out-dir",        default="./packed")
-    p.add_argument("--val-fraction",   type=float, default=0.0005,
+    p.add_argument("--data-dir",        default="./data")
+    p.add_argument("--tokenizer",       default="./tokenizer")
+    p.add_argument("--out-dir",         default="./packed")
+    p.add_argument("--val-fraction",    type=float, default=0.0005,
                    help="Fraction of tokens for validation (default 0.05%%)")
-    p.add_argument("--workers",        type=int,
+    p.add_argument("--workers",         type=int,
                    default=max(1, (os.cpu_count() or 2) - 1),
                    help="Parallel tokenization workers")
-    p.add_argument("--mini-batch",     type=int, default=64,
+    p.add_argument("--mini-batch",      type=int, default=64,
                    help="Docs encoded per mini-batch in each worker. "
                         "Lower = less RAM per worker. Default 64.")
-    p.add_argument("--copy-chunk-mb",  type=int, default=64,
+    p.add_argument("--max-doc-chars",   type=int, default=200_000,
+                   help="Skip individual documents longer than this. "
+                        "Default 200,000 chars (~50k tokens).")
+    p.add_argument("--copy-chunk-mb",   type=int, default=64,
                    help="Slice size (MB) when copying chunks to final mmap. "
                         "Controls main-process peak RAM. Default 64 MB.")
-    p.add_argument("--shuffle-shards", action="store_true", default=True)
+    p.add_argument("--shuffle-shards",  action="store_true", default=True)
+    p.add_argument("--tokenizer-threads", type=int, default=1,
+                   help="Threads per worker's encode_batch(). Default 1 to "
+                        "avoid oversubscribing cores when --workers > 1.")
     args = p.parse_args()
 
     tokenizer_path = os.path.join(args.tokenizer, "tokenizer.json")
@@ -192,11 +214,18 @@ def main():
             f"{tokenizer_path} not found — run train_tokenizer.py first."
         )
 
+    # Read just the vocab size from the tokenizer file directly, so we don't
+    # have to load the full Tokenizer object in the main process.
+    from tokenizers import Tokenizer
     tmp_tok    = Tokenizer.from_file(tokenizer_path)
     vocab_size = tmp_tok.get_vocab_size()
-    out_dtype  = np.uint16 if vocab_size <= 65536 else np.uint32
     del tmp_tok
+    out_dtype  = np.uint16 if vocab_size <= 65536 else np.uint32
     print(f"Tokenizer vocab size : {vocab_size}  ->  packing as {out_dtype.__name__}")
+
+    # Pin tokenizers' internal rayon thread count BEFORE workers fork/spawn.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, args.tokenizer_threads))
 
     shard_paths = sorted(glob.glob(os.path.join(args.data_dir, "*", "*.jsonl")))
     if not shard_paths:
@@ -218,37 +247,47 @@ def main():
     slice_tokens = max(1, (args.copy_chunk_mb * 1024 * 1024) // 4)
 
     # Print memory estimates so the user can tune before a long run
-    avg_doc_tokens    = 600
-    peak_per_worker   = args.mini_batch * avg_doc_tokens * 4 / 1024**2
-    total_worker_ram  = peak_per_worker * args.workers
+    avg_doc_tokens   = 600
+    peak_per_worker  = args.mini_batch * avg_doc_tokens * 4 / 1024**2
+    total_worker_ram = peak_per_worker * args.workers
+    main_proc_peak   = args.copy_chunk_mb
     print(f"\nWorkers              : {args.workers}")
     print(f"Mini-batch / worker  : {args.mini_batch} docs  "
           f"(~{peak_per_worker:.0f} MB peak RAM per worker)")
-    print(f"Est. total worker RAM: ~{total_worker_ram:.0f} MB  "
-          f"(was several GB with old design)")
-    print(f"Copy slice           : {args.copy_chunk_mb} MB\n")
+    print(f"Est. total worker RAM: ~{total_worker_ram:.0f} MB")
+    print(f"Main proc peak RAM   : ~{main_proc_peak} MB (copy slice)")
+    print(f"Per-doc cap          : {args.max_doc_chars:,} chars")
+    print(f"Tokenizer threads    : {args.tokenizer_threads} per worker\n")
 
     # ---------------------------------------------------------------
     # Stage 1 — tokenize shards in parallel, stream-write chunk files
     # ---------------------------------------------------------------
+    # Use 'spawn' instead of 'fork' so workers don't inherit the parent's
+    # already-loaded mmap / torch / openblas state. Forks-after-mmap have
+    # caused subtle munmap_chunk() issues on some glibc versions.
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+
     t0         = time.time()
     work_items = [(path, tmp_dir, i, args.mini_batch)
                   for i, path in enumerate(shard_paths)]
 
     cat_counts:    dict = {}
     chunk_records: list = []
+    total_skipped: int  = 0
 
     print(f"Stage 1 — tokenizing {len(work_items)} shard(s) …")
-    with Pool(
+    with ctx.Pool(
         processes=args.workers,
         initializer=_init_worker,
-        initargs=(tokenizer_path,),
+        initargs=(tokenizer_path, args.max_doc_chars),
     ) as pool:
-        for i, (cat, n_tok, chunk_path) in enumerate(
-            pool.imap(_tokenize_shard, work_items)
+        for i, (cat, n_tok, chunk_path, skipped) in enumerate(
+            pool.imap_unordered(_tokenize_shard, work_items)
         ):
             chunk_records.append((cat, n_tok, chunk_path))
             cat_counts[cat] = cat_counts.get(cat, 0) + n_tok
+            total_skipped  += skipped
 
             report_every = max(1, len(work_items) // 20)
             if (i + 1) % report_every == 0 or (i + 1) == len(work_items):
@@ -257,7 +296,8 @@ def main():
                       f"{done:,} tokens  ({time.time()-t0:.1f}s)")
 
     total_tokens = sum(r[1] for r in chunk_records)
-    print(f"\nTotal tokens : {total_tokens:,}")
+    print(f"\nTotal tokens : {total_tokens:,}"
+          + (f"  (skipped {total_skipped} oversized docs)" if total_skipped else ""))
     for cat, n in sorted(cat_counts.items()):
         pct = 100 * n / total_tokens if total_tokens else 0
         print(f"  {cat:14s}: {n:,}  ({pct:.1f}%)")
@@ -314,6 +354,7 @@ def main():
         "val_tokens":            int(val_ptr),
         "total_tokens":          int(total_tokens),
         "category_token_counts": cat_counts,
+        "skipped_oversized_docs": total_skipped,
         "tokenizer_dir":         os.path.abspath(args.tokenizer),
     }
     meta_path = os.path.join(args.out_dir, "meta.json")

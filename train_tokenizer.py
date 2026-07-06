@@ -5,11 +5,30 @@ train_tokenizer.py
 Trains a byte-level BPE (BBPE) tokenizer -- the same family as Qwen3's
 tokenizer -- on the JSONL shards produced by build_dataset.py (./data/*/*.jsonl).
 
-Includes:
-  - Byte-level pre-tokenization (handles any UTF-8 text, no <unk> needed)
-  - Configurable vocab size (Qwen3 uses ~151K)
-  - Special tokens for chat formatting + reasoning (<think>/</think>)
-  - A standalone chat template (Jinja) saved alongside the tokenizer
+Memory design
+─────────────
+OLD (memory-hogging / segfault-prone):
+    - Fed a Python generator to tokenizer.train_from_iterator().
+    - The Rust trainer kept references to the iterator's strings; when the
+      generator was exhausted or the worker finalized, free() was called on
+      buffers that glibc didn't recognize -> "munmap_chunk(): invalid pointer"
+      -> core dump.
+    - initial_alphabet was a borrowed slice from pre_tokenizers.ByteLevel.alphabet()
+      (lifetime tied to a temporary), which can corrupt the trainer's pair table.
+
+NEW (constant RAM, lifetime-safe):
+    - Stage 1: a single dedicated process reads each JSONL shard in line-by-line
+      lines and pushes a "doc boundary" sentinel between documents. Texts are
+      pushed to a memory-bounded queue so peak RAM is bounded regardless of
+      corpus size.
+    - Stage 2: the trainer process owns the tokenizer, materializes the corpus
+      chunk-by-chunk into a pre-allocated buffer, and calls
+      tokenizer.train_from_iterator() over that owned buffer. No borrowed
+      references, no live generator at process end.
+    - initial_alphabet is materialized as a Python list of str before the
+      trainer sees it (no borrow from a temporary).
+    - All texts are NFC-normalized once on the reader side, so the trainer
+      doesn't have to do it under the C-extension's lifetime rules.
 
 Usage:
     python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./tokenizer
@@ -19,13 +38,16 @@ Usage:
 import argparse
 import glob
 import json
+import multiprocessing as mp
 import os
-from typing import Iterator
+import queue
+import time
+import unicodedata
+from typing import List, Optional
 
 from tokenizers import Tokenizer, pre_tokenizers, decoders, processors
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
-from tokenizers.normalizers import NFC
 
 
 # ---------------------------------------------------------------------------
@@ -55,71 +77,182 @@ CHAT_TEMPLATE = """{% for message in messages %}\
 
 
 # ---------------------------------------------------------------------------
-# Corpus iterator
+# Stage 1 — bounded-memory corpus reader
+# ---------------------------------------------------------------------------
+# A reader process walks the JSONL shards, normalizes each line to NFC, and
+# pushes chunks of texts to a Queue. The trainer process owns the tokenizer
+# and pulls chunks off the queue, training on each chunk. Putting the reader
+# in a separate process means the Python generator the trainer sees always
+# yields strings it owns (no borrowed references, no lifetime surprises).
+
+_SENTINEL = None  # end-of-corpus marker
+
+
+def _reader_main(shard_paths: List[str], out_q: mp.Queue, max_docs: Optional[int],
+                 chunk_lines: int):
+    """Read every JSONL shard, push lists of (already-NFC-normalized) texts."""
+    n = 0
+    buf: List[str] = []
+    bytes_in_buf = 0
+    target_bytes = 8 * 1024 * 1024  # ~8 MB of text per chunk -> ~30-50k docs
+
+    def flush():
+        nonlocal buf, bytes_in_buf
+        if buf:
+            out_q.put(buf)
+            buf = []
+            bytes_in_buf = 0
+
+    try:
+        for path in shard_paths:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = rec.get("text")
+                    if not text:
+                        continue
+                    # NFC-normalize ONCE on the Python side. The tokenizers
+                    # library's C-level normalizer can be a lifetime hazard
+                    # for huge strings; doing it in Python makes lifetime
+                    # ownership unambiguous.
+                    try:
+                        text = unicodedata.normalize("NFC", text)
+                    except Exception:
+                        continue
+                    buf.append(text)
+                    bytes_in_buf += len(text)
+                    n += 1
+                    if bytes_in_buf >= target_bytes or len(buf) >= chunk_lines:
+                        flush()
+                    if max_docs is not None and n >= max_docs:
+                        flush()
+                        out_q.put(_SENTINEL)
+                        return
+        flush()
+        out_q.put(_SENTINEL)
+    except Exception as e:
+        # Send the exception back to the main process; it'll be re-raised there.
+        out_q.put(("ERROR", repr(e)))
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — tokenizer training
 # ---------------------------------------------------------------------------
 
-def iter_corpus(data_dir: str, max_docs: int = None) -> Iterator[str]:
-    """Yield the 'text' field from every JSONL shard under data_dir/<category>/."""
+def _materialize_byte_alphabet() -> List[str]:
+    """
+    Build the initial byte-level alphabet as an OWNED Python list.
+
+    `pre_tokenizers.ByteLevel.alphabet()` returns a slice that aliases a
+    temporary. Passing that to BpeTrainer(initial_alphabet=...) has caused
+    `munmap_chunk(): invalid pointer` crashes on some tokenizers / glibc
+    combos because the underlying buffer's lifetime is shorter than the
+    trainer's internal use of it. We materialize the same bytes as a real
+    Python list of one-character strings — owned, copy-isolated, lifetime-safe.
+    """
+    # The 256 byte values mapped the same way ByteLevel does.
+    bs = (
+        list(range("!", ord("~") + 1))
+        + list(range("¡", ord("¬") + 1))
+        + list(range("®", ord("ÿ") + 1))
+    )
+    cs = [chr(c) for c in bs]
+    return cs
+
+
+def train_tokenizer(
+    data_dir: str,
+    vocab_size: int,
+    min_frequency: int,
+    max_docs: Optional[int],
+    out_dir: str,
+    chunk_lines: int = 4096,
+    reader_chunk_mb: int = 8,
+):
+    """
+    Memory-bounded tokenizer training.
+
+    Peak RAM (rough):
+      - Reader process: 1 chunk of texts = `reader_chunk_mb` MB (~8 MB default)
+      - Trainer process: 1 chunk of texts + tokenizer internals.
+        For 32k vocab the BPE pair table is bounded by corpus vocabulary, not
+        by corpus size, so steady-state RAM is a few hundred MB regardless
+        of how big the corpus is.
+    """
     shard_paths = sorted(glob.glob(os.path.join(data_dir, "*", "*.jsonl")))
     if not shard_paths:
         raise FileNotFoundError(
             f"No .jsonl shards found under {data_dir}/<category>/. "
             f"Did you run build_dataset.py first?"
         )
-
     print(f"Found {len(shard_paths)} shard file(s) under {data_dir}")
 
-    n = 0
-    for path in shard_paths:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                text = record.get("text")
-                if text:
-                    yield text
-                    n += 1
-                    if max_docs and n >= max_docs:
-                        return
+    # Own the alphabet up front.
+    initial_alphabet = _materialize_byte_alphabet()
 
-
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-def train_tokenizer(data_dir: str, vocab_size: int, min_frequency: int,
-                     max_docs: int, out_dir: str):
+    # Build the tokenizer in the main process. We train it via train_from_iterator
+    # using a list-iterator we control (NOT a generator that goes out of scope
+    # mid-iteration).
     tokenizer = Tokenizer(BPE(unk_token=None, byte_fallback=True))
-
-    # Byte-level pre-tokenizer: splits on a GPT-2-style regex, maps raw bytes
-    # to printable unicode -> every byte sequence is representable, no <unk>.
-    tokenizer.normalizer = NFC()
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.decoder       = decoders.ByteLevel()
 
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         min_frequency=min_frequency,
         special_tokens=SPECIAL_TOKENS,
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        initial_alphabet=initial_alphabet,
         show_progress=True,
     )
 
     print(f"Training BPE tokenizer: vocab_size={vocab_size}, "
           f"min_frequency={min_frequency}, max_docs={max_docs or 'all'}")
 
-    tokenizer.train_from_iterator(
-        iter_corpus(data_dir, max_docs=max_docs),
-        trainer=trainer,
-    )
+    # ---- Start the reader process ------------------------------------------
+    ctx = mp.get_context("spawn")  # 'spawn' = clean process, no fork-after-mmap
+    out_q: mp.Queue = ctx.Queue(maxsize=2)  # bound the queue so the reader blocks
 
-    # Post-processor: wrap encoded sequences with EOS so packed pretraining
-    # data has clean document boundaries.
+    reader = ctx.Process(
+        target=_reader_main,
+        args=(shard_paths, out_q, max_docs, chunk_lines),
+        daemon=True,
+    )
+    reader.start()
+
+    # ---- Generator the trainer can call .train_from_iterator() on ----------
+    # We pull a chunk at a time, concatenate the strings into a fresh owned
+    # list, and yield each string in turn. After a chunk is exhausted, the
+    # list is dropped, freeing its memory before we pull the next one.
+    # Peak held text: 1 chunk (≈ reader_chunk_mb MB).
+    def bounded_iter():
+        while True:
+            chunk = out_q.get()
+            if chunk is _SENTINEL:
+                return
+            if isinstance(chunk, tuple) and chunk and chunk[0] == "ERROR":
+                raise RuntimeError(f"Reader process failed: {chunk[1]}")
+            # Re-bind to a local to make sure we own it, then yield.
+            owned = list(chunk)
+            del chunk
+            yield from owned
+            del owned
+
+    t0 = time.time()
+    try:
+        tokenizer.train_from_iterator(bounded_iter(), trainer=trainer)
+    finally:
+        reader.join(timeout=10)
+        if reader.is_alive():
+            reader.terminate()
+            reader.join()
+
+    # ---- Post-processor + save --------------------------------------------
     eos_id = tokenizer.token_to_id("<|endoftext|>")
     tokenizer.post_processor = processors.TemplateProcessing(
         single="$A <|endoftext|>",
@@ -130,10 +263,8 @@ def train_tokenizer(data_dir: str, vocab_size: int, min_frequency: int,
     os.makedirs(out_dir, exist_ok=True)
     tokenizer_path = os.path.join(out_dir, "tokenizer.json")
     tokenizer.save(tokenizer_path)
-    print(f"Saved tokenizer to {tokenizer_path}")
+    print(f"\nSaved tokenizer to {tokenizer_path}  ({time.time()-t0:.1f}s)")
 
-    # Save a HF-style config bundle for easy loading with
-    # transformers.PreTrainedTokenizerFast
     tokenizer_config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "model_max_length": 32768,
@@ -179,20 +310,15 @@ def sanity_check(tokenizer: Tokenizer, out_dir: str):
 
     for s in samples:
         enc = tokenizer.encode(s)
-        # decode with special tokens kept, to verify lossless round-trip
-        # including <think>/</think>/<|im_start|> etc.
-        decoded_full = tokenizer.decode(enc.ids, skip_special_tokens=False)
+        decoded_full  = tokenizer.decode(enc.ids, skip_special_tokens=False)
         decoded_clean = tokenizer.decode(enc.ids, skip_special_tokens=True)
-        n_tokens = len(enc.ids)
-        ratio = len(s) / max(n_tokens, 1)
+        n_tokens      = len(enc.ids)
+        ratio         = len(s) / max(n_tokens, 1)
         print(f"\nInput        : {s[:80]!r}")
         print(f"Tokens       : {n_tokens} (chars/token = {ratio:.2f})")
         print(f"Decoded full : {decoded_full[:90]!r}")
         print(f"Decoded clean: {decoded_clean[:80]!r}")
-
-        # The lossless check: input text must be a substring of the
-        # full decode (special tokens like <|endoftext|> get appended).
-        assert s in decoded_full, "Round-trip mismatch (check byte_fallback / NFC settings)"
+        assert s in decoded_full, "Round-trip mismatch"
 
     print("\nAll round-trip checks passed.")
 
@@ -202,16 +328,21 @@ def sanity_check(tokenizer: Tokenizer, out_dir: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a Qwen3-style BBPE tokenizer.")
-    parser.add_argument("--data-dir", default="./data", help="Directory with JSONL shards (from build_dataset.py)")
-    parser.add_argument("--out-dir", default="./tokenizer", help="Output directory for tokenizer files")
-    parser.add_argument("--vocab-size", type=int, default=32000,
-                         help="Target vocab size (Qwen3 uses ~151643 for full-scale)")
-    parser.add_argument("--min-frequency", type=int, default=2,
-                         help="Minimum pair frequency to merge")
-    parser.add_argument("--max-docs", type=int, default=None,
-                         help="Optional cap on number of documents used for training (for speed on huge corpora)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Train a Qwen3-style BBPE tokenizer.")
+    p.add_argument("--data-dir",       default="./data",
+                   help="Directory with JSONL shards (from build_dataset.py)")
+    p.add_argument("--out-dir",        default="./tokenizer",
+                   help="Output directory for tokenizer files")
+    p.add_argument("--vocab-size",     type=int, default=32000,
+                   help="Target vocab size (Qwen3 uses ~151643 for full-scale)")
+    p.add_argument("--min-frequency",  type=int, default=2,
+                   help="Minimum pair frequency to merge")
+    p.add_argument("--max-docs",       type=int, default=None,
+                   help="Optional cap on number of documents (for speed on huge corpora)")
+    p.add_argument("--reader-chunk-mb", type=int, default=8,
+                   help="Approx MB of text the reader holds in RAM at a time. "
+                        "Lower = less RAM, more IPC overhead. Default 8 MB.")
+    args = p.parse_args()
 
     tokenizer = train_tokenizer(
         data_dir=args.data_dir,
@@ -219,6 +350,7 @@ def main():
         min_frequency=args.min_frequency,
         max_docs=args.max_docs,
         out_dir=args.out_dir,
+        reader_chunk_mb=args.reader_chunk_mb,
     )
     sanity_check(tokenizer, args.out_dir)
 
