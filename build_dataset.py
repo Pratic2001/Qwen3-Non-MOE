@@ -37,19 +37,31 @@ from datasets import load_dataset
 
 SOURCES = {
     "web": [
+        # FineWeb sample-10BT (~44 GB on disk, ~10 B tokens) is the main
+        # web source. Add fallbacks below it that kick in only when the
+        # primary is exhausted, so 100 GB+ targets don't stall.
         dict(path="HuggingFaceFW/fineweb", name="sample-10BT", split="train", text_field="text"),
+        dict(path="HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", text_field="text"),
+        dict(path="Skylion007/openwebtext", name=None, split="train", text_field="text"),
     ],
     "code": [
         dict(path="bigcode/the-stack-smol", name=None, split="train", text_field="content"),
+        # Fallback only reached if the-stack-smol exhausts.
+        dict(path="codeparrot/github-code-clean", name="all-all", split="train", text_field="code"),
     ],
     "math": [
         dict(path="HuggingFaceTB/finemath", name="finemath-4plus", split="train", text_field="text"),
+        dict(path="HuggingFaceTB/finemath", name="finemath-3plus", split="train", text_field="text"),
+        dict(path="open-r1/OpenR1-Math-220k", name=None, split="train", text_field="problem"),
     ],
     "knowledge": [
+        # Wikipedia is ~20 GB compressed -> one full pass already covers
+        # the knowledge budget; no fallback needed.
         dict(path="wikimedia/wikipedia", name="20231101.en", split="train", text_field="text"),
     ],
     "reasoning": [
         dict(path="Open-Orca/OpenOrca", name=None, split="train", text_field=None),  # special-cased
+        dict(path="Open-Orca/SlimOrca", name=None, split="train", text_field=None),   # special-cased
     ],
 }
 
