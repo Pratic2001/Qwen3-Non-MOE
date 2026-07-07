@@ -39,9 +39,15 @@ Highlights
 
 Usage
 -----
-  # one-shot generation
+  # one-shot generation (SFT or merged model)
   python infer.py --checkpoint ./sft_merged/merged_model.pt \\
       --tokenizer ./tokenizer --prompt "Solve 2+2"
+
+  # base pretrained model (no SFT).  --pretrained auto-forces raw prompt
+  # mode and prints a banner explaining the output is expected to be
+  # ungrammatical on small models.
+  python infer.py --pretrained --checkpoint ./checkpoints/latest.pt \\
+      --tokenizer ./tokenizer --prompt "Once upon a time"
 
   # interactive REPL with stream-of-tokens output
   python infer.py --checkpoint ./sft_merged/merged_model.pt \\
@@ -728,6 +734,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "deepspeed_shard_consolidator.py.")
     p.add_argument("--tokenizer",  required=True,
                    help="Directory containing tokenizer.json (from train_tokenizer.py).")
+    p.add_argument("--pretrained", action="store_true",
+                   help="Marker flag: the checkpoint is a base pretrained model "
+                        "(from train.py or deepspeed_shard_consolidator.py), NOT "
+                        "an SFT or chat-tuned model.  This auto-forces "
+                        "--chat-template raw (no ChatML wrapping) and prints a "
+                        "banner so the call is self-documenting.  No other "
+                        "behavior change — the same loader and generate path "
+                        "is used.")
 
     # ---- Device
     p.add_argument("--device", default="auto",
@@ -1005,6 +1019,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.smoke_test:
         return smoke_test()
+
+    # ---- --pretrained marker: announce mode and force raw prompt wrapping
+    # A base pretrained model has never seen ChatML turn structure, so
+    # wrapping the prompt in <|im_start|>user\n...<|im_end|>\n
+    # <|im_start|>assistant\n is actively harmful — the model will produce
+    # junk trying to complete the template.  Force raw text in.
+    if args.pretrained:
+        args.chat_template = "raw"
+        args.enable_thinking = False
+        print("=" * 60)
+        print("  PRETRAINED MODE  (base model, not SFT/chat-tuned)")
+        print("  - --chat-template forced to 'raw' (no ChatML wrap)")
+        print("  - --enable-thinking disabled")
+        print("  - Generation parameters unchanged from your flags")
+        print("")
+        print("  Tip: a 62.5M / small base model will produce stop-word-heavy")
+        print("  output that doesn't cohere.  This is expected, not a bug.")
+        print("  Use --temperature 0.7-1.0 and --repetition-penalty 1.1")
+        print("  to break comma-loops in the output.")
+        print("=" * 60)
 
     # ---- model
     print(f"[infer] loading checkpoint: {args.checkpoint}")
