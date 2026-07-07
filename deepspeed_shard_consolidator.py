@@ -328,10 +328,50 @@ def consolidate(args):
     size_gb = out_path.stat().st_size / 1e9
     print(f"[Save]  Done.  File size: {size_gb:.2f} GB")
 
+    # ---- verify tie is preserved in the saved file
+    # The state_dict contains BOTH `model.embed_tokens.weight` and
+    # `lm_head.weight` as separate keys. They are numerically equal
+    # (because the training-time tie meant one tensor was saved twice),
+    # but the Python-object tie is NOT preserved in the file — that
+    # relationship only exists in a live model. The downstream loader
+    # must call model.tie_weights() after load_state_dict() to restore
+    # it, otherwise the lm_head and embed_tokens will be different
+    # tensor objects (numerically equal, but identity-different), which
+    # breaks torch.compile / CUDAGraphs / tied-gradient invariants.
+    embed_w = state_dict.get("model.embed_tokens.weight")
+    head_w  = state_dict.get("lm_head.weight")
+    if embed_w is not None and head_w is not None:
+        same_shape = embed_w.shape == head_w.shape
+        # .equal() compares values; .data_ptr() would be different
+        # because state_dict() copies the storage.
+        same_values = embed_w.shape == head_w.shape and embed_w.equal(head_w)
+        if same_values:
+            print(f"\n[Tie]   lm_head and embed_tokens values are equal in the saved file ✓")
+            print(f"        (downstream MUST call model.tie_weights() to restore the in-memory tie)")
+        else:
+            print(f"\n[Tie]   WARNING: lm_head and embed_tokens VALUES differ in the saved file.")
+            print(f"        embed: {tuple(embed_w.shape)} {embed_w.dtype}")
+            print(f"        head : {tuple(head_w.shape)} {head_w.dtype}")
+            if not same_shape:
+                print(f"        Shapes differ — the saved checkpoint is broken or not tied.")
+            print(f"        This will produce garbage generation. Check the source checkpoint.")
+    else:
+        print(f"\n[Tie]   WARNING: could not find embed_tokens.weight and/or lm_head.weight")
+        print(f"        in the saved state_dict. Generation will likely fail.")
+
     print(f"""
 {'='*60}
   Consolidation complete!
   Output: {out_path}
+
+  REQUIRED in your downstream load script (after model.load_state_dict(...)):
+      if hasattr(model, "tie_weights"):
+          model.tie_weights()
+      model.eval()    # also disable dropout
+
+  Without these two lines, lm_head and embed_tokens will be
+  numerically-equal-but-different tensor objects, which produces
+  the ":,,,,,,,..." comma-loop generation output.
 
   To start SFT:
       python sft.py \\
@@ -340,6 +380,12 @@ def consolidate(args):
           --data-dir   ./sft_data \\
           --lora \\
           --out-dir    ./sft_checkpoints
+
+  To generate text from the pretrained model:
+      python diagnose_and_generate.py \\
+          --checkpoint {out_path} \\
+          --tokenizer  ./tokenizer \\
+          --prompt "Once upon a time"
 {'='*60}
 """)
 

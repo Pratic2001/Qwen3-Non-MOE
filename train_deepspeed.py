@@ -623,12 +623,16 @@ def print_ds_config_summary(cfg: dict, zero_stage: int,
 
 class PackedDataLoader:
     """
-    Identical to train.py version: memmap-backed, prefetched, rank-sharded.
+    Identical to train.py version: memmap-backed, prefetched, rank-sharded,
+    per-loader independent RNG, and a sequential iterator for true held-out
+    evaluation.
     """
     def __init__(self, bin_path: str, seq_len: int, batch_size: int,
-                 rank: int = 0, world_size: int = 1, dtype=np.uint16):
+                 rank: int = 0, world_size: int = 1, dtype=np.uint16,
+                 loader_id: int = 0, seed: int = 42):
         self.seq_len    = seq_len
         self.batch_size = batch_size
+        self.loader_id  = loader_id
 
         data       = np.memmap(bin_path, dtype=dtype, mode="r")
         shard_size = len(data) // world_size
@@ -638,11 +642,19 @@ class PackedDataLoader:
         self.n_pos = max(1, len(self.data) - seq_len)
         self._next: Optional[Tuple] = None
 
+        # Independent RNG per loader so train and val don't share state.
+        self.gen = torch.Generator().manual_seed(
+            seed * 1_000_003 + rank * 31 + loader_id
+        )
+
         print(f"[DataLoader rank {rank}] {bin_path}: "
-              f"{len(self.data):,} tokens  shard [{start}:{end}]")
+              f"{len(self.data):,} tokens  shard [{start}:{end}]  "
+              f"loader_id={loader_id}")
 
     def _build(self):
-        ix = torch.randint(self.n_pos, (self.batch_size,))
+        ix = torch.randint(
+            self.n_pos, (self.batch_size,), generator=self.gen
+        )
         x  = torch.stack([torch.from_numpy(self.data[i:i+self.seq_len].astype(np.int64))
                           for i in ix])
         y  = torch.stack([torch.from_numpy(self.data[i+1:i+1+self.seq_len].astype(np.int64))
@@ -662,6 +674,38 @@ class PackedDataLoader:
         x = x_cpu.pin_memory().to(device, non_blocking=True)
         y = y_cpu.pin_memory().to(device, non_blocking=True)
         return x, y
+
+    def iter_sequential(self, device: torch.device, max_batches: int):
+        """
+        Walk self.data in document order, yielding (x, y) on `device` with
+        no overlap and no replacement. Used by evaluate() to compute the
+        true held-out loss (unaffected by the val-file-allocation artifact
+        of pack_dataset.py). See train.py for the long-form rationale.
+        """
+        n = len(self.data)
+        usable = (n // self.seq_len) * self.seq_len
+        for batch_start in range(0, usable, self.batch_size * self.seq_len):
+            if max_batches <= 0:
+                break
+            offsets = [
+                batch_start + j * self.seq_len
+                for j in range(self.batch_size)
+                if batch_start + j * self.seq_len + self.seq_len < n
+            ]
+            if not offsets:
+                break
+            x = torch.stack([
+                torch.from_numpy(self.data[o:o+self.seq_len].astype(np.int64))
+                for o in offsets
+            ])
+            y = torch.stack([
+                torch.from_numpy(self.data[o+1:o+1+self.seq_len].astype(np.int64))
+                for o in offsets
+            ])
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+            yield x, y
+            max_batches -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -745,26 +789,47 @@ def prune_checkpoints(out_dir: str, keep: int = 3):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(engine, val_loader, eval_steps, device, world_size, use_pytorch_bf16=False):
+def evaluate(engine, val_loader, eval_steps, device, world_size,
+             use_pytorch_bf16=False) -> tuple[float, float]:
+    """
+    Returns (loss_random, loss_sequential). See train.py for the full
+    rationale — short version: loss_random is comparable to train loss
+    (both are random-window), loss_sequential is the true held-out
+    loss a downstream consumer would see.
+    """
     engine.eval()
     autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                     if use_pytorch_bf16
                     else nullcontext())
-    losses = []
+
+    losses_random = []
     with torch.no_grad():
         for _ in range(eval_steps):
             x, y = val_loader.next_batch(device)
             with autocast_ctx:
                 out  = engine(x, labels=y)
             loss = out["loss"]
-            losses.append(loss.item())
+            losses_random.append(loss.item())
+    loss_random = float(np.mean(losses_random))
+
+    losses_seq = []
+    with torch.no_grad():
+        for x, y in val_loader.iter_sequential(device, max_batches=eval_steps):
+            with autocast_ctx:
+                out = engine(x, labels=y)
+            losses_seq.append(out["loss"].item())
+    loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
+
     engine.train()
-    mean_loss = float(np.mean(losses))
+
     if world_size > 1:
-        t = torch.tensor(mean_loss, device=device)
-        dist.all_reduce(t, op=dist.ReduceOp.AVG)
-        mean_loss = t.item()
-    return mean_loss
+        t_r = torch.tensor(loss_random, device=device)
+        t_s = torch.tensor(loss_seq,    device=device)
+        dist.all_reduce(t_r, op=dist.ReduceOp.AVG)
+        dist.all_reduce(t_s, op=dist.ReduceOp.AVG)
+        loss_random = t_r.item()
+        loss_seq    = t_s.item()
+    return loss_random, loss_seq
 
 
 # ---------------------------------------------------------------------------
@@ -883,15 +948,19 @@ def train(args):
     )
 
     # ---------------------------------------------------------------- data
+    # loader_id 0 = train, 1 = val. Combined with rank and args.seed
+    # this gives each loader a fully independent random stream.
     train_loader = PackedDataLoader(
         os.path.join(args.data_dir, "train.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=global_rank, world_size=world_size, dtype=dtype_np,
+        loader_id=0, seed=args.seed,
     )
     val_loader = PackedDataLoader(
         os.path.join(args.data_dir, "val.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=global_rank, world_size=world_size, dtype=dtype_np,
+        loader_id=1, seed=args.seed,
     )
     train_loader.prime()
     val_loader.prime()
@@ -1012,13 +1081,25 @@ def train(args):
 
         # ---- validation
         if step % args.eval_interval == 0 and step > start_step:
-            val_loss = evaluate(engine, val_loader, args.eval_steps, device, world_size, use_pytorch_bf16)
+            val_random, val_seq = evaluate(
+                engine, val_loader, args.eval_steps, device, world_size,
+                use_pytorch_bf16,
+            )
+            # Sequential metric is the "true" held-out loss; track best
+            # checkpoint on it so the saved best.pt reflects actual
+            # downstream quality, not an artifact of the val slice.
+            val_loss = val_seq
             if master:
                 improved = " ✓" if val_loss < best_val_loss else ""
-                print(f"  [eval] step {step:7d} | val_loss {val_loss:.4f}{improved}")
+                print(f"  [eval] step {step:7d} | val_random {val_random:.4f} | "
+                      f"val_seq {val_seq:.4f}{improved}")
                 if use_wandb:
                     import wandb
-                    wandb.log({"val/loss": val_loss}, step=step)
+                    wandb.log({
+                        "val/loss":         val_loss,    # backwards-compat alias
+                        "val/loss_random":  val_random,
+                        "val/loss_seq":     val_seq,
+                    }, step=step)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
 

@@ -140,10 +140,12 @@ class PackedDataLoader:
 
     def __init__(self, bin_path: str, seq_len: int, batch_size: int,
                  rank: int = 0, world_size: int = 1, dtype=np.uint16,
-                 prefetch: bool = True):
+                 prefetch: bool = True,
+                 loader_id: int = 0, seed: int = 42):
         self.seq_len    = seq_len
         self.batch_size = batch_size
         self.prefetch   = prefetch
+        self.loader_id  = loader_id
 
         data = np.memmap(bin_path, dtype=dtype, mode="r")
         shard_size = len(data) // world_size
@@ -154,12 +156,24 @@ class PackedDataLoader:
         self.n_positions = max(1, len(self.data) - seq_len)
         self._prefetched: Optional[tuple] = None
 
+        # Per-loader RNG so train and val don't share state and the
+        # val draw is reproducible regardless of how many train steps
+        # preceded the eval call. Previously the global torch RNG was
+        # advanced ~4500 times by train before val was sampled, so the
+        # val draw was effectively random-but-not-reproducible.
+        self.gen = torch.Generator().manual_seed(
+            seed * 1_000_003 + rank * 31 + loader_id
+        )
+
         print(f"[DataLoader rank {rank}] {bin_path}: "
-              f"{len(self.data):,} tokens, shard [{start}:{end}]")
+              f"{len(self.data):,} tokens, shard [{start}:{end}]  "
+              f"loader_id={loader_id}")
 
     def _build_batch_cpu(self):
         """Build a (x, y) batch entirely on CPU as int64 tensors."""
-        ix = torch.randint(self.n_positions, (self.batch_size,))
+        ix = torch.randint(
+            self.n_positions, (self.batch_size,), generator=self.gen
+        )
         x = torch.stack([
             torch.from_numpy(self.data[i : i + self.seq_len].astype(np.int64))
             for i in ix
@@ -169,6 +183,54 @@ class PackedDataLoader:
             for i in ix
         ])
         return x, y
+
+    def iter_sequential(self, device: torch.device, max_batches: int):
+        """
+        Yield (x, y) on `device`, walking self.data in document order with
+        no overlap and no replacement.
+
+        Used by evaluate() to compute a second val-loss number that
+        reflects the model's loss on coherent held-out text rather than
+        on random mid-document windows. The cap on `max_batches` keeps
+        eval latency bounded even for a 5B-token val set.
+
+        Yields up to `max_batches` batches; stops earlier if the data
+        is exhausted.
+        """
+        # Total non-overlapping windows of length seq_len that fit in
+        # the data. Last window may be short — drop it so y is always
+        # of length seq_len.
+        n = len(self.data)
+        usable = (n // self.seq_len) * self.seq_len
+        for batch_start in range(0, usable, self.batch_size * self.seq_len):
+            if max_batches <= 0:
+                break
+            # Build a batch by stacking `batch_size` consecutive windows.
+            # This keeps the H2D pattern simple and avoids per-window
+            # pin_memory() calls.
+            offsets = [
+                batch_start + j * self.seq_len
+                for j in range(self.batch_size)
+                if batch_start + j * self.seq_len + self.seq_len < n
+            ]
+            if not offsets:
+                break
+            x = torch.stack([
+                torch.from_numpy(self.data[o : o + self.seq_len].astype(np.int64))
+                for o in offsets
+            ])
+            y = torch.stack([
+                torch.from_numpy(self.data[o + 1 : o + 1 + self.seq_len].astype(np.int64))
+                for o in offsets
+            ])
+            if device.type == "cuda":
+                x = x.pin_memory().to(device, non_blocking=True)
+                y = y.pin_memory().to(device, non_blocking=True)
+            else:
+                x = x.to(device)
+                y = y.to(device)
+            yield x, y
+            max_batches -= 1
 
     def prime(self, device: torch.device):
         """Prefetch the very first batch before the loop starts."""
@@ -318,18 +380,46 @@ def load_checkpoint(path: str, model: nn.Module,
 @torch.no_grad()
 def evaluate(model: nn.Module, val_loader: PackedDataLoader,
              eval_steps: int, device: torch.device, ctx,
-             use_cudagraphs: bool = False) -> float:
+             use_cudagraphs: bool = False) -> tuple[float, float]:
+    """
+    Returns (loss_random, loss_sequential).
+
+    - loss_random:    the historical metric. Samples `eval_steps` random
+                      batches via val_loader.next_batch. Comparable to
+                      train loss because both use random-window sampling.
+    - loss_sequential: walks the val file in document order with no
+                      overlap and no replacement. Approximates the loss
+                      a downstream consumer (lm-eval-harness, ppl of
+                      real text) would see, since real text is not
+                      random mid-document jumps.
+
+    Reporting both makes the train/val gap interpretable. If loss_sequential
+    is much higher than loss_random, the val file is a coherent easy slice
+    (current pack_dataset.py head-slice behavior). If they're close, the
+    val is well-distributed.
+    """
     model.eval()
-    losses = []
+    losses_random = []
     for _ in range(eval_steps):
         x, y = val_loader.next_batch(device)
         with ctx:
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
             out = model(x, labels=y)
-        losses.append(out["loss"].item())
+        losses_random.append(out["loss"].item())
+    loss_random = float(np.mean(losses_random))
+
+    losses_seq = []
+    for x, y in val_loader.iter_sequential(device, max_batches=eval_steps):
+        with ctx:
+            if use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            out = model(x, labels=y)
+        losses_seq.append(out["loss"].item())
+    loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
+
     model.train()
-    return float(np.mean(losses))
+    return loss_random, loss_seq
 
 
 # ---------------------------------------------------------------------------
@@ -479,15 +569,19 @@ def train(args):
         model = DDP(model, device_ids=[local_rank])
 
     # ------------------------------------------------------------------ data
+    # loader_id 0 = train, 1 = val. Combined with rank and args.seed
+    # this gives each loader a fully independent random stream.
     train_loader = PackedDataLoader(
         os.path.join(args.data_dir, "train.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=rank, world_size=world_size, dtype=dtype_np,
+        loader_id=0, seed=args.seed,
     )
     val_loader = PackedDataLoader(
         os.path.join(args.data_dir, "val.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=rank, world_size=world_size, dtype=dtype_np,
+        loader_id=1, seed=args.seed,
     )
     train_loader.prime(device)   # fill prefetch buffer
     val_loader.prime(device)
@@ -622,17 +716,34 @@ def train(args):
 
         # ---- validation
         if step % args.eval_interval == 0 and step > start_step:
-            val_loss = evaluate(model, val_loader, args.eval_steps, device, ctx,
-                                use_cudagraphs=_use_cudagraphs)
+            val_random, val_seq = evaluate(model, val_loader, args.eval_steps,
+                                           device, ctx,
+                                           use_cudagraphs=_use_cudagraphs)
+            # Use the sequential metric as the "true" held-out loss for
+            # best-checkpoint tracking; it isn't biased by the easy-slice
+            # artifact of pack_dataset.py's head-slice val allocation.
+            val_loss = val_seq
             if world_size > 1:
-                vl = torch.tensor(val_loss, device=device)
-                dist.all_reduce(vl, op=dist.ReduceOp.AVG)
-                val_loss = vl.item()
+                # Reduce both numbers across ranks so the W&B dashboard
+                # shows a single coherent value rather than per-rank
+                # samples.
+                vr = torch.tensor(val_random, device=device)
+                vs = torch.tensor(val_seq,    device=device)
+                dist.all_reduce(vr, op=dist.ReduceOp.AVG)
+                dist.all_reduce(vs, op=dist.ReduceOp.AVG)
+                val_random = vr.item()
+                val_seq    = vs.item()
+                val_loss   = val_seq
 
             if master:
-                print(f"  [eval] step {step:7d} | val_loss {val_loss:.4f}")
+                print(f"  [eval] step {step:7d} | val_random {val_random:.4f} | "
+                      f"val_seq {val_seq:.4f}")
                 if use_wandb:
-                    log_wandb({"val/loss": val_loss}, step=step)
+                    log_wandb({
+                        "val/loss":         val_loss,    # backwards-compat alias
+                        "val/loss_random":  val_random,
+                        "val/loss_seq":     val_seq,
+                    }, step=step)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
 
@@ -761,8 +872,8 @@ def smoke_test():
     ctx = (torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
            if device.type == "cuda" else nullcontext())
 
-    loader     = PackedDataLoader(os.path.join(packed, "train.bin"), 64, 2, dtype=np.uint16)
-    val_loader = PackedDataLoader(os.path.join(packed, "val.bin"),   64, 2, dtype=np.uint16)
+    loader     = PackedDataLoader(os.path.join(packed, "train.bin"), 64, 2, dtype=np.uint16, loader_id=0)
+    val_loader = PackedDataLoader(os.path.join(packed, "val.bin"),   64, 2, dtype=np.uint16, loader_id=1)
     loader.prime(device)
     val_loader.prime(device)
 
@@ -785,9 +896,12 @@ def smoke_test():
         print(f"  step {step} | loss {out['loss'].item():.4f} | "
               f"lr {lr:.2e} | mfu {mfu*100:.2f}%")
 
-    val_loss = evaluate(model, val_loader, 3, device, ctx)
-    print(f"  val_loss: {val_loss:.4f}")
+    val_random, val_seq = evaluate(model, val_loader, 3, device, ctx)
+    print(f"  val_random: {val_random:.4f} | val_seq: {val_seq:.4f}")
 
+    # Use the sequential metric for the save sidecar (matches the
+    # convention the main train() loop uses for best-checkpoint tracking).
+    val_loss = val_seq
     save_checkpoint(ckpt_dir, 5, model, optimizer, config, {}, val_loss)
 
     model2     = Qwen3ForCausalLM(config).to(device)
