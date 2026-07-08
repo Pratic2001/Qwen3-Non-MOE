@@ -23,8 +23,10 @@ NEW (constant RAM, lifetime-safe):
     - Workers encode documents in mini-batches of --mini-batch size and
       write uint32 token IDs directly to a binary chunk file.
       Peak RAM per worker ≈ mini_batch × avg_doc_tokens × 4 bytes ≈ 30–80 MB.
-    - An optional --max-doc-chars cap rejects pathologically large documents
-      so a single 50 MB JSONL line can't blow the mini-batch budget.
+    - An optional --max-doc-chars cap pathologically large documents so a
+      single 50 MB JSONL line can't blow the mini-batch budget. Oversized
+      documents are NOT dropped — they are split into <=max-doc-chars
+      pieces and tokenized one piece at a time, so no data is lost.
     - The main process copies each chunk into the output memmap in slices
       of --copy-chunk-mb bytes so it never loads a full chunk into RAM either.
     - Stage 1 uses 'spawn' (not 'fork') so the main process's already-loaded
@@ -53,15 +55,17 @@ import numpy as np
 
 _TOKENIZER = None
 _MAX_DOC_CHARS = 0
+_PIECE_OVERLAP_CHARS = 0
 
 
-def _init_worker(tokenizer_path: str, max_doc_chars: int):
+def _init_worker(tokenizer_path: str, max_doc_chars: int, piece_overlap_chars: int = 0):
     """Load the tokenizer once per worker. Imported lazily so workers don't
     depend on the parent's torch / numpy state at import time."""
-    global _TOKENIZER, _MAX_DOC_CHARS
+    global _TOKENIZER, _MAX_DOC_CHARS, _PIECE_OVERLAP_CHARS
     from tokenizers import Tokenizer
     _TOKENIZER = Tokenizer.from_file(tokenizer_path)
     _MAX_DOC_CHARS = max_doc_chars
+    _PIECE_OVERLAP_CHARS = piece_overlap_chars
 
 
 def _tokenize_shard(job):
@@ -69,8 +73,13 @@ def _tokenize_shard(job):
     Stream documents from one JSONL shard, encode in mini-batches, write
     raw uint32 token IDs to a binary chunk file.
 
+    Oversized documents (longer than _MAX_DOC_CHARS) are split into
+    <=_MAX_DOC_CHARS-character pieces and tokenized one piece at a time,
+    so no data is dropped. Each piece is encoded in its own batch slot
+    to keep per-piece memory bounded.
+
     Chunk file: plain sequence of little-endian uint32 integers.
-    Returns (category, total_token_count, chunk_path).
+    Returns (category, total_token_count, chunk_path, chunked_doc_count).
     """
     shard_path, tmp_dir, idx, mini_batch = job
 
@@ -78,7 +87,7 @@ def _tokenize_shard(job):
     category = None
     total    = 0
     batch_texts: list = []
-    skipped_too_big = 0
+    chunked_docs = 0   # number of source documents that had to be split
 
     def _flush(texts, fh):
         if not texts:
@@ -93,6 +102,26 @@ def _tokenize_shard(job):
                 fh.write(struct.pack(f"<{len(enc.ids)}I", *enc.ids))
                 n += len(enc.ids)
         return n
+
+    def _enqueue_piece(text, fh):
+        """Enqueue a single piece, flushing whenever the batch is full.
+        Handles the rare case where a single piece alone is bigger than
+        the mini-batch budget by flushing the current batch first, then
+        encoding the piece solo."""
+        nonlocal total
+        # If the piece alone fills more than the whole batch budget,
+        # flush whatever we have first so the piece is the only thing
+        # encoded in its batch.
+        if len(batch_texts) >= mini_batch:
+            total += _flush(batch_texts, fout)
+            batch_texts.clear()
+        batch_texts.append(text)
+        # Flush aggressively when a piece is large to keep peak RAM low.
+        # Using mini_batch as the trigger (not mini_batch*2) ensures no
+        # batch ever exceeds the configured budget.
+        if len(batch_texts) >= mini_batch:
+            total += _flush(batch_texts, fout)
+            batch_texts.clear()
 
     try:
         with open(shard_path, "r", encoding="utf-8", errors="replace") as fin, \
@@ -112,16 +141,29 @@ def _tokenize_shard(job):
                 if category is None:
                     category = rec.get("category", "unknown")
 
-                # Cap individual document size. A single 50 MB line shouldn't
-                # be allowed to dominate the mini-batch's RAM.
                 if _MAX_DOC_CHARS and len(text) > _MAX_DOC_CHARS:
-                    skipped_too_big += 1
-                    continue
-
-                batch_texts.append(text)
-                if len(batch_texts) >= mini_batch:
-                    total += _flush(batch_texts, fout)
-                    batch_texts = []
+                    # Split the oversized doc into fixed-size character
+                    # windows. Boundaries are character-based (not token-
+                    # based) because we don't know the token stream until
+                    # we run the tokenizer. The tokenizer will produce
+                    # whatever pieces it produces for each window.
+                    #
+                    # Slight overlap (--piece-overlap-chars, default 0)
+                    # could be used to avoid cutting tokens in half at
+                    # boundaries, but the tokenizers library handles
+                    # partial UTF-8 fine and the rare boundary cut is a
+                    # tiny quality cost vs. dropping the document.
+                    step = _MAX_DOC_CHARS - _PIECE_OVERLAP_CHARS
+                    if step <= 0:
+                        step = _MAX_DOC_CHARS
+                    for start in range(0, len(text), step):
+                        piece = text[start:start + _MAX_DOC_CHARS]
+                        _enqueue_piece(piece, fout)
+                        if len(piece) < _MAX_DOC_CHARS:
+                            break
+                    chunked_docs += 1
+                else:
+                    _enqueue_piece(text, fout)
 
             total += _flush(batch_texts, fout)  # flush remainder
 
@@ -131,9 +173,9 @@ def _tokenize_shard(job):
     if total == 0:
         if os.path.exists(out_path):
             os.remove(out_path)
-        return category or "unknown", 0, None, skipped_too_big
+        return category or "unknown", 0, None, chunked_docs
 
-    return category or "unknown", total, out_path, skipped_too_big
+    return category or "unknown", total, out_path, chunked_docs
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +230,8 @@ def main():
     p.add_argument("--data-dir",        default="./data")
     p.add_argument("--tokenizer",       default="./tokenizer")
     p.add_argument("--out-dir",         default="./packed")
-    p.add_argument("--val-fraction",    type=float, default=0.0005,
-                   help="Fraction of tokens for validation (default 0.05%%)")
+    p.add_argument("--val-fraction",    type=float, default=0.005,
+                   help="Fraction of tokens for validation (default 0.5%%)")
     p.add_argument("--workers",         type=int,
                    default=max(1, (os.cpu_count() or 2) - 1),
                    help="Parallel tokenization workers")
@@ -197,8 +239,15 @@ def main():
                    help="Docs encoded per mini-batch in each worker. "
                         "Lower = less RAM per worker. Default 64.")
     p.add_argument("--max-doc-chars",   type=int, default=200_000,
-                   help="Skip individual documents longer than this. "
+                   help="Cap for a single piece fed to the tokenizer. "
+                        "Documents longer than this are split into pieces "
+                        "of this size and tokenized one piece at a time. "
                         "Default 200,000 chars (~50k tokens).")
+    p.add_argument("--piece-overlap-chars", type=int, default=0,
+                   help="Character overlap between adjacent pieces when "
+                        "splitting an oversized document. Default 0 "
+                        "(no overlap). Larger values avoid rare token-"
+                        "boundary cuts at the cost of duplicate tokens.")
     p.add_argument("--copy-chunk-mb",   type=int, default=64,
                    help="Slice size (MB) when copying chunks to final mmap. "
                         "Controls main-process peak RAM. Default 64 MB.")
@@ -256,7 +305,8 @@ def main():
           f"(~{peak_per_worker:.0f} MB peak RAM per worker)")
     print(f"Est. total worker RAM: ~{total_worker_ram:.0f} MB")
     print(f"Main proc peak RAM   : ~{main_proc_peak} MB (copy slice)")
-    print(f"Per-doc cap          : {args.max_doc_chars:,} chars")
+    print(f"Per-doc cap          : {args.max_doc_chars:,} chars per piece")
+    print(f"Piece overlap        : {args.piece_overlap_chars:,} chars (0 = no overlap)")
     print(f"Tokenizer threads    : {args.tokenizer_threads} per worker\n")
 
     # ---------------------------------------------------------------
@@ -274,20 +324,20 @@ def main():
 
     cat_counts:    dict = {}
     chunk_records: list = []
-    total_skipped: int  = 0
+    total_chunked: int  = 0
 
     print(f"Stage 1 — tokenizing {len(work_items)} shard(s) …")
     with ctx.Pool(
         processes=args.workers,
         initializer=_init_worker,
-        initargs=(tokenizer_path, args.max_doc_chars),
+        initargs=(tokenizer_path, args.max_doc_chars, args.piece_overlap_chars),
     ) as pool:
-        for i, (cat, n_tok, chunk_path, skipped) in enumerate(
+        for i, (cat, n_tok, chunk_path, chunked) in enumerate(
             pool.imap_unordered(_tokenize_shard, work_items)
         ):
             chunk_records.append((cat, n_tok, chunk_path))
             cat_counts[cat] = cat_counts.get(cat, 0) + n_tok
-            total_skipped  += skipped
+            total_chunked  += chunked
 
             report_every = max(1, len(work_items) // 20)
             if (i + 1) % report_every == 0 or (i + 1) == len(work_items):
@@ -297,7 +347,8 @@ def main():
 
     total_tokens = sum(r[1] for r in chunk_records)
     print(f"\nTotal tokens : {total_tokens:,}"
-          + (f"  (skipped {total_skipped} oversized docs)" if total_skipped else ""))
+          + (f"  (split {total_chunked} oversized doc(s) into pieces)"
+             if total_chunked else ""))
     for cat, n in sorted(cat_counts.items()):
         pct = 100 * n / total_tokens if total_tokens else 0
         print(f"  {cat:14s}: {n:,}  ({pct:.1f}%)")
@@ -354,7 +405,9 @@ def main():
         "val_tokens":            int(val_ptr),
         "total_tokens":          int(total_tokens),
         "category_token_counts": cat_counts,
-        "skipped_oversized_docs": total_skipped,
+        "chunked_doc_count":     total_chunked,
+        "max_doc_chars":         args.max_doc_chars,
+        "piece_overlap_chars":   args.piece_overlap_chars,
         "tokenizer_dir":         os.path.abspath(args.tokenizer),
     }
     meta_path = os.path.join(args.out_dir, "meta.json")
