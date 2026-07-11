@@ -953,20 +953,44 @@ def train(args):
             verbose=master,
         )
 
-    # Whether to use PyTorch's bf16 (cast model + autocast) instead of
-    # DeepSpeed's broken bf16 path. See the long comment in
-    # build_ds_config for why we have to do this.
+    # Whether to run the forward pass under torch.autocast(bf16) instead
+    # of DeepSpeed's native bf16 path (which produced a degenerate model
+    # at init — see the long comment in build_ds_config). Model parameters
+    # stay in fp32; only compute inside autocast runs in bf16. See the
+    # comment below for why the params must NOT be cast to bf16.
     use_pytorch_bf16 = (args.dtype == "bf16")
 
     model    = Qwen3ForCausalLM(config)
     n_params = count_parameters(model)
 
-    # Cast the model to bf16 BEFORE DeepSpeed init when using PyTorch's
-    # bf16 path. This keeps weights/activations in bf16 for ~2x VRAM
-    # savings, while letting DeepSpeed's standard fp32 optimizer handle
-    # the parameter updates correctly.
-    if use_pytorch_bf16:
-        model = model.to(torch.bfloat16)
+    # IMPORTANT: do NOT cast the model to bf16 here, even though we drive
+    # the forward pass through torch.autocast(bf16) (see torch_autocast in
+    # build_ds_config). Autograd allocates each parameter's .grad in that
+    # parameter's own dtype — casting the model to bf16 means gradients
+    # are created, reduced across the grad_accum_steps micro-batches, and
+    # stored in bf16 for the entire pipeline, with no fp32 master copy
+    # anywhere (DeepSpeed's native bf16 path normally provides that fp32
+    # grad-accumulation buffer via BF16_Optimizer, but that path is
+    # disabled below because of the degenerate-init bug).
+    #
+    # bf16 has ~8 bits of mantissa. Early in training gradients are large
+    # enough that this doesn't matter, but as the loss lands and true
+    # gradient magnitudes shrink, the bf16-accumulated sum over 62
+    # micro-batches starts rounding to exactly 0.0 — first for a few
+    # params, then pervasively. That's the "grad norm goes to exactly 0
+    # after ~1000 steps, loss plateaus" failure mode: Adam sees a zero
+    # gradient and stops updating the weights entirely.
+    #
+    # Keeping params in fp32 and relying on torch_autocast for the bf16
+    # compute gives the same forward/backward speed benefit while keeping
+    # gradients and the Adam optimizer states in full fp32 precision.
+    # (If you need the VRAM savings badly enough to reconsider, the
+    # supported alternative is DeepSpeed's native bf16 mode with
+    # "data_types": {"grad_accum_dtype": "fp32"} explicitly set — that
+    # forces fp32 grad accumulation even inside BF16_Optimizer, and may
+    # also fix the original degenerate-init issue since it looks like the
+    # same underlying cause. It wasn't re-tested here, so verify before
+    # relying on it.)
 
     if master:
         print_audit(hw, n_params)
