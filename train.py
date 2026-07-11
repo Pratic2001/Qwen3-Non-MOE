@@ -199,6 +199,20 @@ class PackedDataLoader:
         outer = self
 
         class _ShardDataset(Dataset):
+            def __init__(self):
+                # Created lazily, once per worker process (see __getitem__).
+                # persistent_workers=True keeps this same Dataset instance
+                # alive for the whole run, so self._gen's state naturally
+                # advances across calls. Do NOT re-seed a fresh Generator
+                # inside __getitem__: torch.Generator().manual_seed(seed)
+                # with a seed that only depends on constants (outer.gen's
+                # initial seed + worker id) produces the IDENTICAL sample
+                # on every call, so each worker would replay the same one
+                # fixed batch forever instead of streaming fresh random
+                # windows — the model then just memorizes `num_workers`
+                # batches instead of training on the real corpus.
+                self._gen = None
+
             def __len__(self):
                 # Effectively infinite; the DataLoader is just a worker
                 # pool that yields (x, y) tuples on demand.
@@ -208,9 +222,14 @@ class PackedDataLoader:
                 # Each worker has its own worker_id; derive a stable
                 # per-worker seed from the outer gen so the overall
                 # stream is still a function of (rank, loader_id, seed).
-                wid = torch.utils.data.get_worker_info()
-                seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
-                g = torch.Generator().manual_seed(seed)
+                # The generator itself is created once and then persists
+                # (its state advances with every draw), so successive
+                # calls return fresh random windows, not the same one.
+                if self._gen is None:
+                    wid = torch.utils.data.get_worker_info()
+                    seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
+                    self._gen = torch.Generator().manual_seed(seed)
+                g = self._gen
                 ix = torch.randint(outer.n_positions, (outer.batch_size,), generator=g)
                 x = torch.stack([
                     torch.from_numpy(outer.data[i : i + outer.seq_len].astype(np.int64))

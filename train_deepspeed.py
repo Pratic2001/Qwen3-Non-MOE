@@ -691,13 +691,30 @@ class PackedDataLoader:
         outer = self
 
         class _ShardDataset(Dataset):
+            def __init__(self):
+                # Created lazily, once per worker process (see __getitem__).
+                # persistent_workers=True keeps this same Dataset instance
+                # alive for the whole run, so self._gen's state naturally
+                # advances across calls — exactly like the single-process
+                # `_build()` path uses `outer.gen`. Do NOT re-seed a fresh
+                # Generator inside __getitem__: torch.Generator().manual_seed(seed)
+                # with a seed that only depends on constants (outer.gen's
+                # initial seed + worker id) produces the IDENTICAL sample
+                # on every call, so each worker would replay the same one
+                # fixed batch forever instead of streaming fresh random
+                # windows — the model then just memorizes `num_workers`
+                # batches instead of training on the real corpus.
+                self._gen = None
+
             def __len__(self):
                 return 1 << 30
 
             def __getitem__(self, _idx):
-                wid = torch.utils.data.get_worker_info()
-                seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
-                g = torch.Generator().manual_seed(seed)
+                if self._gen is None:
+                    wid = torch.utils.data.get_worker_info()
+                    seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
+                    self._gen = torch.Generator().manual_seed(seed)
+                g = self._gen
                 ix = torch.randint(outer.n_pos, (outer.batch_size,), generator=g)
                 x = torch.stack([
                     torch.from_numpy(outer.data[i : i + outer.seq_len].astype(np.int64))
