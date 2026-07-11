@@ -51,7 +51,6 @@ import platform
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -506,11 +505,21 @@ def build_ds_config(
     # Workaround: keep the model parameters in bf16 (so we still get the
     # ~2x activation VRAM savings) but disable DeepSpeed's bf16 path.
     # The model is cast to bf16 below, and the forward is wrapped in
-    # torch.autocast(bf16). DeepSpeed then sees fp32 params and uses
+    # torch.autocast(bf16) — by DeepSpeed itself, via the `torch_autocast`
+    # config section. This silences the "torch.autocast is enabled outside
+    # DeepSpeed" warning and makes the autocast handling consistent on both
+    # sides of the engine boundary. DeepSpeed then sees fp32 params and uses
     # its standard fp32 optimizer — which works correctly.
     bf16_cfg = {"enabled": False}
     fp16_cfg = {"enabled": False}
     use_pytorch_bf16 = (args.dtype == "bf16")
+    # Native torch.autocast(bf16) — drives forward matmuls in bf16.
+    # Only effective when `bf16/fp16` is disabled (we are), so there is
+    # no double-cast of the model parameters (params are already bf16
+    # because we cast them manually below).
+    torch_autocast_cfg = (
+        {"enabled": True, "dtype": "bfloat16"} if use_pytorch_bf16 else {"enabled": False}
+    )
 
     # ---- gradient clipping
     grad_clip = args.grad_clip
@@ -590,6 +599,7 @@ def build_ds_config(
         "scheduler":                      scheduler_cfg,
         "bf16":                           bf16_cfg,
         "fp16":                           fp16_cfg,
+        "torch_autocast":                 torch_autocast_cfg,
         "zero_optimization":              zero_cfg,
     }
     if act_ckpt:
@@ -608,6 +618,8 @@ def print_ds_config_summary(cfg: dict, zero_stage: int,
     print(f"  CPU offload optimizer : {cpu_opt}")
     print(f"  CPU offload params    : {cpu_param}")
     print(f"  BF16                  : {cfg['bf16']['enabled']}")
+    print(f"  torch.autocast       : {cfg['torch_autocast'].get('enabled')} "
+          f"({cfg['torch_autocast'].get('dtype')})")
     print(f"  Grad accum steps      : {cfg['gradient_accumulation_steps']}")
     print(f"  Micro batch / GPU     : {cfg['train_micro_batch_size_per_gpu']}")
     print(f"  Grad clip             : {cfg['gradient_clipping']}")
@@ -857,20 +869,23 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
     `use_cudagraphs` must match the value used during training; it
     controls whether cudagraph_mark_step_begin() is called before each
     forward (required when running with --compile-mode reduce-overhead).
+
+    `use_pytorch_bf16` is kept for backward-compat with older call sites
+    but is now a no-op: autocast is driven by DeepSpeed's `torch_autocast`
+    config block, not by a manual context here.
     """
     engine.eval()
-    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if use_pytorch_bf16
-                    else nullcontext())
+    # Native torch.autocast(bf16) is driven by DeepSpeed's engine via the
+    # `torch_autocast` config block. The engine wraps engine(...) in
+    # torch.autocast(bf16) automatically, so no manual context here.
 
     losses_random = []
     with torch.no_grad():
         for _ in range(eval_steps):
             x, y = val_loader.next_batch(device)
-            with autocast_ctx:
-                if use_cudagraphs:
-                    torch.compiler.cudagraph_mark_step_begin()
-                out  = engine(x, labels=y)
+            if use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            out  = engine(x, labels=y)
             loss = out["loss"]
             losses_random.append(loss.item())
     loss_random = float(np.mean(losses_random))
@@ -878,10 +893,9 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
     losses_seq = []
     with torch.no_grad():
         for x, y in val_loader.iter_sequential(device, max_batches=eval_steps):
-            with autocast_ctx:
-                if use_cudagraphs:
-                    torch.compiler.cudagraph_mark_step_begin()
-                out = engine(x, labels=y)
+            if use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            out = engine(x, labels=y)
             losses_seq.append(out["loss"].item())
     loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
 
@@ -1096,12 +1110,11 @@ def train(args):
     # reduces per-step sync count from grad_accum_steps+1 to 1.
     loss_accum = torch.zeros((), device=device)
 
-    # When using PyTorch's bf16 path (DS bf16 disabled), wrap the forward
-    # in autocast so the bf16-cast model's matmuls run in bf16. The
-    # cross-entropy and softmax are dtype-stable so they stay in fp32.
-    autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if use_pytorch_bf16
-                    else nullcontext())
+    # Native torch.autocast(bf16) is now driven by DeepSpeed's engine via
+    # the `torch_autocast` config block (see build_ds_config). The engine
+    # wraps engine(...) in torch.autocast(bf16) automatically, so we no
+    # longer need a manual context here. Cross-entropy / softmax are
+    # dtype-stable and remain in fp32.
 
     for step in range(start_step, args.max_steps):
 
@@ -1123,13 +1136,14 @@ def train(args):
         # once per `step` of the outer `for step in range(...)`.
         for micro_step in range(args.grad_accum_steps):
             x, y = train_loader.next_batch(device)
-            with autocast_ctx:
-                # CUDAGraphs (reduce-overhead mode) requires this marker
-                # before every forward pass so it knows a new "step" has
-                # begun and won't confuse output buffers across calls.
-                if _use_cudagraphs:
-                    torch.compiler.cudagraph_mark_step_begin()
-                out  = engine(x, labels=y)
+            # CUDAGraphs (reduce-overhead mode) requires this marker
+            # before every forward pass so it knows a new "step" has
+            # begun and won't confuse output buffers across calls.
+            if _use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            # Forward: DeepSpeed's `torch_autocast` config wraps engine(...)
+            # in torch.autocast(bf16) for us — no manual context needed.
+            out  = engine(x, labels=y)
             # Divide by grad_accum_steps so the sum over the inner
             # loop is the true mean loss over one effective batch
             # (= one optimizer step), exactly like train.py.
