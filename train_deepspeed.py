@@ -482,16 +482,19 @@ def build_ds_config(
         },
     }
 
-    # ---- LR scheduler (DeepSpeed handles it so the engine knows the LR)
-    scheduler_cfg = {
-        "type": "WarmupCosineLR",
-        "params": {
-            "warmup_num_steps":  args.warmup_steps,
-            "total_num_steps":   args.max_steps,
-            "warmup_type":       "linear",
-            "last_batch_iteration": -1,
-        },
-    }
+    # NOTE: we intentionally do NOT put a "scheduler" block in the DS
+    # config. The training loop drives its own manual warmup+cosine
+    # schedule via engine.optimizer.param_groups overrides (see
+    # `_cosine_lr` and the "LR override" section in train()). A DS
+    # "scheduler" block would construct DeepSpeed's own WarmupCosineLR
+    # and call its .step() inside engine.step() (after optimizer.step()
+    # in current DeepSpeed versions, so it doesn't corrupt the applied
+    # LR today) but it's live, checkpointed state (restored on --resume)
+    # that directly fights the manual schedule and could silently start
+    # winning on a future DeepSpeed version that reorders
+    # _take_model_step(). Leaving it out removes the landmine entirely;
+    # self.lr_scheduler is simply None and only the manual override ever
+    # touches param_groups["lr"].
 
     # ---- bf16 / fp16
     # IMPORTANT: DeepSpeed's "bf16: {enabled: True}" mode (BF16_Optimizer
@@ -596,7 +599,6 @@ def build_ds_config(
         "steps_per_print":                args.log_interval,
         "wall_clock_breakdown":           False,
         "optimizer":                      optimizer_cfg,
-        "scheduler":                      scheduler_cfg,
         "bf16":                           bf16_cfg,
         "fp16":                           fp16_cfg,
         "torch_autocast":                 torch_autocast_cfg,

@@ -120,18 +120,11 @@ def build_ds_config(
         },
     }
 
-    # ---- LR scheduler (informational; we override LR each step manually
-    #      to match train_grpo.py's cosine schedule, so DeepSpeed's
-    #      scheduler is just a placeholder that won't move the LR).
-    scheduler_cfg = {
-        "type": "WarmupCosineLR",
-        "params": {
-            "warmup_num_steps":  args.warmup_steps,
-            "total_num_steps":   args.max_steps,
-            "warmup_type":       "linear",
-            "last_batch_iteration": -1,
-        },
-    }
+    # ---- LR: no DS "scheduler" block. We override LR each step manually
+    # to match train_grpo.py's cosine schedule. A DS scheduler block is
+    # not just "informational" — it's live, checkpointed state that DS
+    # calls internally on every engine.step(); leaving it out avoids that
+    # entirely rather than relying on it staying harmless.
 
     # ---- bf16 / fp16
     bf16_cfg = {"enabled": args.dtype == "bf16"}
@@ -183,7 +176,6 @@ def build_ds_config(
         "steps_per_print":                args.log_interval,
         "wall_clock_breakdown":           False,
         "optimizer":                      optimizer_cfg,
-        "scheduler":                      scheduler_cfg,
         "bf16":                           bf16_cfg,
         "fp16":                           fp16_cfg,
         "zero_optimization":              zero_cfg,

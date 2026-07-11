@@ -439,16 +439,11 @@ def build_ds_config(
 
     # We do not use DS's built-in scheduler — train_sft.py drives a
     # manual warmup+cosine schedule via engine.optimizer.param_groups
-    # overrides, same as train_deepspeed.py does for pretraining.
-    scheduler_cfg = {
-        "type": "WarmupCosineLR",
-        "params": {
-            "warmup_num_steps":      args.warmup_steps,
-            "total_num_steps":       args.max_steps,
-            "warmup_type":           "linear",
-            "last_batch_iteration": -1,
-        },
-    }
+    # overrides, same as train_deepspeed.py does for pretraining. We
+    # previously also declared a "scheduler" block below (unused, but
+    # still live/checkpointed DS state that fought the manual override)
+    # — removed entirely so self.lr_scheduler is None and nothing but
+    # the manual override ever writes param_groups["lr"].
 
     bf16_cfg = {"enabled": args.dtype == "bf16"}
     fp16_cfg = {"enabled": False}
@@ -497,12 +492,35 @@ def build_ds_config(
 
     cfg = {
         "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps":    args.grad_accum_steps,
+        # IMPORTANT: this is 1, NOT args.grad_accum_steps, even though we
+        # accumulate over args.grad_accum_steps micro-batches per outer
+        # training-loop iteration. Two problems arise if this is set to
+        # args.grad_accum_steps instead:
+        #   1. DeepSpeed's engine.backward() automatically divides the
+        #      loss by its configured gradient_accumulation_steps. The
+        #      training loop below ALSO divides the loss by
+        #      args.grad_accum_steps before calling backward(). With
+        #      gas == args.grad_accum_steps, that's a double division —
+        #      gradients end up scaled down by grad_accum_steps^2, not
+        #      grad_accum_steps, making effective LR far smaller than
+        #      intended.
+        #   2. DeepSpeed's internal micro-step counter advances once per
+        #      engine.step() call, not once per backward() call. The
+        #      loop below calls engine.step() only once per outer
+        #      iteration (after grad_accum_steps backward() calls), so
+        #      with gas == grad_accum_steps the accumulation-boundary
+        #      condition only trips once every grad_accum_steps outer
+        #      iterations — the optimizer silently updates far less
+        #      often than the loop (logging, LR schedule, checkpointing)
+        #      assumes.
+        # Setting gas=1 disables DeepSpeed's internal accumulation
+        # counting entirely; the manual loop below is solely responsible
+        # for the accumulation cadence, exactly as in train_deepspeed.py.
+        "gradient_accumulation_steps":    1,
         "gradient_clipping":              args.grad_clip,
         "steps_per_print":                args.log_interval,
         "wall_clock_breakdown":           False,
         "optimizer":                      optimizer_cfg,
-        "scheduler":                      scheduler_cfg,
         "bf16":                           bf16_cfg,
         "fp16":                           fp16_cfg,
         "zero_optimization":              zero_cfg,
