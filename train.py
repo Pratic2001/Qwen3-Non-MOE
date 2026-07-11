@@ -141,10 +141,12 @@ class PackedDataLoader:
     def __init__(self, bin_path: str, seq_len: int, batch_size: int,
                  rank: int = 0, world_size: int = 1, dtype=np.uint16,
                  prefetch: bool = True,
+                 num_workers: int = 0,
                  loader_id: int = 0, seed: int = 42):
         self.seq_len    = seq_len
         self.batch_size = batch_size
         self.prefetch   = prefetch
+        self.num_workers = num_workers
         self.loader_id  = loader_id
 
         data = np.memmap(bin_path, dtype=dtype, mode="r")
@@ -182,6 +184,64 @@ class PackedDataLoader:
             torch.from_numpy(self.data[i + 1 : i + 1 + self.seq_len].astype(np.int64))
             for i in ix
         ])
+        return x, y
+
+    def _start_workers(self):
+        """
+        Spin up a torch.utils.data.DataLoader on a small in-process
+        dataset, used only when num_workers > 0. Each worker process
+        gets its own copy of the (already-mapped) shard via shared
+        memory and its own torch.Generator seeded from this loader's
+        gen so the train stream stays reproducible.
+        """
+        from torch.utils.data import DataLoader, Dataset
+
+        outer = self
+
+        class _ShardDataset(Dataset):
+            def __len__(self):
+                # Effectively infinite; the DataLoader is just a worker
+                # pool that yields (x, y) tuples on demand.
+                return 1 << 30
+
+            def __getitem__(self, _idx):
+                # Each worker has its own worker_id; derive a stable
+                # per-worker seed from the outer gen so the overall
+                # stream is still a function of (rank, loader_id, seed).
+                wid = torch.utils.data.get_worker_info()
+                seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
+                g = torch.Generator().manual_seed(seed)
+                ix = torch.randint(outer.n_positions, (outer.batch_size,), generator=g)
+                x = torch.stack([
+                    torch.from_numpy(outer.data[i : i + outer.seq_len].astype(np.int64))
+                    for i in ix
+                ])
+                y = torch.stack([
+                    torch.from_numpy(outer.data[i + 1 : i + 1 + outer.seq_len].astype(np.int64))
+                    for i in ix
+                ])
+                return x, y
+
+        self._worker_loader = DataLoader(
+            _ShardDataset(),
+            batch_size=None,           # _ShardDataset already yields full batches
+            num_workers=self.num_workers,
+            prefetch_factor=2,
+            persistent_workers=True,
+            pin_memory=False,          # we pin in next_batch
+        )
+        self._worker_iter = iter(self._worker_loader)
+
+    def _next_batch_workers(self, device: torch.device):
+        if not hasattr(self, "_worker_iter"):
+            self._start_workers()
+        x_cpu, y_cpu = next(self._worker_iter)
+        if device.type == "cuda":
+            x = x_cpu.pin_memory().to(device, non_blocking=True)
+            y = y_cpu.pin_memory().to(device, non_blocking=True)
+        else:
+            x = x_cpu.to(device)
+            y = y_cpu.to(device)
         return x, y
 
     def iter_sequential(self, device: torch.device, max_batches: int):
@@ -240,9 +300,12 @@ class PackedDataLoader:
     def next_batch(self, device: torch.device):
         """
         Return (x, y) on `device`.
-        If prefetch is on, the CPU batch for the *next* call is prepared
-        while the caller is doing GPU work with the current one.
+        If num_workers > 0, dispatch to a multi-process DataLoader
+        pool; otherwise use the in-process prefetch path.
         """
+        if self.num_workers > 0:
+            return self._next_batch_workers(device)
+
         if self.prefetch and self._prefetched is not None:
             x_cpu, y_cpu = self._prefetched
             # Kick off the prefetch for the next call *before* H2D transfer
@@ -571,16 +634,21 @@ def train(args):
     # ------------------------------------------------------------------ data
     # loader_id 0 = train, 1 = val. Combined with rank and args.seed
     # this gives each loader a fully independent random stream.
+    # num_workers=0 keeps the original in-process prefetch path (safe,
+    # reproducible). num_workers>0 spawns a DataLoader worker pool for
+    # higher throughput on machines with many CPU cores.
     train_loader = PackedDataLoader(
         os.path.join(args.data_dir, "train.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=rank, world_size=world_size, dtype=dtype_np,
+        num_workers=args.num_workers,
         loader_id=0, seed=args.seed,
     )
     val_loader = PackedDataLoader(
         os.path.join(args.data_dir, "val.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=rank, world_size=world_size, dtype=dtype_np,
+        num_workers=0,   # val is single-pass; no benefit from workers
         loader_id=1, seed=args.seed,
     )
     train_loader.prime(device)   # fill prefetch buffer
@@ -636,8 +704,12 @@ def train(args):
     optimizer.zero_grad(set_to_none=True)
 
     t0              = time.perf_counter()
-    loss_accum      = 0.0
-    grad_norm_accum = 0.0
+    # GPU-side accumulators. Keeping these as 0-dim tensors on the same
+    # device as the model means we never trigger a GPU->CPU sync inside
+    # the micro-step loop. The .item() call is deferred to log time,
+    # which reduces per-step sync count from grad_accum_steps+1 to 1.
+    loss_accum      = torch.zeros((), device=device)
+    grad_norm_accum = torch.zeros((), device=device)
 
     for step in range(start_step, args.max_steps):
 
@@ -664,11 +736,13 @@ def train(args):
                 loss = out["loss"] / args.grad_accum_steps
                 loss.backward()
 
-            loss_accum += loss.item()
+            # Stay on GPU — no .item() here. The single .item() per
+            # log interval below is the only allowed sync.
+            loss_accum = loss_accum + loss.detach()
 
-        # ---- gradient clipping
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
-        grad_norm_accum += grad_norm
+        # ---- gradient clipping (returns a 0-dim tensor; accumulate on GPU)
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        grad_norm_accum = grad_norm_accum + grad_norm.detach()
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -691,10 +765,11 @@ def train(args):
             # log_interval averaging is needed here -- multiplying by
             # grad_accum_steps again was double-counting that scaling and
             # inflated the displayed loss by a factor of grad_accum_steps.
-            loss_display      = loss_accum / args.log_interval
-            grad_norm_display = grad_norm_accum / args.log_interval
-            loss_accum        = 0.0
-            grad_norm_accum   = 0.0
+            # The single .item() here is the only sync per log interval.
+            loss_display      = (loss_accum      / args.log_interval).item()
+            grad_norm_display = (grad_norm_accum / args.log_interval).item()
+            loss_accum        = torch.zeros((), device=device)
+            grad_norm_accum   = torch.zeros((), device=device)
 
             print(
                 f"step {step:7d} | loss {loss_display:.4f} | lr {lr:.2e} | "
@@ -816,6 +891,8 @@ def parse_args():
                        "(marginally faster for small batches, needs cudagraph_mark_step_begin). "
                        "'max-autotune' — exhaustive kernel search, very slow to compile."
                    ))
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="Background processes for PackedDataLoader (0 = in-process prefetch)")
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
 

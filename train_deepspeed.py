@@ -625,13 +625,16 @@ class PackedDataLoader:
     """
     Identical to train.py version: memmap-backed, prefetched, rank-sharded,
     per-loader independent RNG, and a sequential iterator for true held-out
-    evaluation.
+    evaluation. Optionally uses a multi-process DataLoader pool
+    (num_workers>0) for higher throughput on machines with many CPU cores.
     """
     def __init__(self, bin_path: str, seq_len: int, batch_size: int,
                  rank: int = 0, world_size: int = 1, dtype=np.uint16,
+                 num_workers: int = 0,
                  loader_id: int = 0, seed: int = 42):
         self.seq_len    = seq_len
         self.batch_size = batch_size
+        self.num_workers = num_workers
         self.loader_id  = loader_id
 
         data       = np.memmap(bin_path, dtype=dtype, mode="r")
@@ -661,10 +664,64 @@ class PackedDataLoader:
                           for i in ix])
         return x, y
 
+    def _start_workers(self):
+        """
+        Spin up a torch.utils.data.DataLoader on a small in-process
+        dataset, used only when num_workers > 0. Each worker process
+        gets its own copy of the (already-mapped) shard via shared
+        memory and its own torch.Generator seeded from this loader's
+        gen so the train stream stays reproducible.
+        """
+        from torch.utils.data import DataLoader, Dataset
+
+        outer = self
+
+        class _ShardDataset(Dataset):
+            def __len__(self):
+                return 1 << 30
+
+            def __getitem__(self, _idx):
+                wid = torch.utils.data.get_worker_info()
+                seed = outer.gen.initial_seed() + (wid.id if wid else 0) * 9973
+                g = torch.Generator().manual_seed(seed)
+                ix = torch.randint(outer.n_pos, (outer.batch_size,), generator=g)
+                x = torch.stack([
+                    torch.from_numpy(outer.data[i : i + outer.seq_len].astype(np.int64))
+                    for i in ix
+                ])
+                y = torch.stack([
+                    torch.from_numpy(outer.data[i + 1 : i + 1 + outer.seq_len].astype(np.int64))
+                    for i in ix
+                ])
+                return x, y
+
+        self._worker_loader = DataLoader(
+            _ShardDataset(),
+            batch_size=None,           # _ShardDataset already yields full batches
+            num_workers=self.num_workers,
+            prefetch_factor=2,
+            persistent_workers=True,
+            pin_memory=False,          # we pin in next_batch
+        )
+        self._worker_iter = iter(self._worker_loader)
+
+    def _next_batch_workers(self, device: torch.device):
+        if not hasattr(self, "_worker_iter"):
+            self._start_workers()
+        x_cpu, y_cpu = next(self._worker_iter)
+        x = x_cpu.pin_memory().to(device, non_blocking=True)
+        y = y_cpu.pin_memory().to(device, non_blocking=True)
+        return x, y
+
     def prime(self):
-        self._next = self._build()
+        if self.num_workers > 0:
+            self._start_workers()
+        else:
+            self._next = self._build()
 
     def next_batch(self, device: torch.device):
+        if self.num_workers > 0:
+            return self._next_batch_workers(device)
         if self._next is not None:
             x_cpu, y_cpu = self._next
             self._next   = self._build()   # prefetch next
@@ -790,12 +847,16 @@ def prune_checkpoints(out_dir: str, keep: int = 3):
 
 @torch.no_grad()
 def evaluate(engine, val_loader, eval_steps, device, world_size,
-             use_pytorch_bf16=False) -> tuple[float, float]:
+             use_pytorch_bf16=False, use_cudagraphs: bool = False) -> tuple[float, float]:
     """
     Returns (loss_random, loss_sequential). See train.py for the full
     rationale — short version: loss_random is comparable to train loss
     (both are random-window), loss_sequential is the true held-out
     loss a downstream consumer would see.
+
+    `use_cudagraphs` must match the value used during training; it
+    controls whether cudagraph_mark_step_begin() is called before each
+    forward (required when running with --compile-mode reduce-overhead).
     """
     engine.eval()
     autocast_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -807,6 +868,8 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
         for _ in range(eval_steps):
             x, y = val_loader.next_batch(device)
             with autocast_ctx:
+                if use_cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
                 out  = engine(x, labels=y)
             loss = out["loss"]
             losses_random.append(loss.item())
@@ -816,6 +879,8 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
     with torch.no_grad():
         for x, y in val_loader.iter_sequential(device, max_batches=eval_steps):
             with autocast_ctx:
+                if use_cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
                 out = engine(x, labels=y)
             losses_seq.append(out["loss"].item())
     loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
@@ -896,6 +961,25 @@ def train(args):
     if args.gradient_checkpointing:
         model.model.enable_gradient_checkpointing()
 
+    # ---------------------------------------------------------------- torch.compile
+    # Apply BEFORE deepspeed.initialize so the DeepSpeedEngine wraps an
+    # already-compiled forward. The cudagraphs-marker required by
+    # reduce-overhead mode is wired up below in the training loop, just
+    # before each `engine(x, ...)` call.
+    if args.compile:
+        if master:
+            print(f"[compile] torch.compile(mode='{args.compile_mode}')…")
+            if args.compile_mode == "reduce-overhead":
+                print("          Using CUDAGraphs (reduce-overhead). If you see tensor")
+                print("          overwrite errors, switch to --compile-mode default.")
+            print("          First step will be slow (~60-120s). Subsequent steps are fast.")
+        model = torch.compile(model, mode=args.compile_mode)
+
+    # Whether to call cudagraph_mark_step_begin() before every forward.
+    # Required when using reduce-overhead (CUDAGraphs) to prevent the
+    # "tensor overwritten by subsequent run" error on tied-weight models.
+    _use_cudagraphs = args.compile and args.compile_mode == "reduce-overhead"
+
     # ---------------------------------------------------------------- ZeRO selection
     zero_stage, cpu_offload_opt, cpu_offload_param = select_zero_stage_and_offload(
         hw, n_params, world_size,
@@ -950,16 +1034,20 @@ def train(args):
     # ---------------------------------------------------------------- data
     # loader_id 0 = train, 1 = val. Combined with rank and args.seed
     # this gives each loader a fully independent random stream.
+    # num_workers>0 spawns a DataLoader worker pool for higher throughput
+    # on machines with many CPU cores; 0 keeps the in-process prefetch path.
     train_loader = PackedDataLoader(
         os.path.join(args.data_dir, "train.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=global_rank, world_size=world_size, dtype=dtype_np,
+        num_workers=args.num_workers,
         loader_id=0, seed=args.seed,
     )
     val_loader = PackedDataLoader(
         os.path.join(args.data_dir, "val.bin"),
         seq_len=args.seq_len, batch_size=args.batch_size,
         rank=global_rank, world_size=world_size, dtype=dtype_np,
+        num_workers=0,   # val is single-pass; no benefit from workers
         loader_id=1, seed=args.seed,
     )
     train_loader.prime()
@@ -1002,7 +1090,11 @@ def train(args):
     # ================================================================ LOOP
     engine.train()
     t0         = time.perf_counter()
-    loss_accum = 0.0
+    # GPU-side loss accumulator. Keeping this as a 0-dim tensor on the
+    # same device means we never trigger a GPU->CPU sync inside the
+    # micro-step loop. The .item() call is deferred to log time, which
+    # reduces per-step sync count from grad_accum_steps+1 to 1.
+    loss_accum = torch.zeros((), device=device)
 
     # When using PyTorch's bf16 path (DS bf16 disabled), wrap the forward
     # in autocast so the bf16-cast model's matmuls run in bf16. The
@@ -1032,6 +1124,11 @@ def train(args):
         for micro_step in range(args.grad_accum_steps):
             x, y = train_loader.next_batch(device)
             with autocast_ctx:
+                # CUDAGraphs (reduce-overhead mode) requires this marker
+                # before every forward pass so it knows a new "step" has
+                # begun and won't confuse output buffers across calls.
+                if _use_cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
                 out  = engine(x, labels=y)
             # Divide by grad_accum_steps so the sum over the inner
             # loop is the true mean loss over one effective batch
@@ -1039,7 +1136,9 @@ def train(args):
             loss = out["loss"] / args.grad_accum_steps
             engine.backward(loss)
 
-            loss_accum += loss.item()
+            # Stay on GPU — no .item() here. The single .item() per
+            # log interval below is the only allowed sync.
+            loss_accum = loss_accum + loss.detach()
 
         engine.step()
 
@@ -1056,9 +1155,9 @@ def train(args):
             # the mean per-optimizer-step loss. Only the log_interval
             # averaging is left — dividing by grad_accum_steps here
             # would double-count and inflate the displayed loss by that
-            # factor.
-            loss_display = loss_accum / args.log_interval
-            loss_accum   = 0.0
+            # factor. The single .item() here is the only sync per interval.
+            loss_display = (loss_accum / args.log_interval).item()
+            loss_accum   = torch.zeros((), device=device)
 
             # grad norm from DS engine
             grad_norm = engine.get_global_grad_norm() or 0.0
@@ -1083,7 +1182,7 @@ def train(args):
         if step % args.eval_interval == 0 and step > start_step:
             val_random, val_seq = evaluate(
                 engine, val_loader, args.eval_steps, device, world_size,
-                use_pytorch_bf16,
+                use_pytorch_bf16, _use_cudagraphs,
             )
             # Sequential metric is the "true" held-out loss; track best
             # checkpoint on it so the saved best.pt reflects actual
@@ -1172,6 +1271,19 @@ def parse_args():
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--gradient-checkpointing", action="store_true",
                    help="Recompute activations on backward (~35% less VRAM)")
+    p.add_argument("--compile", action="store_true",
+                   help="Run torch.compile for kernel fusion (+25-40%% throughput). "
+                        "Combine with --compile-mode reduce-overhead for CUDAGraphs.")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help=(
+                       "torch.compile mode. "
+                       "'default' — safe, no CUDAGraphs. "
+                       "'reduce-overhead' — uses CUDAGraphs (needs cudagraph_mark_step_begin). "
+                       "'max-autotune' — exhaustive kernel search, slow to compile."
+                   ))
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="Background processes for PackedDataLoader (0 = in-process prefetch)")
     p.add_argument("--seed", type=int, default=42)
 
     # ZeRO / offload  (auto-selected if not specified)
