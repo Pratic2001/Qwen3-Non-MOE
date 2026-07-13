@@ -57,11 +57,41 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 import deepspeed
 from deepspeed.utils import logger as ds_logger
 
 from model import Qwen3Config, Qwen3ForCausalLM, count_parameters
+
+
+# ---------------------------------------------------------------------------
+# ── LOSS (pre-shifted targets) ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PackedDataLoader._build() / iter_sequential() already build `y` as
+# data[i+1 : i+1+seq_len] -- i.e. y[t] IS the correct next-token target for
+# logits[t] (which was computed from context x[0..t]). model.py's forward(),
+# however, is written for the HuggingFace convention where `labels` is
+# UNSHIFTED (same alignment as input_ids) and does its own internal shift
+# (logits[:-1] vs labels[1:]) before computing cross-entropy.
+#
+# Calling engine(x, labels=y) with our already-shifted y therefore shifts
+# TWICE: logits[t] (a prediction for token t+1, given context up to t) ends
+# up compared against y[t+1] = data[i+t+2] -- two tokens further ahead than
+# anything derivable from that context. That target is unlearnable noise at
+# every position, so the model gets no real gradient signal and collapses to
+# predicting whatever token is globally most frequent in the corpus (hence
+# training converging to spamming "----", "#", commas, etc. instead of
+# learning language).
+#
+# Fix: call the engine WITHOUT labels (so model.py does no internal shift)
+# and compute the loss here ourselves directly against the already-shifted y.
+def _pretrain_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        y.reshape(-1),
+        ignore_index=-100,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -904,8 +934,8 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
             x, y = val_loader.next_batch(device)
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
-            out  = engine(x, labels=y)
-            loss = out["loss"]
+            out  = engine(x)
+            loss = _pretrain_loss(out["logits"], y)
             losses_random.append(loss.item())
     loss_random = float(np.mean(losses_random))
 
@@ -914,8 +944,8 @@ def evaluate(engine, val_loader, eval_steps, device, world_size,
         for x, y in val_loader.iter_sequential(device, max_batches=eval_steps):
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
-            out = engine(x, labels=y)
-            losses_seq.append(out["loss"].item())
+            out = engine(x)
+            losses_seq.append(_pretrain_loss(out["logits"], y).item())
     loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
 
     engine.train()
@@ -1186,11 +1216,11 @@ def train(args):
                 torch.compiler.cudagraph_mark_step_begin()
             # Forward: DeepSpeed's `torch_autocast` config wraps engine(...)
             # in torch.autocast(bf16) for us — no manual context needed.
-            out  = engine(x, labels=y)
+            out  = engine(x)
             # Divide by grad_accum_steps so the sum over the inner
             # loop is the true mean loss over one effective batch
             # (= one optimizer step), exactly like train.py.
-            loss = out["loss"] / args.grad_accum_steps
+            loss = _pretrain_loss(out["logits"], y) / args.grad_accum_steps
             engine.backward(loss)
 
             # Stay on GPU — no .item() here. The single .item() per

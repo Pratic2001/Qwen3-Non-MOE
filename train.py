@@ -47,9 +47,38 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import Qwen3Config, Qwen3ForCausalLM, count_parameters
+
+
+# ---------------------------------------------------------------------------
+# ── LOSS (pre-shifted targets) ───────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PackedDataLoader._build_batch_cpu() / iter_sequential() already build `y`
+# as data[i+1 : i+1+seq_len] -- i.e. y[t] IS the correct next-token target
+# for logits[t] (computed from context x[0..t]). model.py's forward(),
+# however, expects `labels` to be UNSHIFTED (same alignment as input_ids)
+# and does its own internal shift (logits[:-1] vs labels[1:]) before
+# computing cross-entropy.
+#
+# Calling model(x, labels=y) with our already-shifted y therefore shifts
+# TWICE: logits[t] (a prediction for token t+1, given context up to t) ends
+# up compared against y[t+1] = data[i+t+2] -- two tokens further ahead than
+# anything derivable from that context. That target is unlearnable noise at
+# every position, so the model gets no real gradient signal and collapses to
+# predicting whatever token is globally most frequent in the corpus (hence
+# training converging to spamming "----", "#", commas, etc. instead of
+# learning language). Same bug as train_deepspeed.py, fixed the same way:
+# call the model WITHOUT labels and compute the loss here ourselves,
+# directly against the already-shifted y.
+def _pretrain_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        y.reshape(-1),
+        ignore_index=-100,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,8 +516,8 @@ def evaluate(model: nn.Module, val_loader: PackedDataLoader,
         with ctx:
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
-            out = model(x, labels=y)
-        losses_random.append(out["loss"].item())
+            out = model(x)
+        losses_random.append(_pretrain_loss(out["logits"], y).item())
     loss_random = float(np.mean(losses_random))
 
     losses_seq = []
@@ -496,8 +525,8 @@ def evaluate(model: nn.Module, val_loader: PackedDataLoader,
         with ctx:
             if use_cudagraphs:
                 torch.compiler.cudagraph_mark_step_begin()
-            out = model(x, labels=y)
-        losses_seq.append(out["loss"].item())
+            out = model(x)
+        losses_seq.append(_pretrain_loss(out["logits"], y).item())
     loss_seq = float(np.mean(losses_seq)) if losses_seq else loss_random
 
     model.train()
@@ -751,8 +780,8 @@ def train(args):
                     # begun and won't confuse output buffers across calls.
                     if _use_cudagraphs:
                         torch.compiler.cudagraph_mark_step_begin()
-                    out  = model(x, labels=y)
-                loss = out["loss"] / args.grad_accum_steps
+                    out  = model(x)
+                loss = _pretrain_loss(out["logits"], y) / args.grad_accum_steps
                 loss.backward()
 
             # Stay on GPU — no .item() here. The single .item() per
@@ -984,12 +1013,13 @@ def smoke_test():
         x, y = loader.next_batch(device)
         optimizer.zero_grad(set_to_none=True)
         with ctx:
-            out = model(x, labels=y)
-        out["loss"].backward()
+            out = model(x)
+        loss = _pretrain_loss(out["logits"], y)
+        loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         mfu = estimate_mfu(model, 2 * 64 / max(time.perf_counter() - t0, 1e-6), gpu_peak)
-        print(f"  step {step} | loss {out['loss'].item():.4f} | "
+        print(f"  step {step} | loss {loss.item():.4f} | "
               f"lr {lr:.2e} | mfu {mfu*100:.2f}%")
 
     val_random, val_seq = evaluate(model, val_loader, 3, device, ctx)
