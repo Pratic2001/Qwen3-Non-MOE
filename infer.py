@@ -503,11 +503,18 @@ def _prepare_inputs(
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
     Tokenize `prompts`, left-pad to the longest, and return
-    (input_ids, attention_mask, prompt_len).
+    (input_ids, pad_mask, prompt_len).
 
     Left-padding is the right choice for causal LMs: the right edge
     stays in the same position across the batch, so positional
     encodings and KV-cache queries are consistent.
+
+    `pad_mask` is a (B, max_len) additive float mask (0.0 real token,
+    -inf padding) describing ONLY padding — it carries no causal
+    information. If every prompt in the batch is the same length (no
+    padding actually needed — e.g. any single-prompt call), this
+    returns None instead, so `_step` can take the fast `is_causal=True`
+    SDPA path rather than building an explicit mask.
     """
     encoded = [tokenizer.encode(p) for p in prompts]
     ids_list = [e.ids for e in encoded]
@@ -519,48 +526,92 @@ def _prepare_inputs(
         or 0
     )
 
-    max_len = max(len(x) for x in ids_list)
+    lens = [len(x) for x in ids_list]
+    max_len = max(lens)
     input_ids = torch.full((len(prompts), max_len), pad_id, dtype=torch.long)
-    # SDPA only accepts bool, float, or query-dtype masks.  We build a
-    # float additive mask: 0.0 for real tokens, -inf for pad.  The
-    # caller casts it onto the model's compute device + dtype so SDPA
-    # sees a dtype match against the query.
-    attn_mask = torch.zeros((len(prompts), max_len), dtype=torch.float)
+    needs_padding = min(lens) != max_len
+    pad_mask = torch.zeros((len(prompts), max_len), dtype=torch.float) if needs_padding else None
     for i, ids in enumerate(ids_list):
         offset = max_len - len(ids)
         input_ids[i, offset:] = torch.tensor(ids, dtype=torch.long)
-        attn_mask[i, :offset] = float("-inf")  # mask left-pad
+        if needs_padding:
+            pad_mask[i, :offset] = float("-inf")  # mask left-pad
 
-    return input_ids.to(device), attn_mask.to(device), max_len
+    input_ids = input_ids.to(device)
+    if pad_mask is not None:
+        pad_mask = pad_mask.to(device)
+    return input_ids, pad_mask, max_len
+
+
+def _build_combined_mask(
+    pad_mask_so_far: Optional[torch.Tensor],  # (B, past_len) or None
+    seq_len: int,
+    past_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Build a (B, 1, seq_len, past_len+seq_len) additive mask combining:
+      - causal restriction (query position can't see future keys) —
+        only bites when seq_len > 1, i.e. the prefill step;
+      - key padding, carried forward from pad_mask_so_far.
+    Also returns the padding mask extended with `seq_len` zero columns
+    (new tokens are never padding) for the caller to pass into the next
+    step. Returns (None, None) if there's no padding at all — callers
+    should rely on SDPA's `is_causal` fast path in that case instead.
+    """
+    if pad_mask_so_far is None:
+        return None, None
+
+    bsz = pad_mask_so_far.size(0)
+    new_cols = torch.zeros((bsz, seq_len), dtype=pad_mask_so_far.dtype, device=device)
+    full_pad = torch.cat([pad_mask_so_far, new_cols], dim=1)   # (B, past_len+seq_len)
+
+    total_len = past_len + seq_len
+    q_pos = torch.arange(past_len, total_len, device=device).unsqueeze(1)   # (seq_len, 1)
+    k_pos = torch.arange(0, total_len, device=device).unsqueeze(0)          # (1, total_len)
+    causal = torch.zeros((seq_len, total_len), device=device)
+    causal.masked_fill_(k_pos > q_pos, float("-inf"))                      # mask future keys
+
+    mask = causal.unsqueeze(0) + full_pad.unsqueeze(1)   # (B, seq_len, total_len)
+    mask = mask.unsqueeze(1).to(dtype)                   # (B, 1, seq_len, total_len)
+    return mask, full_pad
 
 
 @torch.inference_mode()
 def _step(
     model: Qwen3ForCausalLM,
     input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    pad_mask: Optional[torch.Tensor],
     past_key_values: Optional[List],
-) -> Tuple[torch.Tensor, Optional[List]]:
+) -> Tuple[torch.Tensor, Optional[List], Optional[torch.Tensor]]:
     """
     Run one forward pass.  `input_ids` is either the full prompt (when
     `past_key_values` is None, i.e. the prefill step) or just the last
-    token (decode step).  Returns the next-token logits at the last
-    position and the updated KV cache.
+    token (decode step).  `pad_mask` is the (B, past_len) padding mask
+    accumulated so far, or None if the batch has no padding at all.
+
+    Returns (next_token_logits, updated_past_key_values, updated_pad_mask)
+    — `updated_pad_mask` should be threaded into the next `_step` call.
     """
-    if attention_mask is not None:
-        # SDPA requires the additive mask to be on the same device as the
-        # query and its dtype must match.  Cast both at once.
-        model_param = next(model.parameters())
-        attention_mask = attention_mask.to(device=model_param.device,
-                                           dtype=model_param.dtype)
+    bsz, seq_len = input_ids.shape
+    model_param = next(model.parameters())
+    past_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+
+    combined_mask, updated_pad_mask = _build_combined_mask(
+        pad_mask, seq_len, past_len,
+        device=input_ids.device, dtype=model_param.dtype,
+    )
+
     out = model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,        use_cache=True,
+        attention_mask=combined_mask,   # None -> fast is_causal SDPA path
+        past_key_values=past_key_values,
+        use_cache=True,
     )
     # logits at the last position: (B, V)
     next_logits = out["logits"][:, -1, :]
-    return next_logits, out["past_key_values"]
+    return next_logits, out["past_key_values"], updated_pad_mask
 
 
 
@@ -594,9 +645,9 @@ def generate_batch(
         eos_token_id = find_eos_token_id(tokenizer)
 
     # ------------------ prefill
-    input_ids, base_attn, prompt_len = _prepare_inputs(tokenizer, prompts, device)
+    input_ids, pad_mask, prompt_len = _prepare_inputs(tokenizer, prompts, device)
     past_kv: Optional[List] = None
-    logits, past_kv = _step(model, input_ids, base_attn, past_kv)
+    logits, past_kv, pad_mask = _step(model, input_ids, pad_mask, past_kv)
 
     # generated tokens so far (B, T); starts as the prompt itself
     # (we'll trim it from the output later).  We track this for
@@ -633,10 +684,10 @@ def generate_batch(
         if eos_token_id is not None:
             finished = finished | (next_id.squeeze(-1) == eos_token_id)
 
-        # Decode step: feed only the new token, no attention mask.
-        # The model treats seq_len=1 + past_key_value as "attend to
-        # cached context" — no causal mask needed.
-        logits, past_kv = _step(model, next_id, None, past_kv)
+        # Decode step: feed only the new token. `pad_mask` carries the
+        # padding history forward so the KV-cache's padded key positions
+        # (if any) stay masked; None if the batch had no padding.
+        logits, past_kv, pad_mask = _step(model, next_id, pad_mask, past_kv)
 
     # ------------------ decode output
     completions: List[Dict] = []
@@ -690,9 +741,9 @@ def generate_stream(
     if eos_token_id is None:
         eos_token_id = find_eos_token_id(tokenizer)
 
-    input_ids, base_attn, prompt_len = _prepare_inputs(tokenizer, [prompt], device)
+    input_ids, pad_mask, prompt_len = _prepare_inputs(tokenizer, [prompt], device)
     past_kv: Optional[List] = None
-    logits, past_kv = _step(model, input_ids, base_attn, past_kv)
+    logits, past_kv, pad_mask = _step(model, input_ids, pad_mask, past_kv)
     generated = input_ids.clone()
 
     for _ in range(max_new_tokens):
@@ -714,8 +765,9 @@ def generate_stream(
         chunk = tokenizer.decode([tok], skip_special_tokens=False)
         yield chunk
 
-        # Decode step: no attention mask needed (seq_len=1 + KV-cache).
-        logits, past_kv = _step(model, next_id, None, past_kv)
+        # Decode step: feed only the new token; `pad_mask` (None for a
+        # single un-padded prompt) carries forward any padding history.
+        logits, past_kv, pad_mask = _step(model, next_id, pad_mask, past_kv)
 
 
 # ---------------------------------------------------------------------------
