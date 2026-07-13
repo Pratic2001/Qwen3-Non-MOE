@@ -121,6 +121,36 @@ MIN_ANSWER_CHARS = 5
 # Per-dataset extractors  ->  {"prompt", "thinking", "answer"} or None
 # ---------------------------------------------------------------------------
 
+def _extract_boxed(text: str):
+    """Return every \\boxed{...} payload in `text`, respecting nested braces.
+
+    The naive regex pattern boxed\{([^}]+)\} stops at the FIRST closing brace,
+    so any nested-brace LaTeX (\\boxed{\\frac{1}{2}}, \\boxed{x^{2}}, etc. --
+    extremely common in NuminaMath/OpenThoughts solutions) gets truncated
+    into a syntactically broken, wrong answer. This does real brace matching
+    instead.
+    """
+    results = []
+    i = 0
+    marker = "\\boxed{"
+    while True:
+        start = text.find(marker, i)
+        if start == -1:
+            break
+        depth = 1
+        j = start + len(marker)
+        while j < len(text) and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            results.append(text[start + len(marker): j - 1])
+        i = j
+    return results
+
+
 def _gsm8k_split_thinking(raw_answer: str):
     """GSM8K answers are 'reasoning\n#### final_num'. Split them."""
     if "####" in raw_answer:
@@ -145,7 +175,7 @@ def extract_record(example: dict, extractor: str) -> Optional[dict]:
             # thinking, with the last sentence / boxed expression as the answer.
             thinking = answer
             # Try to pull out the final boxed answer as the short answer field
-            boxed = re.findall(r"\\boxed\{([^}]+)\}", answer)
+            boxed = _extract_boxed(answer)
             short_ans = boxed[-1] if boxed else answer.split("\n")[-1].strip()
             return {"prompt": prompt, "thinking": thinking, "answer": short_ans}
 
@@ -340,13 +370,27 @@ def stream_category(category: str, byte_budget: int, out_dir: str) -> tuple:
     writer     = ShardWriter(out_dir, category)
     src_idx    = 0
     last_print = time.time()
+    # Track which sources have been fully exhausted so the round-robin loop
+    # never reopens (and silently re-streams/duplicates) one that's already
+    # been read to the end -- a streaming HF dataset restarts from example 0
+    # every time load_dataset() is called on it again.
+    exhausted  = set()
 
     print(f"\n=== [{category}] target {byte_budget / 1024**2:.1f} MB "
           f"from {len(sources)} source(s) ===")
 
     while writer.total_bytes < byte_budget:
+        if len(exhausted) >= len(sources):
+            print(f"\n[{category}] all sources exhausted at "
+                  f"{writer.total_bytes / 1024**2:.1f} MB "
+                  f"(target was {byte_budget / 1024**2:.1f} MB) -- stopping, "
+                  f"no data will be duplicated")
+            break
+
         src = sources[src_idx % len(sources)]
         src_idx += 1
+        if src["path"] in exhausted:
+            continue
 
         try:
             ds = load_dataset(
@@ -383,9 +427,14 @@ def stream_category(category: str, byte_budget: int, out_dir: str) -> tuple:
                           f" / {byte_budget / 1024**2:.1f} MB  ({pct:5.1f}%)"
                           f"  docs={writer.total_docs:,}", end="\r")
                     last_print = time.time()
+            else:
+                # Inner for-loop ran to completion without `break` -> the
+                # stream is exhausted. Never reopen it.
+                exhausted.add(src["path"])
 
         except Exception as e:
             print(f"\n[warn] stream error for {src['path']}: {e} — trying next source")
+            exhausted.add(src["path"])
             continue
 
         if writer.total_bytes >= byte_budget:

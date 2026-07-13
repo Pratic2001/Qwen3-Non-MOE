@@ -126,11 +126,18 @@ def format_and_tokenise(
         return None
 
     # ---- user turn (prompt — masked out of mask)
-    user_text = f"user\n{prompt}\n"
+    # IMPORTANT: this must match the exact ChatML template pack_sft_data.py
+    # trains the model on (<|im_start|>role\n...\n<|im_end|>\n). The model
+    # only knows how to produce well-formed <think>...</think> completions
+    # when it sees a prompt in the format it was fine-tuned on. The
+    # previous plain "user\n{prompt}\n" template was a different, unseen
+    # prompt shape -- GRPO rollouts were sampling the model off-distribution,
+    # which corrupts the reward signal from the very first step.
+    user_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
     # ---- assistant turn (canonical answer only — mask = 1 region)
     # No <think> block: GRPO expects the model to reason at rollout time.
-    asst_text = f"assistant\n{answer}\n"
+    asst_text = f"{answer}<|im_end|>\n"
 
     user_ids = tokenizer.encode(user_text, add_special_tokens=False).ids
     asst_ids = tokenizer.encode(asst_text, add_special_tokens=False).ids
