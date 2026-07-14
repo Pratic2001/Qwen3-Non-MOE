@@ -64,6 +64,26 @@ SOURCES = {
             split="train",
             extractor="gsm8k",
         ),
+        # ~14M rows -- by far the largest single source here, and the one
+        # most likely to keep the 'math' budget from exhausting early.
+        dict(
+            path="nvidia/OpenMathInstruct-2",
+            name=None,
+            split="train",
+            extractor="openmath_instruct2",
+        ),
+        dict(
+            path="microsoft/orca-math-word-problems-200k",
+            name=None,
+            split="train",
+            extractor="orca_math",
+        ),
+        dict(
+            path="TIGER-Lab/MathInstruct",
+            name=None,
+            split="train",
+            extractor="instruction_output_math",
+        ),
     ],
     "code": [
         dict(
@@ -77,6 +97,24 @@ SOURCES = {
             name=None,
             split="train",
             extractor="alpaca_code",
+        ),
+        dict(
+            path="ise-uiuc/Magicoder-Evol-Instruct-110K",
+            name=None,
+            split="train",
+            extractor="magicoder",
+        ),
+        dict(
+            path="glaiveai/glaive-code-assistant-v3",
+            name=None,
+            split="train",
+            extractor="glaive_code",
+        ),
+        dict(
+            path="bigcode/self-oss-instruct-sc2-exec-filter-50k",
+            name=None,
+            split="train",
+            extractor="self_oss_instruct",
         ),
     ],
     "reasoning": [
@@ -92,6 +130,19 @@ SOURCES = {
             split="train",
             extractor="open_hermes",
         ),
+        # ~4.2M rows -- the workhorse for keeping 'reasoning' topped up.
+        dict(
+            path="Open-Orca/OpenOrca",
+            name=None,
+            split="train",
+            extractor="open_orca",
+        ),
+        dict(
+            path="HuggingFaceH4/ultrachat_200k",
+            name=None,
+            split="train_sft",
+            extractor="ultrachat",
+        ),
     ],
     "science": [
         dict(
@@ -105,6 +156,30 @@ SOURCES = {
             name=None,
             split="train",
             extractor="science_qa",
+        ),
+        dict(
+            path="allenai/sciq",
+            name=None,
+            split="train",
+            extractor="sciq",
+        ),
+        dict(
+            path="camel-ai/physics",
+            name=None,
+            split="train",
+            extractor="camel_qa",
+        ),
+        dict(
+            path="camel-ai/chemistry",
+            name=None,
+            split="train",
+            extractor="camel_qa",
+        ),
+        dict(
+            path="camel-ai/biology",
+            name=None,
+            split="train",
+            extractor="camel_qa",
         ),
     ],
 }
@@ -207,6 +282,46 @@ def extract_record(example: dict, extractor: str) -> Optional[dict]:
                 return None
             return {"prompt": prompt, "answer": _gsm8k_extract_answer(raw)}
 
+        if extractor == "openmath_instruct2":
+            prompt = (example.get("problem") or "").strip()
+            answer = (example.get("expected_answer") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "orca_math":
+            prompt = (example.get("question") or "").strip()
+            resp   = (example.get("answer") or "").strip()
+            if not prompt or not resp:
+                return None
+            # No clean short-answer field; take the boxed value if present,
+            # otherwise fall back to the last non-empty line of the response.
+            boxed = _extract_boxed(resp)
+            if boxed:
+                short_ans = boxed[-1].strip()
+            else:
+                lines = [l.strip() for l in resp.splitlines() if l.strip()]
+                short_ans = lines[-1] if lines else ""
+            if not short_ans:
+                return None
+            return {"prompt": prompt, "answer": short_ans}
+
+        if extractor == "instruction_output_math":
+            # TIGER-Lab/MathInstruct: {"instruction": ..., "output": ...}
+            prompt = (example.get("instruction") or "").strip()
+            resp   = (example.get("output") or "").strip()
+            if not prompt or not resp:
+                return None
+            boxed = _extract_boxed(resp)
+            if boxed:
+                short_ans = boxed[-1].strip()
+            else:
+                m = re.search(r"[Tt]he answer is[:\s]*([^\.\n]+)", resp)
+                short_ans = m.group(1).strip() if m else resp.split("\n")[-1].strip()
+            if not short_ans:
+                return None
+            return {"prompt": prompt, "answer": short_ans}
+
         # ---- Code ----
         if extractor == "instruction_output":
             prompt = (example.get("instruction") or "").strip()
@@ -223,6 +338,30 @@ def extract_record(example: dict, extractor: str) -> Optional[dict]:
             if not prompt or not output:
                 return None
             return {"prompt": prompt, "answer": output}
+
+        if extractor == "magicoder":
+            # ise-uiuc/Magicoder-Evol-Instruct-110K: {"instruction", "response"}
+            prompt = (example.get("instruction") or "").strip()
+            answer = (example.get("response") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "glaive_code":
+            # glaiveai/glaive-code-assistant-v3: {"question", "answer"}
+            prompt = (example.get("question") or "").strip()
+            answer = (example.get("answer") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "self_oss_instruct":
+            # bigcode/self-oss-instruct-sc2-exec-filter-50k: {"instruction", "response"}
+            prompt = (example.get("instruction") or "").strip()
+            answer = (example.get("response") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
 
         # ---- Reasoning ----
         if extractor == "open_thoughts":
@@ -254,6 +393,27 @@ def extract_record(example: dict, extractor: str) -> Optional[dict]:
                 return None
             prompt = human_turns[0].strip()
             answer = gpt_turns[0].strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "open_orca":
+            # Open-Orca/OpenOrca: {"question", "response", "system_prompt"}
+            prompt = (example.get("question") or "").strip()
+            answer = (example.get("response") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "ultrachat":
+            # HuggingFaceH4/ultrachat_200k: {"messages": [{"role":..,"content":..}, ...]}
+            msgs = example.get("messages") or []
+            user_turns = [m["content"] for m in msgs if m.get("role") == "user"]
+            asst_turns = [m["content"] for m in msgs if m.get("role") == "assistant"]
+            if not user_turns or not asst_turns:
+                return None
+            prompt = (user_turns[0] or "").strip()
+            answer = (asst_turns[0] or "").strip()
             if not prompt or not answer:
                 return None
             return {"prompt": prompt, "answer": answer}
@@ -290,6 +450,22 @@ def extract_record(example: dict, extractor: str) -> Optional[dict]:
             if ans_idx is not None and isinstance(ans_idx, int) and ans_idx < len(choices):
                 answer = f"{chr(65+ans_idx)}. {choices[ans_idx]}"
             if not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "sciq":
+            # allenai/sciq: {"question", "correct_answer", "support"}
+            prompt = (example.get("question") or "").strip()
+            answer = (example.get("correct_answer") or "").strip()
+            if not prompt or not answer:
+                return None
+            return {"prompt": prompt, "answer": answer}
+
+        if extractor == "camel_qa":
+            # camel-ai/{physics,chemistry,biology}: {"message_1", "message_2"}
+            prompt = (example.get("message_1") or "").strip()
+            answer = (example.get("message_2") or "").strip()
+            if not prompt or not answer:
                 return None
             return {"prompt": prompt, "answer": answer}
 
