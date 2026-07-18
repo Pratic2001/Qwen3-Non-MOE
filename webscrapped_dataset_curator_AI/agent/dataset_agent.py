@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.parse
 from contextlib import AsyncExitStack
@@ -77,7 +78,23 @@ DEFAULT_MIX = {
 # Ollama calls
 # ---------------------------------------------------------------------------
 
-async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
+OLLAMA_HEARTBEAT_SECS = float(os.environ.get("OLLAMA_HEARTBEAT_SECS", "15"))
+
+
+async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: bool = False,
+                           purpose: str = "generate") -> str:
+    """Calls Ollama's /api/generate. Logs at INFO (not just debug) so the
+    LLM's activity shows up in a normal --log-level INFO run instead of
+    being invisible unless you turn on debug logging -- `purpose` tags
+    each call with what it's for (e.g. "plan_queries", "judge:math",
+    "sft_extract:code") so the log reads as a trace of what the agent's
+    built-in AI is actually doing, not just an opaque "[ollama]" line.
+
+    While the request is in flight, a background heartbeat logs every
+    OLLAMA_HEARTBEAT_SECS (default 15s) so a hung/slow Ollama call is
+    visibly "still waiting" rather than looking identical to a frozen
+    process -- the heartbeat is cancelled the instant the response (or an
+    error) comes back."""
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -87,13 +104,34 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
         payload["system"] = system
     if json_mode:
         payload["format"] = "json"
-    log.debug(f"[ollama] -> model={OLLAMA_MODEL} prompt={prompt[:120]!r}...")
+
     start = time.time()
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        text = resp.json().get("response", "")
-    log.debug(f"[ollama] <- ({time.time()-start:.1f}s) {text[:120]!r}...")
+    log.info(f"[llm:{purpose}] -> calling {OLLAMA_MODEL} at {OLLAMA_URL} "
+              f"({len(prompt)} chars prompt)")
+    log.debug(f"[llm:{purpose}] prompt preview: {prompt[:200]!r}...")
+
+    async def _heartbeat():
+        while True:
+            await asyncio.sleep(OLLAMA_HEARTBEAT_SECS)
+            log.info(f"[llm:{purpose}] ... still waiting on ollama "
+                      f"({time.time()-start:.0f}s elapsed so far -- if this keeps growing, "
+                      f"check `ollama serve` is running and {OLLAMA_MODEL} is pulled)")
+
+    hb_task = asyncio.create_task(_heartbeat())
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            resp.raise_for_status()
+            text = resp.json().get("response", "")
+    except Exception as e:
+        log.warning(f"[llm:{purpose}] call FAILED after {time.time()-start:.1f}s: {e}")
+        raise
+    finally:
+        hb_task.cancel()
+
+    elapsed = time.time() - start
+    log.info(f"[llm:{purpose}] <- done in {elapsed:.1f}s ({len(text)} chars returned)")
+    log.debug(f"[llm:{purpose}] response preview: {text[:200]!r}...")
     return text
 
 
@@ -115,7 +153,8 @@ async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
         f"Generate {n} new, specific search queries for this category."
     )
     try:
-        raw = await ollama_generate(prompt, system=system, json_mode=True)
+        raw = await ollama_generate(prompt, system=system, json_mode=True,
+                                     purpose=f"plan_queries:{category}")
         data = json.loads(raw)
         queries = data.get("queries", [])
         queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()][:n]
@@ -142,10 +181,11 @@ async def judge_quality(text: str, category: str) -> bool:
     )
     snippet = text[:3000]
     try:
-        raw = await ollama_generate(snippet, system=system, json_mode=True)
+        raw = await ollama_generate(snippet, system=system, json_mode=True,
+                                     purpose=f"judge:{category}")
         data = json.loads(raw)
         keep = bool(data.get("keep", False))
-        log.debug(f"[judge:{category}] keep={keep}")
+        log.info(f"[judge:{category}] verdict: {'KEEP' if keep else 'REJECT'}")
         return keep
     except Exception as e:
         # If the judge fails/times out, don't block the pipeline on it --
@@ -169,12 +209,13 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
         "question/answer pair exists in this text."
     )
     try:
-        raw = await ollama_generate(text[:6000], system=system, json_mode=True)
+        raw = await ollama_generate(text[:6000], system=system, json_mode=True,
+                                     purpose=f"sft_extract:{category}")
         data = json.loads(raw)
         if not data.get("prompt") or not data.get("answer"):
-            log.debug(f"[sft:{category}] no usable Q/A pair in article")
+            log.info(f"[sft:{category}] no usable Q/A pair in article")
             return None
-        log.debug(f"[sft:{category}] extracted pair, prompt={data['prompt'][:80]!r}...")
+        log.info(f"[sft:{category}] extracted pair, prompt={data['prompt'][:80]!r}...")
         return {"prompt": data["prompt"].strip(), "thinking": "", "answer": data["answer"].strip()}
     except Exception as e:
         log.debug(f"[sft:{category}] extraction failed: {e}")
@@ -418,12 +459,79 @@ async def _process_deep_crawl_page(page: dict, category: str, mode: str, min_doc
                                    counters)
 
 
-def _drain_rows_to_staging(row_iter, fh, budget_remaining: int) -> tuple:
+DOWNLOAD_WATCHDOG_INTERVAL_SECS = float(os.environ.get("DOWNLOAD_WATCHDOG_INTERVAL_SECS", "5"))
+DOWNLOAD_STALL_THRESHOLD_SECS = float(os.environ.get("DOWNLOAD_STALL_THRESHOLD_SECS", "20"))
+
+
+class DownloadProgress:
+    """Shared, thread-safe counters for one dataset's streaming pull.
+    `_drain_rows_to_staging` (running inside asyncio.to_thread) updates
+    this after every row; a separate watchdog thread reads it periodically
+    to print live speed and detect stalls -- two threads because the
+    download loop itself is a blocking `for row in row_iter` with no
+    natural place to "pause and print", so the only way to get a
+    heartbeat while it's blocked mid-fetch is a second thread watching the
+    clock from outside."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.rows = 0
+        self.raw_bytes = 0
+        self.start = time.time()
+        self.last_update = self.start
+        self.done = False
+        self._lock = threading.Lock()
+
+    def update(self, rows: int, raw_bytes: int):
+        with self._lock:
+            self.rows = rows
+            self.raw_bytes = raw_bytes
+            self.last_update = time.time()
+
+    def snapshot(self):
+        with self._lock:
+            return self.rows, self.raw_bytes, self.last_update
+
+
+def _download_watchdog(progress: DownloadProgress) -> None:
+    """Runs in its own daemon thread for the lifetime of one dataset's
+    download. Every DOWNLOAD_WATCHDOG_INTERVAL_SECS, logs rows/sec and
+    MB/sec so far; if no new row has arrived in
+    DOWNLOAD_STALL_THRESHOLD_SECS, logs a STALLED warning instead so a
+    genuinely hung network fetch reads differently in the log than a slow
+    but progressing one. Exits on its own once progress.done is set."""
+    while not progress.done:
+        time.sleep(DOWNLOAD_WATCHDOG_INTERVAL_SECS)
+        if progress.done:
+            break
+        rows, raw_bytes, last_update = progress.snapshot()
+        now = time.time()
+        elapsed = now - progress.start
+        since_last = now - last_update
+        avg_rows_s = rows / elapsed if elapsed > 0 else 0.0
+        avg_mb_s = (raw_bytes / 1024**2) / elapsed if elapsed > 0 else 0.0
+        if since_last >= DOWNLOAD_STALL_THRESHOLD_SECS:
+            log.warning(f"[download:{progress.label}] STALLED -- no new rows in "
+                        f"{since_last:.0f}s (so far: {rows} rows, {raw_bytes/1024**2:.2f} MB, "
+                        f"{avg_mb_s:.3f} MB/s avg). Usually just a slow network fetch or a "
+                        f"large single row (e.g. an image/audio field) still downloading -- "
+                        f"if this keeps growing for minutes, the dataset host may be "
+                        f"unresponsive or rate-limiting.")
+        else:
+            log.info(f"[download:{progress.label}] {rows} rows, {raw_bytes/1024**2:.2f} MB "
+                      f"-- {avg_rows_s:.1f} rows/s, {avg_mb_s:.3f} MB/s avg "
+                      f"(elapsed {elapsed:.0f}s)")
+
+
+def _drain_rows_to_staging(row_iter, fh, budget_remaining: int,
+                            progress: Optional[DownloadProgress] = None) -> tuple:
     """Blocking helper: pull rows from a (streaming, network-backed)
     generator and append each as one JSON line to an already-open staging
     file handle, stopping once `budget_remaining` raw text bytes have been
     written or the generator is exhausted -- whichever comes first. Runs
     inside asyncio.to_thread since dataset/network iteration blocks.
+    If `progress` is given, updates it after every row so a watchdog
+    thread can report live speed / detect stalls.
     Returns (rows_written, raw_text_bytes_written)."""
     rows_written = 0
     raw_bytes = 0
@@ -433,6 +541,8 @@ def _drain_rows_to_staging(row_iter, fh, budget_remaining: int) -> tuple:
         fh.write(json.dumps(row) + "\n")
         rows_written += 1
         raw_bytes += len((row.get("text") or "").encode("utf-8", errors="ignore"))
+        if progress is not None:
+            progress.update(rows_written, raw_bytes)
     fh.flush()
     return rows_written, raw_bytes
 
@@ -550,11 +660,19 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                 remaining = byte_budget - raw_bytes_downloaded
                 log.info(f"[public-hf:{category}] downloading {ds_id} (raw pull, up to "
                           f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows)
-                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
+                progress = DownloadProgress(f"hf:{category}:{ds_id}")
+                watchdog = threading.Thread(target=_download_watchdog, args=(progress,), daemon=True)
+                watchdog.start()
+                try:
+                    gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows)
+                    n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining, progress)
+                finally:
+                    progress.done = True
                 raw_rows_downloaded += n
                 raw_bytes_downloaded += b
+                dt = max(0.001, time.time() - progress.start)
                 log.info(f"[public-hf:{category}] {ds_id} -> {n} rows, {b/1024**2:.2f} MB "
+                          f"in {dt:.1f}s ({(b/1024**2)/dt:.3f} MB/s) "
                           f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
 
         if "kaggle" in public_cfg.get("sources", set()) and raw_bytes_downloaded < byte_budget:
@@ -568,11 +686,19 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                 remaining = byte_budget - raw_bytes_downloaded
                 log.info(f"[public-kaggle:{category}] downloading {ref} (raw pull, up to "
                           f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows)
-                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
+                progress = DownloadProgress(f"kaggle:{category}:{ref}")
+                watchdog = threading.Thread(target=_download_watchdog, args=(progress,), daemon=True)
+                watchdog.start()
+                try:
+                    gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows)
+                    n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining, progress)
+                finally:
+                    progress.done = True
                 raw_rows_downloaded += n
                 raw_bytes_downloaded += b
+                dt = max(0.001, time.time() - progress.start)
                 log.info(f"[public-kaggle:{category}] {ref} -> {n} rows, {b/1024**2:.2f} MB "
+                          f"in {dt:.1f}s ({(b/1024**2)/dt:.3f} MB/s) "
                           f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
 
     print(f"[public:{category}] raw download done: {raw_rows_downloaded} rows, "
@@ -624,174 +750,220 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
           f"{writer.total_docs} docs")
 
 
+CATEGORY_PROGRESS_INTERVAL_SECS = float(os.environ.get("CATEGORY_PROGRESS_INTERVAL_SECS", "10"))
+
+
+async def _category_progress_ticker(writer: ShardWriter, byte_budget: int, category: str) -> None:
+    """Background task, alive for the whole run_category() call, that
+    reports total MB/docs written plus the write rate since the last tick
+    -- covers every phase (HF/Kaggle raw download, quality-filter pass,
+    live web search+scrape) with one consistent "is this still moving"
+    signal, since those phases don't all have their own per-row logging.
+    If zero bytes were written in an entire interval, says so explicitly
+    -- that's the most direct answer to "is this stuck", though it can
+    also just mean the run is mid-download or mid-LLM-judge for that
+    stretch (those have their own progress logs to disambiguate)."""
+    last_bytes = writer.total_bytes
+    last_time = time.time()
+    while True:
+        await asyncio.sleep(CATEGORY_PROGRESS_INTERVAL_SECS)
+        now = time.time()
+        elapsed = now - last_time
+        delta_bytes = writer.total_bytes - last_bytes
+        rate_mb_s = (delta_bytes / 1024**2) / elapsed if elapsed > 0 else 0.0
+        pct = (100 * writer.total_bytes / byte_budget) if byte_budget else 0.0
+        stuck_note = (" -- NO shard bytes written this interval; check the "
+                       "[download:...]/[llm:...] logs above to see which phase is "
+                       "slow (or genuinely stalled) right now" if delta_bytes == 0 else "")
+        log.info(f"[progress:{category}] {writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB "
+                  f"({pct:.1f}%), {writer.total_docs} docs -- "
+                  f"{rate_mb_s:.3f} MB/s over last {elapsed:.0f}s{stuck_note}")
+        last_bytes = writer.total_bytes
+        last_time = now
+
+
 async def run_category(scraper: ScraperClient, category: str, byte_budget: int, out_dir: str,
                         mode: str, min_doc_chars: int, use_llm_judge: bool, concurrency: int = 5,
                         public_cfg: Optional[dict] = None, deep_crawl_per_domain: int = 0,
                         deep_crawl_max_pages: int = 10):
     writer = ShardWriter(out_dir, category)
-    exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
-    near_dedup = NearDedup()
-    state = RunState(out_dir, category)  # resumable across process runs
-    write_lock = asyncio.Lock()
-    sem = asyncio.Semaphore(concurrency)
+    ticker_task = asyncio.create_task(_category_progress_ticker(writer, byte_budget, category))
+    try:
+        exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
+        near_dedup = NearDedup()
+        state = RunState(out_dir, category)  # resumable across process runs
+        write_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(concurrency)
 
-    counters = {
-        "filtered_quality": 0, "filtered_dup": 0, "llm_rejected": 0,
-        "robots_blocked": 0, "http_error": 0, "video_skipped": 0,
-        "missing_dependency": 0, "other_extract_fail": 0,
-    }
+        counters = {
+            "filtered_quality": 0, "filtered_dup": 0, "llm_rejected": 0,
+            "robots_blocked": 0, "http_error": 0, "video_skipped": 0,
+            "missing_dependency": 0, "other_extract_fail": 0,
+        }
 
-    resumed = f" (resumed: {len(state.used_queries)} prior queries, {len(state.seen_urls)} prior URLs)" \
-        if state.used_queries or state.seen_urls else ""
-    print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB "
-          f"(live web scraping, concurrency={concurrency}){resumed} ===")
+        resumed = f" (resumed: {len(state.used_queries)} prior queries, {len(state.seen_urls)} prior URLs)" \
+            if state.used_queries or state.seen_urls else ""
+        print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB "
+              f"(live web scraping, concurrency={concurrency}){resumed} ===")
 
-    if public_cfg and public_cfg.get("sources"):
-        await run_public_sources_for_category(
-            category, byte_budget, mode, min_doc_chars, use_llm_judge,
-            exact_dedup, near_dedup, writer, write_lock, counters, public_cfg,
-            concurrency=concurrency,
-        )
-        if public_cfg.get("public_only"):
-            state.save()
-            print(f"\n[{category}] public-sources-only run done: "
-                  f"{writer.total_bytes / 1024**2:.2f} MB, {writer.total_docs} docs, "
-                  f"filtered {counters['filtered_quality']} low-quality + "
-                  f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected")
-            writer.close()
-            return writer.total_bytes, writer.total_docs
+        if public_cfg and public_cfg.get("sources"):
+            await run_public_sources_for_category(
+                category, byte_budget, mode, min_doc_chars, use_llm_judge,
+                exact_dedup, near_dedup, writer, write_lock, counters, public_cfg,
+                concurrency=concurrency,
+            )
+            if public_cfg.get("public_only"):
+                state.save()
+                print(f"\n[{category}] public-sources-only run done: "
+                      f"{writer.total_bytes / 1024**2:.2f} MB, {writer.total_docs} docs, "
+                      f"filtered {counters['filtered_quality']} low-quality + "
+                      f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected")
+                writer.close()
+                return writer.total_bytes, writer.total_docs
 
-    async def bounded_process(url: str):
-        async with sem:
-            return await _process_hit(scraper, url, category, mode, min_doc_chars,
-                                       use_llm_judge, exact_dedup, near_dedup, writer,
-                                       byte_budget, write_lock, counters)
+        async def bounded_process(url: str):
+            async with sem:
+                return await _process_hit(scraper, url, category, mode, min_doc_chars,
+                                           use_llm_judge, exact_dedup, near_dedup, writer,
+                                           byte_budget, write_lock, counters)
 
-    async def bounded_deep_crawl(seed_url: str):
-        async with sem:
-            try:
-                pages = await scraper.deep_crawl(seed_url, max_pages=deep_crawl_max_pages,
-                                                   max_depth=1, keywords=category)
-            except Exception as e:
-                log.warning(f"[deep_crawl:{category}] failed for {seed_url}: {e}")
-                return 0
-            if len(pages) == 1 and pages[0].get("error"):
-                log.info(f"[deep_crawl:{category}] {seed_url} -- {pages[0]['error']}")
-                return 0
-            written = 0
-            for page in pages:
-                page_url = page.get("url", seed_url)
-                if page_url in state.seen_urls:
+        async def bounded_deep_crawl(seed_url: str):
+            async with sem:
+                try:
+                    pages = await scraper.deep_crawl(seed_url, max_pages=deep_crawl_max_pages,
+                                                       max_depth=1, keywords=category)
+                except Exception as e:
+                    log.warning(f"[deep_crawl:{category}] failed for {seed_url}: {e}")
+                    return 0
+                if len(pages) == 1 and pages[0].get("error"):
+                    log.info(f"[deep_crawl:{category}] {seed_url} -- {pages[0]['error']}")
+                    return 0
+                written = 0
+                for page in pages:
+                    page_url = page.get("url", seed_url)
+                    if page_url in state.seen_urls:
+                        continue
+                    state.seen_urls.add(page_url)
+                    if await _process_deep_crawl_page(page, category, mode, min_doc_chars,
+                                                       use_llm_judge, exact_dedup, near_dedup,
+                                                       writer, byte_budget, write_lock, counters):
+                        written += 1
+                log.info(f"[deep_crawl:{category}] {seed_url} -> {len(pages)} pages harvested, "
+                         f"{written} kept")
+                return written
+
+        deep_crawled_domains: set = set()
+
+        stall_rounds = 0
+        while writer.total_bytes < byte_budget:
+            round_start = time.time()
+            bytes_before_round = writer.total_bytes
+            queries = await plan_queries(category, state.used_queries, n=6)
+            state.used_queries.extend(queries)
+            progressed_this_round = False
+            round_urls = []
+
+            for query in queries:
+                log.info(f"[search:{category}] query={query!r}")
+                try:
+                    hits = await scraper.search(query, max_results=8)
+                except Exception as e:
+                    log.warning(f"[search:{category}] search failed for {query!r}: {e}")
                     continue
-                state.seen_urls.add(page_url)
-                if await _process_deep_crawl_page(page, category, mode, min_doc_chars,
-                                                   use_llm_judge, exact_dedup, near_dedup,
-                                                   writer, byte_budget, write_lock, counters):
-                    written += 1
-            log.info(f"[deep_crawl:{category}] {seed_url} -> {len(pages)} pages harvested, "
-                     f"{written} kept")
-            return written
 
-    deep_crawled_domains: set = set()
-
-    stall_rounds = 0
-    while writer.total_bytes < byte_budget:
-        queries = await plan_queries(category, state.used_queries, n=6)
-        state.used_queries.extend(queries)
-        progressed_this_round = False
-        round_urls = []
-
-        for query in queries:
-            log.info(f"[search:{category}] query={query!r}")
-            try:
-                hits = await scraper.search(query, max_results=8)
-            except Exception as e:
-                log.warning(f"[search:{category}] search failed for {query!r}: {e}")
-                continue
-
-            if not isinstance(hits, list):
-                log.warning(f"[search:{category}] {query!r} returned unexpected "
-                            f"non-list response, treating as failure: {hits!r}")
-                continue
-            if len(hits) == 1 and isinstance(hits[0], dict) and "error" in hits[0]:
-                log.warning(f"[search:{category}] backend error for {query!r}: {hits[0]['error']}")
-                continue
-
-            log.info(f"[search:{category}] {query!r} -> {len(hits)} hits: "
-                      f"{[h.get('url') for h in hits if isinstance(h, dict)]}")
-
-            for hit in hits:
-                url = hit.get("url") if isinstance(hit, dict) else None
-                if not url or url in state.seen_urls:
+                if not isinstance(hits, list):
+                    log.warning(f"[search:{category}] {query!r} returned unexpected "
+                                f"non-list response, treating as failure: {hits!r}")
                     continue
-                state.seen_urls.add(url)
-                round_urls.append(url)
+                if len(hits) == 1 and isinstance(hits[0], dict) and "error" in hits[0]:
+                    log.warning(f"[search:{category}] backend error for {query!r}: {hits[0]['error']}")
+                    continue
 
-        # Extract this round's URLs concurrently (bounded by --concurrency)
-        # instead of one at a time -- this is where wall-clock time actually
-        # goes (network fetch + optional ASR/OCR), so serializing it was the
-        # single biggest throughput bottleneck in the original loop.
-        if round_urls:
-            results = await asyncio.gather(*(bounded_process(u) for u in round_urls),
-                                             return_exceptions=True)
-            for r in results:
-                if r is True:
-                    progressed_this_round = True
-                elif isinstance(r, Exception):
-                    log.warning(f"[{category}] worker task raised: {r}")
+                log.info(f"[search:{category}] {query!r} -> {len(hits)} hits: "
+                          f"{[h.get('url') for h in hits if isinstance(h, dict)]}")
 
-        # Deep-crawl top-up: this round's search hits already told us which
-        # domains are relevant to this category -- rather than only taking
-        # the one page web_search pointed at, spend a few crawl4ai calls
-        # harvesting more pages from the SAME domains (its docs/blog/wiki
-        # neighbors), which is usually much cheaper per-document than
-        # planning + running more search queries. Each domain is only
-        # deep-crawled once per category run (deep_crawled_domains), and
-        # only up to --deep-crawl-per-domain new domains get this treatment
-        # per round, to keep it a top-up rather than the primary path.
-        if deep_crawl_per_domain > 0 and round_urls:
-            candidate_domains = []
-            for u in round_urls:
-                host = urllib.parse.urlparse(u).netloc.lower()
-                if host and host not in deep_crawled_domains:
-                    deep_crawled_domains.add(host)
-                    candidate_domains.append(u)  # crawl from the hit itself as the seed
-                if len(candidate_domains) >= deep_crawl_per_domain:
-                    break
-            if candidate_domains:
-                dc_results = await asyncio.gather(
-                    *(bounded_deep_crawl(u) for u in candidate_domains),
-                    return_exceptions=True,
-                )
-                for r in dc_results:
-                    if isinstance(r, int) and r > 0:
+                for hit in hits:
+                    url = hit.get("url") if isinstance(hit, dict) else None
+                    if not url or url in state.seen_urls:
+                        continue
+                    state.seen_urls.add(url)
+                    round_urls.append(url)
+
+            # Extract this round's URLs concurrently (bounded by --concurrency)
+            # instead of one at a time -- this is where wall-clock time actually
+            # goes (network fetch + optional ASR/OCR), so serializing it was the
+            # single biggest throughput bottleneck in the original loop.
+            if round_urls:
+                results = await asyncio.gather(*(bounded_process(u) for u in round_urls),
+                                                 return_exceptions=True)
+                for r in results:
+                    if r is True:
                         progressed_this_round = True
                     elif isinstance(r, Exception):
-                        log.warning(f"[deep_crawl:{category}] worker task raised: {r}")
+                        log.warning(f"[{category}] worker task raised: {r}")
 
-        state.save()
+            # Deep-crawl top-up: this round's search hits already told us which
+            # domains are relevant to this category -- rather than only taking
+            # the one page web_search pointed at, spend a few crawl4ai calls
+            # harvesting more pages from the SAME domains (its docs/blog/wiki
+            # neighbors), which is usually much cheaper per-document than
+            # planning + running more search queries. Each domain is only
+            # deep-crawled once per category run (deep_crawled_domains), and
+            # only up to --deep-crawl-per-domain new domains get this treatment
+            # per round, to keep it a top-up rather than the primary path.
+            if deep_crawl_per_domain > 0 and round_urls:
+                candidate_domains = []
+                for u in round_urls:
+                    host = urllib.parse.urlparse(u).netloc.lower()
+                    if host and host not in deep_crawled_domains:
+                        deep_crawled_domains.add(host)
+                        candidate_domains.append(u)  # crawl from the hit itself as the seed
+                    if len(candidate_domains) >= deep_crawl_per_domain:
+                        break
+                if candidate_domains:
+                    dc_results = await asyncio.gather(
+                        *(bounded_deep_crawl(u) for u in candidate_domains),
+                        return_exceptions=True,
+                    )
+                    for r in dc_results:
+                        if isinstance(r, int) and r > 0:
+                            progressed_this_round = True
+                        elif isinstance(r, Exception):
+                            log.warning(f"[deep_crawl:{category}] worker task raised: {r}")
 
-        if not progressed_this_round:
-            stall_rounds += 1
-            log.warning(f"[{category}] no docs written this round "
-                        f"(stall_rounds={stall_rounds}/5)")
-            if stall_rounds >= 5:
-                log.warning(f"[{category}] no progress after 5 query rounds -- stopping early "
-                            f"at {writer.total_bytes / 1024**2:.1f} MB")
-                break
-        else:
-            stall_rounds = 0
+            state.save()
 
-    print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
-          f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s), "
-          f"filtered {counters['filtered_quality']} low-quality + {counters['filtered_dup']} duplicate + "
-          f"{counters['llm_rejected']} llm-rejected\n"
-          f"[{category}] fetch failures: {counters['robots_blocked']} robots.txt/domain-blocked, "
-          f"{counters['http_error']} HTTP error (403/etc.), {counters['video_skipped']} video/duration-skipped, "
-          f"{counters['missing_dependency']} missing optional dependency, "
-          f"{counters['other_extract_fail']} other extraction failures")
-    writer.close()
-    return writer.total_bytes, writer.total_docs
+            if not progressed_this_round:
+                stall_rounds += 1
+                log.warning(f"[{category}] no docs written this round "
+                            f"(stall_rounds={stall_rounds}/5)")
+                if stall_rounds >= 5:
+                    log.warning(f"[{category}] no progress after 5 query rounds -- stopping early "
+                                f"at {writer.total_bytes / 1024**2:.1f} MB")
+                    break
+            else:
+                stall_rounds = 0
+
+            round_elapsed = time.time() - round_start
+            round_bytes = writer.total_bytes - bytes_before_round
+            round_rate = (round_bytes / 1024**2) / round_elapsed if round_elapsed > 0 else 0.0
+            log.info(f"[round:{category}] round took {round_elapsed:.1f}s, "
+                      f"{len(round_urls)} URLs tried -> {round_bytes/1024**2:.3f} MB written "
+                      f"({round_rate:.3f} MB/s this round), total "
+                      f"{writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB")
+
+        print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
+              f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s), "
+              f"filtered {counters['filtered_quality']} low-quality + {counters['filtered_dup']} duplicate + "
+              f"{counters['llm_rejected']} llm-rejected\n"
+              f"[{category}] fetch failures: {counters['robots_blocked']} robots.txt/domain-blocked, "
+              f"{counters['http_error']} HTTP error (403/etc.), {counters['video_skipped']} video/duration-skipped, "
+              f"{counters['missing_dependency']} missing optional dependency, "
+              f"{counters['other_extract_fail']} other extraction failures")
+        writer.close()
+        return writer.total_bytes, writer.total_docs
+    finally:
+        ticker_task.cancel()
 
 
 def _find_server_path() -> str:
