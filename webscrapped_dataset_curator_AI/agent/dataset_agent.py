@@ -431,6 +431,15 @@ DEFAULT_MIX = {
 # Ollama calls
 # ---------------------------------------------------------------------------
 
+class OllamaModelNotFoundError(Exception):
+    """Raised when the configured OLLAMA_MODEL is not in the local Ollama
+    install. Caught by callers (judge_quality, extract_sft_pair, plan_queries)
+    so they can return a fallback instead of a malformed result. The user
+    sees a single actionable error at startup (via _prewarm_ollama), not a
+    silent quality drop where the judge always returns True and the
+    corpus is built with no LLM gate at all."""
+
+
 async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
     payload = {
         "model": OLLAMA_MODEL,
@@ -445,10 +454,70 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
     start = time.time()
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+        # Detect model-not-found explicitly. Without this branch, the 404
+        # body `{"error": "model 'X' not found"}` gets parsed as if it
+        # were a success response, the caller gets "" back, and
+        # `json.loads("")` raises -- caught and silently swallowed in
+        # judge_quality's except, which returns True. So a missing model
+        # looks identical to a working one and the quality gate is
+        # effectively disabled. The explicit 404 check makes the failure
+        # mode loud and actionable.
+        if resp.status_code == 404:
+            raise OllamaModelNotFoundError(
+                f"Ollama model {OLLAMA_MODEL!r} not found at {OLLAMA_URL}. "
+                f"Run `ollama list` to see installed models, or set "
+                f"OLLAMA_MODEL=... to one of them. To skip the LLM judge "
+                f"entirely, re-run with --no-llm-judge or --fast-heuristics."
+            )
         resp.raise_for_status()
         text = resp.json().get("response", "")
     log.debug(f"[ollama] <- ({time.time()-start:.1f}s) {text[:120]!r}...")
     return text
+
+
+async def _prewarm_ollama(timeout: float = 300.0) -> bool:
+    """Make one tiny inference call to load OLLAMA_MODEL into VRAM, so the
+    first real filter-pass call returns in <1s instead of paying the full
+    model-load cost (30s-5min depending on model size, which is what was
+    causing the filter pass to silently hang for minutes after the first
+    heuristic-rejected rows were logged). The prewarm is a no-op if the
+    model is already loaded. Returns True on success, False on any error
+    (logged, never raised -- callers decide whether a failed prewarm
+    should abort the run)."""
+    if not OLLAMA_MODEL:
+        log.info("prewarm: OLLAMA_MODEL not set; skipping prewarm")
+        return False
+    log.info(f"prewarm: loading {OLLAMA_MODEL!r} into Ollama (up to {timeout:.0f}s)...")
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": "ok", "stream": False},
+            )
+            if resp.status_code == 404:
+                log.error(
+                    f"prewarm FAILED: Ollama model {OLLAMA_MODEL!r} is not "
+                    f"installed at {OLLAMA_URL}. Run `ollama list` to see "
+                    f"installed models, or set OLLAMA_MODEL=... to one of "
+                    f"them. To skip the LLM judge entirely, re-run with "
+                    f"--no-llm-judge or --fast-heuristics."
+                )
+                return False
+            resp.raise_for_status()
+        log.info(f"prewarm: {OLLAMA_MODEL!r} loaded in {time.time()-t0:.1f}s")
+        return True
+    except OllamaModelNotFoundError as e:
+        # Raised by ollama_generate on 404; we bypass ollama_generate here
+        # but keep the same exception class for the caller's except list.
+        log.error(f"prewarm FAILED: {e}")
+        return False
+    except Exception as e:
+        log.warning(
+            f"prewarm failed ({type(e).__name__}: {e}); "
+            f"continuing -- first real call may be slow"
+        )
+        return False
 
 
 async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
@@ -1293,6 +1362,24 @@ async def main_async(args):
         }
         log.info(f"Public dataset sources enabled: {public_source_set} "
                  f"(public_only={args.public_only})")
+
+    # Pre-warm Ollama once at startup, before any per-category work. Without
+    # this, the first row that passes the heuristic on each category would
+    # trigger the full model-load inside the filter pass -- a 30s-5min wait
+    # that silently stalls the entire pipeline (the OllamaBatcher coalesces
+    # 10+ in-flight requests, all of which queue behind the single cold
+    # load). Failing fast here also saves a multi-GB HuggingFace download
+    # when the user has OLLAMA_MODEL pointed at a non-existent model.
+    if use_llm_judge_flag and not getattr(args, "fast_heuristics", False):
+        prewarm_ok = await _prewarm_ollama()
+        if not prewarm_ok:
+            log.error(
+                "LLM judge prewarm failed. Aborting before wasting a multi-GB "
+                "HuggingFace download on a pipeline whose quality gate can't "
+                "run. Fix the Ollama model (or rerun with --no-llm-judge / "
+                "--fast-heuristics) and try again."
+            )
+            return manifest
 
     if public_cfg and public_cfg.get("public_only"):
         # No live scraping requested at all -- skip spinning up the MCP
