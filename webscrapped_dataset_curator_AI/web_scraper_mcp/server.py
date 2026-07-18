@@ -27,6 +27,7 @@ Run with:
 """
 
 import asyncio
+import os
 import time
 import urllib.parse
 import urllib.robotparser
@@ -35,7 +36,11 @@ from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("web-scraper")
+mcp = FastMCP(
+    "web-scraper",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
+)
 
 USER_AGENT = "Mozilla/5.0 (compatible; DatasetResearchBot/1.0; +https://example.com/bot)"
 
@@ -80,24 +85,55 @@ async def _rate_limit(url: str):
 
 @mcp.tool()
 def web_search(query: str, max_results: int = 10) -> list[dict]:
-    """Search the public web (DuckDuckGo) and return title/url/snippet hits.
+    """Search the public web and return title/url/snippet hits.
 
     Use this to discover candidate pages for a topic before fetching them.
     Keep queries short and specific (3-8 words), the same way you'd type
     into a search box.
+
+    IMPORTANT: never fails silently. If the search backend errors out or
+    returns zero hits after retries, this returns a single-item list
+    containing {"error": "...", "query": "..."} instead of an empty list
+    or a raised exception -- so the caller can distinguish "genuinely no
+    results" from "the search backend is broken/rate-limited," which used
+    to look identical and caused the agent to stall without ever printing
+    a warning.
     """
     from ddgs import DDGS  # imported lazily so the server still boots if the
                             # dependency isn't installed yet, with a clear error
+    try:
+        from ddgs.exceptions import DDGSException
+    except ImportError:
+        DDGSException = Exception
 
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            results.append({
-                "title": r.get("title", ""),
-                "url": r.get("href", ""),
-                "snippet": r.get("body", ""),
-            })
-    return results
+    # "auto" fans out to several engines (google/bing/brave/yandex/etc.)
+    # simultaneously, which is the most likely thing to get rate-limited or
+    # CAPTCHA'd at any real volume. Pinning to one backend is more reliable
+    # for sustained scraping. Override with the DDGS_BACKEND env var if one
+    # backend starts failing for you (try "bing", "brave", "mojeek", ...).
+    backend = os.environ.get("DDGS_BACKEND", "duckduckgo")
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results, backend=backend):
+                    results.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", ""),
+                    })
+            if results:
+                return results
+            last_err = "search returned zero results (likely rate-limited or blocked)"
+        except DDGSException as e:
+            last_err = f"{type(e).__name__}: {e}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff before retry
+
+    return [{"error": last_err or "unknown search failure", "query": query}]
 
 
 @mcp.tool()
@@ -171,5 +207,37 @@ async def extract_article(url: str) -> dict:
             "url": url, "error": "extraction failed"}
 
 
+@mcp.tool()
+def healthcheck() -> dict:
+    """Cheap connectivity/config probe -- call this from an orchestrator
+    (n8n Cron job, OpenClaw `probe`, a monitoring workflow, etc.) before
+    kicking off a real scrape, or on a schedule to catch a broken search
+    backend before it silently eats a whole run. Does NOT do a full search;
+    just reports whether the search dependency imports and which backend
+    is configured, and whether robots.txt fetching works against a known-
+    reachable host.
+    """
+    import importlib
+    report = {"ddgs_importable": False, "ddgs_backend": os.environ.get("DDGS_BACKEND", "duckduckgo"),
+               "robots_check_ok": False, "error": None}
+    try:
+        importlib.import_module("ddgs")
+        report["ddgs_importable"] = True
+    except Exception as e:
+        report["error"] = f"ddgs import failed: {e}"
+        return report
+    try:
+        report["robots_check_ok"] = _robots_allowed("https://example.com/")
+    except Exception as e:
+        report["error"] = f"robots check failed: {e}"
+    return report
+
+
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    # Default stdio keeps `dataset_agent.py`'s stdio_client working unchanged.
+    # Set MCP_TRANSPORT=streamable-http (plus optionally MCP_HOST/MCP_PORT)
+    # to expose this as an HTTP endpoint instead, e.g. for n8n's MCP Client
+    # Tool node or OpenClaw's `openclaw mcp` bridge, which both speak HTTP/SSE
+    # rather than spawning the process themselves over stdio.
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
