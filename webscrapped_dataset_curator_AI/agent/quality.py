@@ -60,6 +60,39 @@ def passes_prose_quality_filter(text: str, min_doc_chars: int = 500) -> bool:
     return True
 
 
+def passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> bool:
+    """Quality bar for a (prompt, answer) pair that the source dataset
+    already labeled itself (an HF instruction dataset, a Kaggle Q&A CSV,
+    ...), as opposed to raw scraped prose. These are semantically complete
+    even when short -- a math problem + a short numeric answer, a one-line
+    code question + a one-line fix -- so this deliberately does NOT reuse
+    passes_prose_quality_filter's 500-char default floor, which is tuned
+    for scraped web articles and rejects almost all short Q&A pairs
+    (an entire math/code SFT dataset can come back 100% REJECTed against
+    that bar, well before anything reaches the LLM judge).
+
+    Checks that matter for a labeled pair instead:
+    - both sides present and non-trivial (not just whitespace/punctuation)
+    - combined length clears a much lower floor than prose (min_chars)
+    - not degenerate repetition (e.g. answer == prompt, or all one char)
+    """
+    prompt = (prompt or "").strip()
+    answer = (answer or "").strip()
+    if not prompt or not answer:
+        return False
+    combined = f"{prompt}\n\n{answer}"
+    if len(combined) < min_chars:
+        return False
+    if _alpha_ratio(combined) < 0.3:
+        return False
+    if answer.strip().lower() == prompt.strip().lower():
+        return False
+    lowered = combined.lower()
+    if any(marker in lowered for marker in _JUNK_MARKERS):
+        return False
+    return True
+
+
 _TRANSCRIPT_JUNK_MARKERS = ("[music]", "[applause]", "[laughter]", "♪ ♪ ♪")
 
 

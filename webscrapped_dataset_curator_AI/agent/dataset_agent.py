@@ -56,7 +56,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from quality import (
     ExactDedup, NearDedup, RunState, ShardWriter,
     passes_prose_quality_filter, passes_code_quality_filter,
-    passes_transcript_quality_filter,
+    passes_transcript_quality_filter, passes_sft_pair_quality_filter,
 )
 from topics import TOPIC_SEEDS, HUB_SEARCH_KEYWORDS
 import public_sources
@@ -70,6 +70,16 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 # whether the bypass is on -- the same code path that handles a
 # failed/empty Ollama response also handles the bypass.
 LLM_BYPASS: bool = False
+
+# Length floor (in chars, combined prompt+answer) used ONLY for rows that
+# already carry their own labeled SFT pair (mode=="sft" + extra.prompt/
+# extra.answer present -- see _process_article). Deliberately separate from
+# --min-doc-chars: that flag feeds passes_prose_quality_filter, which is
+# tuned for scraped web articles (default 500 chars) and will reject
+# essentially 100% of a short-form Q&A dataset (math problems, one-line
+# code fixes, ...) before a single row ever reaches the LLM judge. Set via
+# --min-sft-pair-chars.
+MIN_SFT_PAIR_CHARS: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -776,31 +786,44 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
     content_type = article.get("content_type")
     log.debug(f"[extract:{category}] OK {url} -- {len(text)} chars, type={content_type}")
 
-    ok = _quality_filter_for(content_type, text, url, min_doc_chars)
+    # If the source already carries its own prompt/answer labels (a HF
+    # instruction dataset, a Kaggle Q&A CSV, ...), trust those over an LLM
+    # guess -- they're the dataset author's ground truth, not a
+    # hallucinated question. Resolved up front (not just inside the
+    # mode=="sft" record-build block below) because it also changes which
+    # quality bar applies: a labeled pair is judged on its own terms via
+    # passes_sft_pair_quality_filter, NOT passes_prose_quality_filter's
+    # min_doc_chars floor (500 by default), which is tuned for scraped web
+    # articles and would reject nearly every short-but-legitimate Q&A pair
+    # (a math problem + a one-line answer, a one-line code fix) before it
+    # ever reached the LLM judge.
+    extra = article.get("extra") or {}
+    given_prompt, given_answer = extra.get("prompt"), extra.get("answer")
+    has_given_pair = bool(mode == "sft" and given_prompt and given_answer)
+
+    if has_given_pair:
+        ok = passes_sft_pair_quality_filter(given_prompt, given_answer, MIN_SFT_PAIR_CHARS)
+    else:
+        ok = _quality_filter_for(content_type, text, url, min_doc_chars)
     if not ok:
         counters["filtered_quality"] += 1
         log.info(f"[filter:{category}] REJECT (quality heuristics) {url}")
         return False
 
+    judge_text = f"{given_prompt}\n\n{given_answer}" if has_given_pair else text
     if use_llm_judge:
-        keep = await judge_quality(text, category)
+        keep = await judge_quality(judge_text, category)
         if not keep:
             counters["llm_rejected"] += 1
             log.info(f"[filter:{category}] REJECT (llm judge) {url}")
             return False
 
     if mode == "sft":
-        # If the source already carries its own prompt/answer labels (a HF
-        # instruction dataset, a Kaggle Q&A CSV, ...), trust those over an
-        # LLM guess -- they're the dataset author's ground truth, not a
-        # hallucinated question. Only fall back to the built-in-AI
-        # extraction (Ollama inventing a Q/A pair from raw prose) when the
-        # row genuinely doesn't carry one.
-        extra = article.get("extra") or {}
-        given_prompt, given_answer = extra.get("prompt"), extra.get("answer")
-        if given_prompt and given_answer:
+        if has_given_pair:
             pair = {"prompt": given_prompt, "thinking": "", "answer": given_answer}
         else:
+            # Row genuinely doesn't carry a labeled pair -- fall back to
+            # Ollama inventing one from raw prose.
             pair = await extract_sft_pair(text, category)
         if pair is None:
             log.info(f"[filter:{category}] REJECT (no sft pair extractable) {url}")
@@ -1336,6 +1359,11 @@ async def main_async(args):
         LLM_BYPASS = False
     use_llm_judge_flag = (not args.no_llm_judge) and (not LLM_BYPASS)
 
+    global MIN_SFT_PAIR_CHARS
+    MIN_SFT_PAIR_CHARS = args.min_sft_pair_chars
+    log.info(f"min_sft_pair_chars={MIN_SFT_PAIR_CHARS} (labeled-pair rows only; "
+             f"--min-doc-chars={args.min_doc_chars} still applies to unlabeled/prose rows)")
+
     target_bytes = _parse_size(args.target_size)
     categories = args.categories.split(",") if args.categories else list(DEFAULT_MIX.keys())
     mix = {c: DEFAULT_MIX.get(c, 1.0 / len(categories)) for c in categories}
@@ -1482,6 +1510,11 @@ def main():
                          help="Comma-separated, e.g. web,knowledge,reasoning,code,math")
     parser.add_argument("--mode", choices=["pretrain", "sft"], default="pretrain")
     parser.add_argument("--min-doc-chars", type=int, default=500)
+    parser.add_argument("--min-sft-pair-chars", type=int, default=20,
+                         help="Length floor (combined prompt+answer chars) for rows that "
+                              "already carry a labeled SFT pair (mode=sft only). Separate "
+                              "from --min-doc-chars, which is tuned for scraped prose and "
+                              "would reject nearly all short Q&A pairs (default: 20).")
     parser.add_argument("--no-llm-judge", action="store_true",
                          help="Skip the Ollama quality-judging pass, keep only heuristic filters (faster)")
     parser.add_argument("--fast-heuristics", action="store_true",
