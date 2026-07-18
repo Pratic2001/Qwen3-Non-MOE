@@ -28,6 +28,7 @@ Run with:
 
 import asyncio
 import os
+import sys
 import time
 import urllib.parse
 import urllib.robotparser
@@ -132,7 +133,8 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
                         results.append({"title": r.get("title", ""), "url": url,
                                          "snippet": r.get("body", "")})
                 if results:
-                    print(f"[web_search] {query!r} via backend={backend} -> {len(results)} hits", flush=True)
+                    print(f"[web_search] {query!r} via backend={backend} -> {len(results)} hits",
+                          file=sys.stderr, flush=True)
                     return results
                 last_err = f"backend={backend} returned zero results (likely rate-limited/blocked)"
             except DDGSException as e:
@@ -141,7 +143,7 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
                 last_err = f"backend={backend}: {type(e).__name__}: {e}"
             time.sleep(1)  # brief backoff before retrying same backend once
 
-    print(f"[web_search] {query!r} FAILED all backends -- {last_err}", flush=True)
+    print(f"[web_search] {query!r} FAILED all backends -- {last_err}", file=sys.stderr, flush=True)
     return [{"error": last_err or "unknown search failure", "query": query}]
 
 
