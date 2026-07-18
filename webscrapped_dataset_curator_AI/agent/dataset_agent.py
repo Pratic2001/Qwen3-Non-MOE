@@ -102,9 +102,16 @@ class OllamaBatcher:
     ollama_generate call per submit). That's intentional -- it lets users
     --no-judge-batching without any code path divergence."""
 
-    def __init__(self, batch_size: int = 8, flush_interval: float = 1.0):
+    def __init__(self, batch_size: int = 8, flush_interval: float = 1.0,
+                 submit_timeout: float = 180.0):
         self.batch_size = max(1, batch_size)
         self.flush_interval = max(0.05, flush_interval)
+        # Upper bound on how long submit() will wait for a result before
+        # giving up and returning None. Without this, a hung Ollama call
+        # (e.g. model never finishes loading, network stalls) makes every
+        # caller of judge_quality() block forever -- which is what the
+        # "hanging while ollama judge is supposed to work" symptom was.
+        self.submit_timeout = max(1.0, submit_timeout)
         self._queue: asyncio.Queue = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
         self._shutdown = False
@@ -114,17 +121,41 @@ class OllamaBatcher:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
 
+    def _resolve_drain_queue(self):
+        """Resolve every future still sitting in the queue to None. Called
+        on shutdown and when _run exits for any reason, so a caller awaiting
+        a future that arrived after shutdown was signalled doesn't block
+        forever. Idempotent. Sentinels (fut is None) are silently dropped
+        -- they're just wake-up tokens, not real pending requests."""
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            _, _, fut = item
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+
     async def submit(self, prompt: str, system: str) -> Optional[str]:
         """Enqueue a (prompt, system) and await the model's text response.
-        Returns None if the batcher is shutting down (callers fall back to
-        their own parse-failure path, which is the right thing to do)."""
+        Returns None if the batcher is shutting down, the request times out,
+        or the underlying ollama call fails (callers fall back to their own
+        parse-failure path, which is the right thing to do)."""
         if self._shutdown:
             return None
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         await self._queue.put((prompt, system, fut))
         self._ensure_running()
-        return await fut
+        try:
+            return await asyncio.wait_for(fut, timeout=self.submit_timeout)
+        except asyncio.TimeoutError:
+            log.warning(f"[ollama-batcher] submit timed out after "
+                        f"{self.submit_timeout:.0f}s; resolving to None "
+                        f"so the caller can fall through")
+            if not fut.done():
+                fut.set_result(None)
+            return None
 
     async def _run(self):
         """Background coroutine: drain the queue into batches and dispatch
@@ -134,75 +165,86 @@ class OllamaBatcher:
         fallbacks fire -- no doc silently disappears."""
         pending: list[tuple[str, str, asyncio.Future]] = []
         window_deadline: Optional[float] = None  # absolute time at which to flush whatever we have
-        while not (self._shutdown and self._queue.empty() and not pending):
-            # Compute how long to wait for the next item. While the queue
-            # is empty AND pending is empty, idle forever (caller will
-            # wake us by submitting). Once we have at least one pending
-            # item, race a deadline (set when the first pending item
-            # arrived) against "queue has another item ready now."
-            if not pending and self._queue.empty():
-                # Park until something arrives or shutdown is signalled.
-                if self._shutdown:
-                    break
-                item = await self._queue.get()
-                if self._is_sentinel(item):
+        try:
+            while not (self._shutdown and self._queue.empty() and not pending):
+                # Compute how long to wait for the next item. While the queue
+                # is empty AND pending is empty, idle forever (caller will
+                # wake us by submitting). Once we have at least one pending
+                # item, race a deadline (set when the first pending item
+                # arrived) against "queue has another item ready now."
+                if not pending and self._queue.empty():
+                    # Park until something arrives or shutdown is signalled.
+                    if self._shutdown:
+                        break
+                    item = await self._queue.get()
+                    if self._is_sentinel(item):
+                        continue
+                    pending.append(item)
+                    window_deadline = asyncio.get_running_loop().time() + self.flush_interval
+                    # Fast path: if the batch is already full, flush now.
+                    if len(pending) >= self.batch_size:
+                        await self._flush(pending)
+                        pending = []
+                        window_deadline = None
                     continue
-                pending.append(item)
-                window_deadline = asyncio.get_running_loop().time() + self.flush_interval
-                # Fast path: if the batch is already full, flush now.
-                if len(pending) >= self.batch_size:
+
+                # We have at least one pending item. Decide whether to flush:
+                # - batch is full
+                # - shutdown signalled (drain whatever's left)
+                # - flush_interval has elapsed since the first pending item arrived
+                now = asyncio.get_running_loop().time()
+                interval_elapsed = window_deadline is not None and now >= window_deadline
+                should_flush = (
+                    len(pending) >= self.batch_size
+                    or (self._shutdown and pending)
+                    or interval_elapsed
+                )
+                if should_flush:
                     await self._flush(pending)
                     pending = []
                     window_deadline = None
-                continue
-
-            # We have at least one pending item. Decide whether to flush:
-            # - batch is full
-            # - shutdown signalled (drain whatever's left)
-            # - flush_interval has elapsed since the first pending item arrived
-            now = asyncio.get_running_loop().time()
-            interval_elapsed = window_deadline is not None and now >= window_deadline
-            should_flush = (
-                len(pending) >= self.batch_size
-                or (self._shutdown and pending)
-                or interval_elapsed
-            )
-            if should_flush:
-                await self._flush(pending)
-                pending = []
-                window_deadline = None
-                continue
-
-            # Otherwise race the deadline against the next queue item.
-            if not self._queue.empty():
-                item = self._queue.get_nowait()
-                if self._is_sentinel(item):
                     continue
-                pending.append(item)
-                continue
-            # Wait up to (deadline - now) for an item, whichever first.
-            if window_deadline is not None:
-                remaining = max(0.0, window_deadline - now)
-                try:
-                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    continue
-                if self._is_sentinel(item):
-                    continue
-                pending.append(item)
 
-        # Resolve any futures still waiting if we're shutting down
-        # without a successful flush (e.g. cancelled).
-        for _, _, fut in pending:
-            if not fut.done():
-                fut.set_result(None)
+                # Otherwise race the deadline against the next queue item.
+                if not self._queue.empty():
+                    item = self._queue.get_nowait()
+                    if self._is_sentinel(item):
+                        continue
+                    pending.append(item)
+                    continue
+                # Wait up to (deadline - now) for an item, whichever first.
+                if window_deadline is not None:
+                    remaining = max(0.0, window_deadline - now)
+                    try:
+                        item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        continue
+                    if self._is_sentinel(item):
+                        continue
+                    pending.append(item)
+        except asyncio.CancelledError:
+            # shutdown() cancelled us mid-flush (drain_timeout elapsed).
+            # Make sure the in-flight flush's futures aren't left dangling.
+            for _, _, fut in pending:
+                if not fut.done():
+                    fut.set_result(None)
+            raise
+        finally:
+            # Always drain whatever's in the queue on exit, so any submit()
+            # that landed between shutdown's _shutdown=True and this point
+            # gets its future resolved instead of waiting forever.
+            for _, _, fut in pending:
+                if not fut.done():
+                    fut.set_result(None)
+            self._resolve_drain_queue()
 
     @staticmethod
     def _is_sentinel(item: tuple) -> bool:
-        """shutdown() pushes an empty-prompt sentinel to wake a parked
-        _run loop; real submits always carry a non-empty prompt."""
-        prompt, _, _ = item
-        return prompt == ""
+        """shutdown() pushes a (prompt="", _, fut=None) sentinel to wake a
+        parked _run loop. Real submits always carry a non-empty prompt AND
+        a non-None future, so either condition identifies a sentinel."""
+        prompt, _, fut = item
+        return prompt == "" or fut is None
 
     async def _flush(self, items: list[tuple[str, str, asyncio.Future]]):
         """Send one batched prompt to ollama_generate, parse the response,
@@ -321,9 +363,10 @@ class OllamaBatcher:
         background _run coroutine to finish. Safe to call multiple times."""
         self._shutdown = True
         # Push a sentinel so _run wakes from any pending get() even if the
-        # queue is empty.
-        sentinel = asyncio.get_running_loop().create_future()
-        await self._queue.put(("", "", sentinel))
+        # queue is empty. fut=None is the explicit "this is a wake-up
+        # token, not a real pending request" marker -- _resolve_drain_queue
+        # and the _is_sentinel check both treat None as such.
+        await self._queue.put(("", "", None))
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=drain_timeout)
@@ -334,19 +377,12 @@ class OllamaBatcher:
                     await self._task
                 except (asyncio.CancelledError, Exception):
                     pass
+        # Belt-and-suspenders: even if _run already drained via its finally
+        # block, sweep the queue once more so a submit() that landed during
+        # the shutdown race above doesn't end up holding a future that
+        # nothing will ever resolve.
+        self._resolve_drain_queue()
         self._task = None
-
-
-# Sentinel future used by shutdown to wake a parked _run() without
-# representing a real pending request.
-_SENTINEL_FUT: asyncio.Future = None  # type: ignore[assignment]
-
-
-def _make_sentinel_future() -> asyncio.Future:
-    global _SENTINEL_FUT
-    if _SENTINEL_FUT is None or _SENTINEL_FUT.done():
-        _SENTINEL_FUT = asyncio.get_running_loop().create_future()
-    return _SENTINEL_FUT
 
 
 async def _shutdown_all_batchers(drain_timeout: float = 5.0):
