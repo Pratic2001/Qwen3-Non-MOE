@@ -91,13 +91,11 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
     Keep queries short and specific (3-8 words), the same way you'd type
     into a search box.
 
-    IMPORTANT: never fails silently. If the search backend errors out or
-    returns zero hits after retries, this returns a single-item list
-    containing {"error": "...", "query": "..."} instead of an empty list
-    or a raised exception -- so the caller can distinguish "genuinely no
-    results" from "the search backend is broken/rate-limited," which used
-    to look identical and caused the agent to stall without ever printing
-    a warning.
+    IMPORTANT: never fails silently. If every backend errors out or
+    returns zero hits, this returns a single-item list containing
+    {"error": "...", "query": "..."} instead of an empty list or a raised
+    exception -- so the caller can distinguish "genuinely no results" from
+    "the search backend is broken/blocked."
     """
     from ddgs import DDGS  # imported lazily so the server still boots if the
                             # dependency isn't installed yet, with a clear error
@@ -106,33 +104,44 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
     except ImportError:
         DDGSException = Exception
 
-    # "auto" fans out to several engines (google/bing/brave/yandex/etc.)
-    # simultaneously, which is the most likely thing to get rate-limited or
-    # CAPTCHA'd at any real volume. Pinning to one backend is more reliable
-    # for sustained scraping. Override with the DDGS_BACKEND env var if one
-    # backend starts failing for you (try "bing", "brave", "mojeek", ...).
-    backend = os.environ.get("DDGS_BACKEND", "duckduckgo")
+    # "duckduckgo" is frequently hard-blocked outright on cloud/datacenter
+    # IPs (returns "No results found" regardless of query -- confirmed via
+    # diagnose_search.py). "auto" fans out to every engine at once, which
+    # is slow and more likely to trip rate limits under sustained load.
+    # Default to a short list of backends that have tested clean (no ad
+    # links mixed into results) and fall through in order. Override with
+    # DDGS_BACKENDS="brave,yandex" (comma-separated, tried in order) if
+    # your network blocks a different subset.
+    backends_env = os.environ.get("DDGS_BACKENDS")
+    backends = [b.strip() for b in backends_env.split(",")] if backends_env else \
+        ["brave", "yandex", "bing", "auto"]
 
     last_err = None
-    for attempt in range(3):
-        try:
-            results = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_results, backend=backend):
-                    results.append({
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                    })
-            if results:
-                return results
-            last_err = "search returned zero results (likely rate-limited or blocked)"
-        except DDGSException as e:
-            last_err = f"{type(e).__name__}: {e}"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff before retry
+    for backend in backends:
+        for attempt in range(2):
+            try:
+                results = []
+                with DDGS() as ddgs:
+                    for r in ddgs.text(query, max_results=max_results, backend=backend):
+                        url = r.get("href", "")
+                        # Bing mixes sponsored redirect links (bing.com/aclick)
+                        # into organic results -- drop those, they're ads,
+                        # not content, and the redirect won't extract cleanly.
+                        if "bing.com/aclick" in url:
+                            continue
+                        results.append({"title": r.get("title", ""), "url": url,
+                                         "snippet": r.get("body", "")})
+                if results:
+                    print(f"[web_search] {query!r} via backend={backend} -> {len(results)} hits", flush=True)
+                    return results
+                last_err = f"backend={backend} returned zero results (likely rate-limited/blocked)"
+            except DDGSException as e:
+                last_err = f"backend={backend}: {type(e).__name__}: {e}"
+            except Exception as e:
+                last_err = f"backend={backend}: {type(e).__name__}: {e}"
+            time.sleep(1)  # brief backoff before retrying same backend once
 
+    print(f"[web_search] {query!r} FAILED all backends -- {last_err}", flush=True)
     return [{"error": last_err or "unknown search failure", "query": query}]
 
 

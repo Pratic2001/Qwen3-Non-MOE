@@ -1,361 +1,252 @@
 #!/usr/bin/env python3
 """
-dataset_agent.py
+web_scraper_mcp/server.py
 
-A self-directed agent that never runs out of data: it uses a local Ollama
-model to plan search queries per category, calls the web_scraper MCP server
-to search + fetch + clean pages, filters/dedupes with the same rules as
-build_dataset.py, and writes JSONL shards + a manifest.json in the exact
-format your existing pack_dataset.py already consumes.
+An MCP server that gives an agent three tools for turning "I need more data
+about X" into clean text:
 
-Two output modes:
-    --mode pretrain   -> {"text": ..., "source": ..., "category": ...}
-                         (matches build_dataset.py / pack_dataset.py)
-    --mode sft        -> {"prompt": ..., "thinking": "", "answer": ...,
-                          "source": ..., "category": ...}
-                         (matches download_sft_data.py / pack_sft_data.py;
-                          "thinking" is left empty since raw web pages don't
-                          contain a CoT trace -- see README for how to
-                          backfill it with an Ollama-generated rationale)
+    web_search(query, max_results)  -> list of {title, url, snippet}
+    fetch_page(url)                 -> raw HTML (truncated) + status
+    extract_article(url)            -> cleaned main-content text via
+                                        trafilatura (falls back to
+                                        readability-lxml, then a raw-text
+                                        strip) + basic metadata
 
-Usage:
-    ollama pull llama3.1                     # or any instruct model you like
-    python dataset_agent.py --target-size 500MB --mode pretrain \
-        --categories web,knowledge,reasoning --out-dir ./data
+Design notes:
+- Search uses DuckDuckGo's HTML endpoint (via the `ddgs` package) so no API
+  key is required. Swap in Bing/Serper/Tavily here if you have a key and
+  want higher reliability at scale -- the tool signature doesn't change.
+- Everything is read-only / GET-only. This server does not click buttons,
+  submit forms, or execute JS, so it can't be used to take actions on the
+  scraped sites -- just to read public pages.
+- Respects robots.txt via a small in-process cache, and rate-limits by host
+  so the agent can't accidentally hammer one domain.
 
-    python dataset_agent.py --target-size 200MB --mode sft \
-        --categories math,code,reasoning,science --out-dir ./sft_data
-
-Requires the web_scraper_mcp server (see ../web_scraper_mcp/server.py) and
-an Ollama daemon running locally (default http://localhost:11434).
+Run with:
+    python server.py                # stdio transport, for MCP-aware clients
 """
 
-import argparse
 import asyncio
-import json
 import os
-import sys
 import time
-from contextlib import AsyncExitStack
+import urllib.parse
+import urllib.robotparser
 from typing import Optional
 
 import httpx
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.server.fastmcp import FastMCP
 
-sys.path.insert(0, os.path.dirname(__file__))
-from quality import (
-    ExactDedup, NearDedup, ShardWriter,
-    passes_prose_quality_filter, passes_code_quality_filter,
+mcp = FastMCP(
+    "web-scraper",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
 )
-from topics import TOPIC_SEEDS
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
+USER_AGENT = "Mozilla/5.0 (compatible; DatasetResearchBot/1.0; +https://example.com/bot)"
 
-DEFAULT_MIX = {
-    "web": 0.35,
-    "knowledge": 0.20,
-    "reasoning": 0.20,
-    "code": 0.15,
-    "math": 0.10,
-}
+_robots_cache: dict = {}
+_last_request_time: dict = {}
+MIN_SECONDS_BETWEEN_REQUESTS_PER_HOST = 2.0
 
 
-# ---------------------------------------------------------------------------
-# Ollama calls
-# ---------------------------------------------------------------------------
-
-async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }
-    if system:
-        payload["system"] = system
-    if json_mode:
-        payload["format"] = "json"
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "")
+def _host(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc
 
 
-async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
-    """Ask the local model for fresh, specific search queries for a category,
-    steering away from topics already covered so the corpus keeps expanding
-    instead of circling the same few queries."""
-    avoid = ", ".join(recent_topics[-30:]) if recent_topics else "(none yet)"
-    system = (
-        "You generate web search queries for building a language-model "
-        "training corpus. Return ONLY a JSON object: "
-        '{"queries": ["...", "..."]}. Queries must be short (3-8 words), '
-        "specific, and diverse -- avoid vague single-word queries."
-    )
-    prompt = (
-        f"Category: {category}\n"
-        f"Seed topics for this category: {', '.join(TOPIC_SEEDS.get(category, [category]))}\n"
-        f"Recently used queries (avoid repeating/near-duplicating these): {avoid}\n"
-        f"Generate {n} new, specific search queries for this category."
-    )
-    try:
-        raw = await ollama_generate(prompt, system=system, json_mode=True)
-        data = json.loads(raw)
-        queries = data.get("queries", [])
-        return [q.strip() for q in queries if isinstance(q, str) and q.strip()][:n]
-    except Exception as e:
-        print(f"[warn] plan_queries failed ({e}), falling back to seed topics")
-        return TOPIC_SEEDS.get(category, [category])[:n]
-
-
-async def judge_quality(text: str, category: str) -> bool:
-    """LLM-based quality gate, applied AFTER the cheap heuristic filters
-    (which catch the obvious junk for free). Only invoked on documents that
-    already passed the heuristics, to keep the number of LLM calls bounded.
-    Returns True if the model says this is usable training data."""
-    system = (
-        "You judge whether a scraped web document is high-quality training "
-        "data for a language model. Reject: boilerplate, ads/nav menus, "
-        "listicles with no substance, spam, incoherent machine-translated "
-        "text, or content that's mostly links/references with little prose. "
-        f"Accept substantive {category} content. "
-        'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
-    )
-    snippet = text[:3000]
-    try:
-        raw = await ollama_generate(snippet, system=system, json_mode=True)
-        data = json.loads(raw)
-        return bool(data.get("keep", False))
-    except Exception:
-        # If the judge fails/times out, don't block the pipeline on it --
-        # fall back to trusting the heuristic filters alone.
+def _robots_allowed(url: str) -> bool:
+    host = _host(url)
+    if host not in _robots_cache:
+        rp = urllib.robotparser.RobotFileParser()
+        robots_url = f"{urllib.parse.urlparse(url).scheme}://{host}/robots.txt"
+        try:
+            resp = httpx.get(robots_url, timeout=5, headers={"User-Agent": USER_AGENT})
+            rp.parse(resp.text.splitlines())
+        except Exception:
+            # If robots.txt can't be fetched, default to allow (matches
+            # standard crawler behavior) but still respect rate limiting.
+            _robots_cache[host] = None
+            return True
+        _robots_cache[host] = rp
+    rp = _robots_cache[host]
+    if rp is None:
         return True
+    return rp.can_fetch(USER_AGENT, url)
 
 
-async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
-    """For --mode sft: turn a scraped article into a (prompt, answer) pair
-    by having the model pose a question the article answers, and produce a
-    concise answer grounded in the text. Returns None if the article doesn't
-    cleanly support this (e.g. pure narrative with no answerable question)."""
-    system = (
-        "You convert a source article into ONE high-quality instruction-"
-        "tuning example. Ask a specific, well-posed question that the "
-        "article answers, then answer it accurately using ONLY information "
-        "in the article, in your own words (do not quote the article "
-        'verbatim). Respond ONLY with JSON: '
-        '{"prompt": "...", "answer": "..."} or {"prompt": null} if no good '
-        "question/answer pair exists in this text."
-    )
+async def _rate_limit(url: str):
+    host = _host(url)
+    now = time.monotonic()
+    last = _last_request_time.get(host, 0)
+    wait = MIN_SECONDS_BETWEEN_REQUESTS_PER_HOST - (now - last)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_request_time[host] = time.monotonic()
+
+
+@mcp.tool()
+def web_search(query: str, max_results: int = 10) -> list[dict]:
+    """Search the public web and return title/url/snippet hits.
+
+    Use this to discover candidate pages for a topic before fetching them.
+    Keep queries short and specific (3-8 words), the same way you'd type
+    into a search box.
+
+    IMPORTANT: never fails silently. If every backend errors out or
+    returns zero hits, this returns a single-item list containing
+    {"error": "...", "query": "..."} instead of an empty list or a raised
+    exception -- so the caller can distinguish "genuinely no results" from
+    "the search backend is broken/blocked."
+    """
+    from ddgs import DDGS  # imported lazily so the server still boots if the
+                            # dependency isn't installed yet, with a clear error
     try:
-        raw = await ollama_generate(text[:6000], system=system, json_mode=True)
-        data = json.loads(raw)
-        if not data.get("prompt") or not data.get("answer"):
-            return None
-        return {"prompt": data["prompt"].strip(), "thinking": "", "answer": data["answer"].strip()}
-    except Exception:
-        return None
+        from ddgs.exceptions import DDGSException
+    except ImportError:
+        DDGSException = Exception
 
+    # "duckduckgo" is frequently hard-blocked outright on cloud/datacenter
+    # IPs (returns "No results found" regardless of query -- confirmed via
+    # diagnose_search.py). "auto" fans out to every engine at once, which
+    # is slow and more likely to trip rate limits under sustained load.
+    # Default to a short list of backends that have tested clean (no ad
+    # links mixed into results) and fall through in order. Override with
+    # DDGS_BACKENDS="brave,yandex" (comma-separated, tried in order) if
+    # your network blocks a different subset.
+    backends_env = os.environ.get("DDGS_BACKENDS")
+    backends = [b.strip() for b in backends_env.split(",")] if backends_env else \
+        ["brave", "yandex", "bing", "auto"]
 
-# ---------------------------------------------------------------------------
-# MCP tool wrappers
-# ---------------------------------------------------------------------------
-
-class ScraperClient:
-    def __init__(self, session: ClientSession):
-        self.session = session
-
-    async def search(self, query: str, max_results: int = 8) -> list:
-        result = await self.session.call_tool("web_search", {"query": query, "max_results": max_results})
-        return _first_json(result)
-
-    async def extract(self, url: str) -> dict:
-        result = await self.session.call_tool("extract_article", {"url": url})
-        return _first_json(result)
-
-
-def _first_json(tool_result):
-    for block in tool_result.content:
-        if hasattr(block, "text"):
+    last_err = None
+    for backend in backends:
+        for attempt in range(2):
             try:
-                return json.loads(block.text)
-            except Exception:
-                return block.text
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Main crawl loop
-# ---------------------------------------------------------------------------
-
-async def run_category(scraper: ScraperClient, category: str, byte_budget: int, out_dir: str,
-                        mode: str, min_doc_chars: int, use_llm_judge: bool):
-    writer = ShardWriter(out_dir, category)
-    exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
-    near_dedup = NearDedup()
-
-    seen_urls = set()
-    used_queries = []
-    n_filtered_quality = 0
-    n_filtered_dup = 0
-    n_llm_rejected = 0
-    last_report = time.time()
-
-    print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB (live web scraping) ===")
-
-    stall_rounds = 0
-    while writer.total_bytes < byte_budget:
-        queries = await plan_queries(category, used_queries, n=6)
-        used_queries.extend(queries)
-        progressed_this_round = False
-
-        for query in queries:
-            if writer.total_bytes >= byte_budget:
-                break
-            try:
-                hits = await scraper.search(query, max_results=8)
+                results = []
+                with DDGS() as ddgs:
+                    for r in ddgs.text(query, max_results=max_results, backend=backend):
+                        url = r.get("href", "")
+                        # Bing mixes sponsored redirect links (bing.com/aclick)
+                        # into organic results -- drop those, they're ads,
+                        # not content, and the redirect won't extract cleanly.
+                        if "bing.com/aclick" in url:
+                            continue
+                        results.append({"title": r.get("title", ""), "url": url,
+                                         "snippet": r.get("body", "")})
+                if results:
+                    print(f"[web_search] {query!r} via backend={backend} -> {len(results)} hits", flush=True)
+                    return results
+                last_err = f"backend={backend} returned zero results (likely rate-limited/blocked)"
+            except DDGSException as e:
+                last_err = f"backend={backend}: {type(e).__name__}: {e}"
             except Exception as e:
-                print(f"\n[warn] search failed for {query!r}: {e}")
-                continue
-            if not isinstance(hits, list):
-                continue
+                last_err = f"backend={backend}: {type(e).__name__}: {e}"
+            time.sleep(1)  # brief backoff before retrying same backend once
 
-            for hit in hits:
-                url = hit.get("url") if isinstance(hit, dict) else None
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-
-                try:
-                    article = await scraper.extract(url)
-                except Exception as e:
-                    print(f"\n[warn] extract failed for {url}: {e}")
-                    continue
-                if not article or article.get("error") or not article.get("text"):
-                    continue
-
-                text = article["text"]
-
-                if category == "code":
-                    ok = passes_code_quality_filter(text, url, min_doc_chars)
-                else:
-                    ok = passes_prose_quality_filter(text, min_doc_chars)
-                if not ok:
-                    n_filtered_quality += 1
-                    continue
-
-                if exact_dedup.is_duplicate(text) or near_dedup.is_near_duplicate(text):
-                    n_filtered_dup += 1
-                    continue
-
-                if use_llm_judge:
-                    keep = await judge_quality(text, category)
-                    if not keep:
-                        n_llm_rejected += 1
-                        continue
-
-                if mode == "sft":
-                    pair = await extract_sft_pair(text, category)
-                    if pair is None:
-                        continue
-                    record = {**pair, "source": url, "category": category}
-                else:
-                    record = {"text": text, "source": url, "category": category}
-
-                writer.write(record)
-                progressed_this_round = True
-
-                if writer.total_bytes >= byte_budget:
-                    break
-
-                if time.time() - last_report > 5:
-                    pct = 100 * writer.total_bytes / byte_budget
-                    print(f"[{category}] {writer.total_bytes / 1024**2:8.2f} MB "
-                          f"/ {byte_budget / 1024**2:.1f} MB  ({pct:5.1f}%)  "
-                          f"docs={writer.total_docs}  "
-                          f"filtered(quality={n_filtered_quality},dup={n_filtered_dup},"
-                          f"llm={n_llm_rejected})", end="\r")
-                    last_report = time.time()
-
-        if not progressed_this_round:
-            stall_rounds += 1
-            if stall_rounds >= 5:
-                print(f"\n[{category}] no progress after 5 query rounds -- stopping early "
-                      f"at {writer.total_bytes / 1024**2:.1f} MB")
-                break
-        else:
-            stall_rounds = 0
-
-    print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
-          f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s), "
-          f"filtered {n_filtered_quality} low-quality + {n_filtered_dup} duplicate + "
-          f"{n_llm_rejected} llm-rejected")
-    writer.close()
-    return writer.total_bytes, writer.total_docs
+    print(f"[web_search] {query!r} FAILED all backends -- {last_err}", flush=True)
+    return [{"error": last_err or "unknown search failure", "query": query}]
 
 
-async def main_async(args):
-    target_bytes = _parse_size(args.target_size)
-    categories = args.categories.split(",") if args.categories else list(DEFAULT_MIX.keys())
-    mix = {c: DEFAULT_MIX.get(c, 1.0 / len(categories)) for c in categories}
-    total_frac = sum(mix.values())
-    mix = {c: f / total_frac for c, f in mix.items()}
+@mcp.tool()
+async def fetch_page(url: str, max_chars: int = 200_000) -> dict:
+    """Fetch the raw content at a URL (GET only). Honors robots.txt and a
+    per-host rate limit. Returns {status, content_type, html, error}."""
+    if not _robots_allowed(url):
+        return {"status": None, "content_type": None, "html": "", "error": "disallowed by robots.txt"}
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    server_path = os.path.join(os.path.dirname(__file__), "..", "web_scraper_mcp", "server.py")
-    server_params = StdioServerParameters(command=sys.executable, args=[server_path])
-
-    manifest_path = os.path.join(args.out_dir, "manifest.json")
-    manifest = {"target_bytes": target_bytes, "mix": mix, "categories": {}, "mode": args.mode}
-
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            scraper = ScraperClient(session)
-
-            for category, frac in mix.items():
-                budget = int(target_bytes * frac)
-                if budget <= 0:
-                    continue
-                actual_bytes, docs = await run_category(
-                    scraper, category, budget, args.out_dir, args.mode,
-                    args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
-                )
-                manifest["categories"][category] = {
-                    "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
-                }
-
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    total_actual = sum(c["actual_bytes"] for c in manifest["categories"].values())
-    print(f"\n=== Done. Total: {total_actual / 1024**2:.2f} MB across "
-          f"{len(manifest['categories'])} categories ===")
-    print(f"Manifest written to {manifest_path}")
+    await _rate_limit(url)
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15,
+                                      headers={"User-Agent": USER_AGENT}) as client:
+            resp = await client.get(url)
+        content_type = resp.headers.get("content-type", "")
+        if "text" not in content_type and "html" not in content_type:
+            return {"status": resp.status_code, "content_type": content_type,
+                     "html": "", "error": "non-text content-type, skipped"}
+        return {"status": resp.status_code, "content_type": content_type,
+                 "html": resp.text[:max_chars], "error": None}
+    except Exception as e:
+        return {"status": None, "content_type": None, "html": "", "error": str(e)}
 
 
-def _parse_size(size_str: str) -> int:
-    size_str = size_str.strip().upper()
-    units = {"GB": 1024**3, "MB": 1024**2, "KB": 1024, "B": 1}
-    for unit, mult in units.items():
-        if size_str.endswith(unit):
-            return int(float(size_str[: -len(unit)]) * mult)
-    return int(float(size_str))
+@mcp.tool()
+async def extract_article(url: str) -> dict:
+    """Fetch a URL and extract clean main-content text (nav/ads/boilerplate
+    stripped), using trafilatura with a readability-lxml fallback.
+
+    Returns {title, text, author, date, url, error}. `text` is empty and
+    `error` is set if extraction fails or robots.txt disallows the fetch.
+    """
+    page = await fetch_page(url)
+    if page["error"] or not page["html"]:
+        return {"title": None, "text": "", "author": None, "date": None,
+                "url": url, "error": page["error"] or "empty page"}
+
+    html = page["html"]
+
+    try:
+        import trafilatura
+        text = trafilatura.extract(html, url=url, favor_recall=True,
+                                    include_comments=False, include_tables=True)
+        meta = trafilatura.extract_metadata(html)
+        title = meta.title if meta else None
+        author = meta.author if meta else None
+        date = meta.date if meta else None
+        if text and len(text.strip()) > 200:
+            return {"title": title, "text": text.strip(), "author": author,
+                    "date": date, "url": url, "error": None}
+    except Exception:
+        pass
+
+    # Fallback: readability-lxml gets the main content div even when
+    # trafilatura's heuristics miss (common on forum / doc-site layouts).
+    try:
+        from readability import Document
+        import re as _re
+        doc = Document(html)
+        title = doc.title()
+        summary_html = doc.summary()
+        text = _re.sub(r"<[^>]+>", " ", summary_html)
+        text = _re.sub(r"\s+", " ", text).strip()
+        if text and len(text) > 200:
+            return {"title": title, "text": text, "author": None, "date": None,
+                     "url": url, "error": None}
+    except Exception:
+        pass
+
+    return {"title": None, "text": "", "author": None, "date": None,
+            "url": url, "error": "extraction failed"}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Live-scraping infinite dataset agent (Ollama + MCP).")
-    parser.add_argument("--target-size", required=True, help="e.g. 500MB, 2GB")
-    parser.add_argument("--out-dir", default="./data")
-    parser.add_argument("--categories", default=None,
-                         help="Comma-separated, e.g. web,knowledge,reasoning,code,math")
-    parser.add_argument("--mode", choices=["pretrain", "sft"], default="pretrain")
-    parser.add_argument("--min-doc-chars", type=int, default=500)
-    parser.add_argument("--no-llm-judge", action="store_true",
-                         help="Skip the Ollama quality-judging pass, keep only heuristic filters (faster)")
-    args = parser.parse_args()
-    asyncio.run(main_async(args))
+@mcp.tool()
+def healthcheck() -> dict:
+    """Cheap connectivity/config probe -- call this from an orchestrator
+    (n8n Cron job, OpenClaw `probe`, a monitoring workflow, etc.) before
+    kicking off a real scrape, or on a schedule to catch a broken search
+    backend before it silently eats a whole run. Does NOT do a full search;
+    just reports whether the search dependency imports and which backend
+    is configured, and whether robots.txt fetching works against a known-
+    reachable host.
+    """
+    import importlib
+    report = {"ddgs_importable": False, "ddgs_backend": os.environ.get("DDGS_BACKEND", "duckduckgo"),
+               "robots_check_ok": False, "error": None}
+    try:
+        importlib.import_module("ddgs")
+        report["ddgs_importable"] = True
+    except Exception as e:
+        report["error"] = f"ddgs import failed: {e}"
+        return report
+    try:
+        report["robots_check_ok"] = _robots_allowed("https://example.com/")
+    except Exception as e:
+        report["error"] = f"robots check failed: {e}"
+    return report
 
 
 if __name__ == "__main__":
-    main()
+    # Default stdio keeps `dataset_agent.py`'s stdio_client working unchanged.
+    # Set MCP_TRANSPORT=streamable-http (plus optionally MCP_HOST/MCP_PORT)
+    # to expose this as an HTTP endpoint instead, e.g. for n8n's MCP Client
+    # Tool node or OpenClaw's `openclaw mcp` bridge, which both speak HTTP/SSE
+    # rather than spawning the process themselves over stdio.
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
