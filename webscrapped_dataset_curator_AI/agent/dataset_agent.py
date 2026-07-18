@@ -484,6 +484,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
         "sources": {"huggingface", "kaggle"},       # which backends are on
         "hf_datasets": {category: [dataset_id, ...]},   # explicit ids, optional
         "kaggle_datasets": {category: [ref, ...]},      # explicit refs, optional
+        "blacklist_datasets": {category: [dataset_id_or_ref, ...]},  # excluded ids/refs, optional
         "max_rows_per_dataset": int,
         "discover_limit": int,                          # datasets to auto-discover per category
         "keep_raw_staging": bool,                       # keep the staged JSONL after filtering
@@ -497,6 +498,18 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     HF/Kaggle's dataset search does simple keyword matching against
     dataset names/tags, so a full sentence like "calculus integration by
     parts examples" matches nothing and silently discovers zero datasets.
+
+    `blacklist_datasets` (same {category: [...]} / bare-list-applies-to-
+    every-category shape as hf_datasets/kaggle_datasets, matched
+    case-insensitively) excludes dataset ids/refs everywhere they could
+    otherwise enter a run: filtered out of an explicit --hf-datasets/
+    --kaggle-datasets list, AND skipped during auto-discovery so a
+    blacklisted hit doesn't consume one of that category's
+    discover_limit slots -- discovery keeps trying further keywords to
+    backfill instead. Use this to permanently exclude a dataset you've
+    found to be low-quality, mislabeled, or otherwise unwanted, without
+    having to touch --hf-datasets/--kaggle-datasets for every category
+    that happens to auto-discover it.
     """
     sem = asyncio.Semaphore(concurrency)
 
@@ -514,18 +527,32 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     def _lookup(cat_map: dict) -> Optional[list]:
         return cat_map.get(category) or cat_map.get("__all__")
 
+    blacklist = {i.strip().lower() for i in (_lookup(public_cfg.get("blacklist_datasets", {})) or [])}
+    if blacklist:
+        log.info(f"[public:{category}] blacklist active ({len(blacklist)} entries): {sorted(blacklist)}")
+
+    def _drop_blacklisted(ids: list, label: str) -> list:
+        kept = [i for i in ids if i.lower() not in blacklist]
+        skipped = [i for i in ids if i.lower() in blacklist]
+        if skipped:
+            log.info(f"[{label}:{category}] blacklisted, skipping: {skipped}")
+        return kept
+
     async def _discover(discover_fn, label: str) -> list:
         """Try each short keyword in turn, merging/deduping hits (in
         discovery order) until discover_limit distinct ids/refs are found
         or every keyword's been tried. Logs what each individual keyword
         turned up so a bad keyword is visible in the log instead of just
-        silently contributing nothing."""
+        silently contributing nothing. Blacklisted hits are dropped
+        before counting toward discover_limit, so a blacklisted dataset
+        doesn't waste a discovery slot -- more keywords get tried instead."""
         found: list = []
         for kw in search_keywords:
             if len(found) >= discover_limit:
                 break
             hits = await asyncio.to_thread(discover_fn, kw, discover_limit - len(found))
             log.info(f"[{label}:{category}] keyword {kw!r} -> {hits}")
+            hits = _drop_blacklisted(hits, label)
             for h in hits:
                 if h not in found:
                     found.append(h)
@@ -541,7 +568,9 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     with open(staging_path, "w") as fh:
         if "huggingface" in public_cfg.get("sources", set()):
             hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
-            if not hf_ids:
+            if hf_ids:
+                hf_ids = _drop_blacklisted(hf_ids, "public-hf")
+            else:
                 hf_ids = await _discover(public_sources.discover_hf_datasets, "public-hf")
                 log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
             for ds_id in hf_ids:
@@ -559,7 +588,9 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
 
         if "kaggle" in public_cfg.get("sources", set()) and raw_bytes_downloaded < byte_budget:
             kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
-            if not kg_refs:
+            if kg_refs:
+                kg_refs = _drop_blacklisted(kg_refs, "public-kaggle")
+            else:
                 kg_refs = await _discover(public_sources.discover_kaggle_datasets, "public-kaggle")
                 log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
             for ref in kg_refs:
@@ -837,6 +868,7 @@ async def main_async(args):
             "sources": public_source_set,
             "hf_datasets": _parse_category_map(args.hf_datasets),
             "kaggle_datasets": _parse_category_map(args.kaggle_datasets),
+            "blacklist_datasets": _parse_category_map(args.blacklist_datasets),
             "max_rows_per_dataset": args.public_max_rows,
             "discover_limit": args.public_discover_limit,
             "public_only": args.public_only,
@@ -994,6 +1026,18 @@ def main():
                               "--hf-datasets. Requires KAGGLE_USERNAME/KAGGLE_KEY env vars (or "
                               "~/.kaggle/kaggle.json). If omitted, refs are auto-discovered per "
                               "category via Kaggle's search API.")
+    public.add_argument("--blacklist-datasets", default=None,
+                         help="Dataset ids/refs to exclude, same 'category=id1,id2;category2=id3' "
+                              "syntax as --hf-datasets (or a bare 'id1,id2' to blacklist everywhere). "
+                              "Matched case-insensitively against both HF dataset ids and Kaggle "
+                              "owner/dataset-slug refs. Applies to explicit --hf-datasets/"
+                              "--kaggle-datasets entries AND auto-discovered ones -- a blacklisted "
+                              "hit is dropped before it counts toward --public-discover-limit, so "
+                              "discovery tries further keywords to backfill instead of just running "
+                              "one slot short. Use this to permanently exclude a dataset you've found "
+                              "to be low-quality, mislabeled, gated/inaccessible, or otherwise "
+                              "unwanted, without editing --hf-datasets/--kaggle-datasets by hand for "
+                              "every category that happens to auto-discover it.")
     public.add_argument("--public-max-rows", type=int, default=500,
                          help="Max rows to pull per dataset during the raw-download phase (default "
                               "500) -- a per-dataset safety ceiling, separate from the overall "
