@@ -368,6 +368,48 @@ def extract_image(data: bytes, url: str = "") -> dict:
 # Video / audio (captions preferred, ASR transcription fallback)
 # ---------------------------------------------------------------------------
 
+class _YtdlpNullLogger:
+    """Swallows yt-dlp's debug/warning/error output instead of letting it
+    hit stderr. `quiet: True` alone only suppresses yt-dlp's normal
+    progress/info output -- warnings (e.g. "No supported JavaScript
+    runtime could be found") still print unless a logger is supplied that
+    drops them too. Keeps the MCP subprocess's stderr clean so operators
+    aren't left wondering whether a WARNING line means the extraction
+    actually failed (it usually didn't -- captions/metadata still come
+    through fine without a JS runtime; only some signature-gated video/
+    audio formats used by the ASR-fallback download path are affected)."""
+
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+def _ytdlp_base_opts(**overrides) -> dict:
+    """Shared yt-dlp options for both the caption-fetch and audio-download
+    paths: quiet + null logger (see above), plus an optional JS runtime
+    (deno/node/bun/etc.) if the operator has one installed and points to
+    it via YTDLP_JS_RUNTIME (e.g. `YTDLP_JS_RUNTIME=deno` or a full
+    `name:/path/to/binary`). YouTube increasingly requires executing a bit
+    of JS to derive signatures for some formats; without a runtime yt-dlp
+    still works for captions/metadata (as seen in practice) but may miss
+    some audio/video formats used by the ASR-fallback download path -- see
+    https://github.com/yt-dlp/yt-dlp/wiki/EJS for install options."""
+    opts = {"quiet": True, "no_warnings": True, "logger": _YtdlpNullLogger()}
+    js_runtime = os.environ.get("YTDLP_JS_RUNTIME")
+    if js_runtime:
+        opts["extractor_args"] = {"youtube": {"jsruntime": [js_runtime]}}
+    opts.update(overrides)
+    return opts
+
+
 def extract_video(url: str, prefer_captions: bool = True,
                    asr_fallback: bool = True, asr_model_size: str = "base",
                    max_duration_seconds: int = 3600) -> dict:
@@ -391,10 +433,9 @@ def extract_video(url: str, prefer_captions: bool = True,
 
     info = None
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True,
-                                "writesubtitles": prefer_captions,
-                                "writeautomaticsub": prefer_captions,
-                                "subtitleslangs": ["en"]}) as ydl:
+        with yt_dlp.YoutubeDL(_ytdlp_base_opts(
+                skip_download=True, writesubtitles=prefer_captions,
+                writeautomaticsub=prefer_captions, subtitleslangs=["en"])) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         return _result(url=url, content_type="video", error=f"yt-dlp metadata fetch failed: {e}")
@@ -488,12 +529,10 @@ def _transcribe_via_ytdlp_audio(url: str, title, author, date, duration,
     with tempfile.TemporaryDirectory() as tmp:
         out_template = os.path.join(tmp, "audio.%(ext)s")
         try:
-            with yt_dlp.YoutubeDL({
-                "quiet": True, "format": "bestaudio/best",
-                "outtmpl": out_template,
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                     "preferredcodec": "wav"}],
-            }) as ydl:
+            with yt_dlp.YoutubeDL(_ytdlp_base_opts(
+                    format="bestaudio/best", outtmpl=out_template,
+                    postprocessors=[{"key": "FFmpegExtractAudio",
+                                      "preferredcodec": "wav"}])) as ydl:
                 ydl.download([url])
         except Exception as e:
             return _result(url=url, content_type="video",

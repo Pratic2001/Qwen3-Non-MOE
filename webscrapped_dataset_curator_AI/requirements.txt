@@ -28,6 +28,19 @@ Pillow>=10.0
 # system binary ffmpeg on PATH.
 yt-dlp>=2024.1
 faster-whisper>=1.0
+# yt-dlp pulls in `requests` transitively. An old `requests` paired with a
+# newer urllib3/charset-normalizer prints a noisy (harmless) "doesn't match
+# a supported version" RequestsDependencyWarning on every run -- pinning a
+# current `requests` here avoids that.
+requests>=2.32
+# Recommended for full-fidelity YouTube extraction: yt-dlp needs a JS
+# runtime to derive signatures for some formats; without one it logs a
+# warning (now silenced, see extractors.py) and captions/metadata still
+# work, but some audio formats used by the ASR-fallback path may be
+# missing. Install deno (https://deno.land) or Node.js, then point yt-dlp
+# at it with the YTDLP_JS_RUNTIME env var, e.g. YTDLP_JS_RUNTIME=deno or
+# YTDLP_JS_RUNTIME=node:/path/to/node. Not a pip package, so not listed
+# below -- install it via your OS package manager / deno's installer.
 
 # --- Optional but recommended once a run exceeds ~10k-100k docs/category ---
 # Real MinHash+LSH near-dedup. Without this, quality.NearDedup() falls back
