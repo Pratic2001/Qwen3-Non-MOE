@@ -129,16 +129,55 @@ def discover_hf_datasets(query: str, limit: int = 5) -> list:
         return []
 
 
+def discover_hf_configs(dataset_id: str, token: Optional[str] = None) -> list:
+    """Returns every config/subset name a HF dataset exposes (e.g.
+    hendrycks_math -> ['algebra', 'counting_and_probability', 'geometry',
+    ...]), so callers can pull from ALL partitions instead of guessing one.
+    Falls back to [None] (meaning "just use the dataset's single/default
+    config") if the `datasets` package is missing, the dataset genuinely
+    has only one unnamed config, or the listing call fails for any reason
+    -- config discovery is a best-effort enrichment, never a hard
+    requirement, so a lookup failure degrades to old single-config
+    behavior rather than dropping the dataset entirely."""
+    try:
+        from datasets import get_dataset_config_names
+    except ImportError:
+        return [None]
+    try:
+        configs = get_dataset_config_names(dataset_id, token=token)
+        return list(configs) if configs else [None]
+    except Exception as e:
+        log.warning(f"[hf] could not list configs for {dataset_id}: {e} "
+                     f"-- falling back to default config only")
+        return [None]
+
+
 def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str] = None,
                        config: Optional[str] = None) -> Iterator[dict]:
     """Yields normalized records from a Hugging Face dataset via streaming
     mode (no full download to disk, no waiting for the whole dataset to
-    materialize). Stops after max_rows or when the split is exhausted,
-    whichever comes first. Any failure (gated dataset needing HF_TOKEN,
-    dataset doesn't exist, no `datasets` package, unknown split/config)
-    yields a single {"error": ...} record and returns, rather than raising
-    -- consistent with how extract_content reports failures to the agent
-    loop, so one bad dataset id doesn't kill a whole category's run."""
+    materialize).
+
+    Many datasets (hendrycks_math, mmlu, glue, ...) are split into several
+    named configs/subsets, each a *separate* partition that
+    `load_dataset(dataset_id, split=...)` alone will NOT enumerate -- you
+    have to pass the config name explicitly, e.g.
+    `load_dataset("EleutherAI/hendrycks_math", "algebra")`. If `config` is
+    not given explicitly, this function first calls `discover_hf_configs()`
+    to find every available partition and pulls from each of them
+    (fair-sharing `max_rows` across configs) instead of silently loading
+    only whichever one happens to work first -- otherwise a category like
+    "math" would only ever see one subset's worth of rows even though
+    several were available.
+
+    Stops after max_rows (summed across all configs pulled) or when every
+    config/split combination has been exhausted or failed, whichever comes
+    first. Any total failure (gated dataset needing HF_TOKEN, dataset
+    doesn't exist, no `datasets` package, no split/config combination
+    loads) yields a single {"error": ...} record and returns, rather than
+    raising -- consistent with how extract_content reports failures to the
+    agent loop, so one bad dataset id doesn't kill a whole category's
+    run."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -150,36 +189,55 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
 
     token = os.environ.get("HF_TOKEN")
     tried_splits = [split] if split else ["train", "test", "validation"]
-    ds = None
+    configs_to_try = [config] if config else discover_hf_configs(dataset_id, token)
+    if config is None and configs_to_try != [None]:
+        log.info(f"[hf] {dataset_id} has {len(configs_to_try)} config(s): {configs_to_try}")
+
+    # Fair-share max_rows across every discovered config so e.g. algebra
+    # doesn't eat the whole per-dataset budget before geometry/probability
+    # ever get a turn -- each config gets an even slice; a slice a config
+    # under-uses (exhausted early / failed to load) is left unclaimed
+    # rather than silently reassigned, so the accounting stays simple.
+    per_config_cap = max(1, max_rows // len(configs_to_try))
+
+    count = 0
+    any_success = False
     last_err = None
-    for cfg_attempt in ([config] if config else [None]):
+    for cfg_attempt in configs_to_try:
+        if count >= max_rows:
+            break
+        ds = None
+        used_split = None
         for s in tried_splits:
             try:
                 ds = load_dataset(dataset_id, cfg_attempt, split=s, streaming=True, token=token)
-                split = s
+                used_split = s
                 break
             except Exception as e:
                 last_err = e
                 continue
-        if ds is not None:
-            break
+        if ds is None:
+            log.warning(f"[hf] could not load config {cfg_attempt!r} of {dataset_id}: {last_err}")
+            continue
 
-    if ds is None:
+        any_success = True
+        cfg_count = 0
+        cfg_label = f":{cfg_attempt}" if cfg_attempt else ""
+        for row in ds:
+            if count >= max_rows or cfg_count >= per_config_cap:
+                break
+            if not isinstance(row, dict):
+                continue
+            ref = f"hf://{dataset_id}{cfg_label}#{used_split}:{cfg_count}"
+            yield row_to_record(row, "huggingface", dataset_id, ref)
+            count += 1
+            cfg_count += 1
+
+    if not any_success:
         yield {"title": None, "text": "", "author": None, "date": None,
                "content_type": "dataset_row", "url": f"hf://{dataset_id}",
-               "error": f"could not load any split of {dataset_id}: {last_err}",
+               "error": f"could not load any split/config of {dataset_id}: {last_err}",
                "extra": {"source": "huggingface", "dataset": dataset_id}}
-        return
-
-    count = 0
-    for row in ds:
-        if count >= max_rows:
-            break
-        if not isinstance(row, dict):
-            continue
-        ref = f"hf://{dataset_id}#{split}:{count}"
-        yield row_to_record(row, "huggingface", dataset_id, ref)
-        count += 1
 
 
 # ---------------------------------------------------------------------------
