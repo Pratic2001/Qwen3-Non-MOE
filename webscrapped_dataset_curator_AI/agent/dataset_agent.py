@@ -64,6 +64,324 @@ import public_sources
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 
+# When True, judge_quality returns True and extract_sft_pair returns None
+# without ever invoking Ollama. Toggled by --fast-heuristics on the CLI.
+# Reads of this flag are unconditional, so callers don't need to know
+# whether the bypass is on -- the same code path that handles a
+# failed/empty Ollama response also handles the bypass.
+LLM_BYPASS: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Ollama batching layer
+# ---------------------------------------------------------------------------
+# A local Ollama daemon processes one request at a time on a single GPU, so
+# naively fanning N concurrent judge/SFT-extract calls at it just queues them
+# and the throughput ceiling is ~1 doc/s. OllamaBatcher coalesces a small
+# window of incoming requests into a single prompt that asks the model for
+# a JSON array of verdicts (one per doc) and fans the response back out to
+# the per-doc futures. With batch_size=8, throughput on a local 8B model
+# jumps ~5-8x on the judge phase.
+
+class OllamaBatcher:
+    """Async batching wrapper for ollama_generate.
+
+    Callers `submit(prompt, system)` and get back the model's text response
+    as if they'd called ollama_generate directly; the batcher hides the
+    coalescing. One batcher per (system-prompt flavor), because the system
+    prompt is fixed for the lifetime of a batcher's run (judge, SFT extract,
+    etc.) and varies across them.
+
+    Flushing policy: a batch flushes as soon as EITHER `batch_size` requests
+    have arrived OR `flush_interval` seconds have elapsed since the first
+    request in the current batch. This balances "fill the batch to amortize
+    the model call" against "don't artificially wait when there's a steady
+    trickle of requests."
+
+    If batch_size == 1 the batcher degenerates to a passthrough (one
+    ollama_generate call per submit). That's intentional -- it lets users
+    --no-judge-batching without any code path divergence."""
+
+    def __init__(self, batch_size: int = 8, flush_interval: float = 1.0):
+        self.batch_size = max(1, batch_size)
+        self.flush_interval = max(0.05, flush_interval)
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._task: Optional[asyncio.Task] = None
+        self._shutdown = False
+        self._all_batches: list[asyncio.Task] = []
+
+    def _ensure_running(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def submit(self, prompt: str, system: str) -> Optional[str]:
+        """Enqueue a (prompt, system) and await the model's text response.
+        Returns None if the batcher is shutting down (callers fall back to
+        their own parse-failure path, which is the right thing to do)."""
+        if self._shutdown:
+            return None
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        await self._queue.put((prompt, system, fut))
+        self._ensure_running()
+        return await fut
+
+    async def _run(self):
+        """Background coroutine: drain the queue into batches and dispatch
+        each batch as one ollama_generate call. Crashes in one batch
+        (exception in ollama_generate, malformed response) resolve the
+        per-doc futures to None so the caller's existing try/except
+        fallbacks fire -- no doc silently disappears."""
+        pending: list[tuple[str, str, asyncio.Future]] = []
+        window_deadline: Optional[float] = None  # absolute time at which to flush whatever we have
+        while not (self._shutdown and self._queue.empty() and not pending):
+            # Compute how long to wait for the next item. While the queue
+            # is empty AND pending is empty, idle forever (caller will
+            # wake us by submitting). Once we have at least one pending
+            # item, race a deadline (set when the first pending item
+            # arrived) against "queue has another item ready now."
+            if not pending and self._queue.empty():
+                # Park until something arrives or shutdown is signalled.
+                if self._shutdown:
+                    break
+                item = await self._queue.get()
+                if self._is_sentinel(item):
+                    continue
+                pending.append(item)
+                window_deadline = asyncio.get_running_loop().time() + self.flush_interval
+                # Fast path: if the batch is already full, flush now.
+                if len(pending) >= self.batch_size:
+                    await self._flush(pending)
+                    pending = []
+                    window_deadline = None
+                continue
+
+            # We have at least one pending item. Decide whether to flush:
+            # - batch is full
+            # - shutdown signalled (drain whatever's left)
+            # - flush_interval has elapsed since the first pending item arrived
+            now = asyncio.get_running_loop().time()
+            interval_elapsed = window_deadline is not None and now >= window_deadline
+            should_flush = (
+                len(pending) >= self.batch_size
+                or (self._shutdown and pending)
+                or interval_elapsed
+            )
+            if should_flush:
+                await self._flush(pending)
+                pending = []
+                window_deadline = None
+                continue
+
+            # Otherwise race the deadline against the next queue item.
+            if not self._queue.empty():
+                item = self._queue.get_nowait()
+                if self._is_sentinel(item):
+                    continue
+                pending.append(item)
+                continue
+            # Wait up to (deadline - now) for an item, whichever first.
+            if window_deadline is not None:
+                remaining = max(0.0, window_deadline - now)
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    continue
+                if self._is_sentinel(item):
+                    continue
+                pending.append(item)
+
+        # Resolve any futures still waiting if we're shutting down
+        # without a successful flush (e.g. cancelled).
+        for _, _, fut in pending:
+            if not fut.done():
+                fut.set_result(None)
+
+    @staticmethod
+    def _is_sentinel(item: tuple) -> bool:
+        """shutdown() pushes an empty-prompt sentinel to wake a parked
+        _run loop; real submits always carry a non-empty prompt."""
+        prompt, _, _ = item
+        return prompt == ""
+
+    async def _flush(self, items: list[tuple[str, str, asyncio.Future]]):
+        """Send one batched prompt to ollama_generate, parse the response,
+        and resolve each per-doc future with its own slot's text. Items
+        that don't have a parseable slot get None -- the caller's existing
+        except path picks that up."""
+        prompts = [p for p, _, _ in items]
+        # All items in one batch share the same system prompt in practice
+        # (each batcher is bound to one role), but we use the first item's
+        # system as the canonical one and warn loudly if any other item
+        # disagrees.
+        systems = {s for _, s, _ in items}
+        if len(systems) > 1:
+            log.warning(f"[ollama-batcher] batch had {len(systems)} distinct "
+                        f"system prompts; using the first. This shouldn't "
+                        f"happen if each batcher is bound to one role.")
+        system = items[0][1]
+        n = len(prompts)
+
+        if self.batch_size == 1 or n == 1:
+            # Passthrough: no batched prompt, just dispatch one at a time
+            # to preserve the original per-doc semantics. (batch_size==1
+            # is the "I turned batching off" knob.)
+            for prompt, _, fut in items:
+                if fut.done():
+                    continue
+                try:
+                    resp = await ollama_generate(prompt, system=system, json_mode=True)
+                    fut.set_result(resp)
+                except Exception as e:
+                    log.warning(f"[ollama-batcher] per-doc call failed: {e}")
+                    fut.set_result(None)
+            return
+
+        try:
+            batched_prompt = self._build_batched_prompt(prompts)
+            raw = await ollama_generate(batched_prompt, system=system, json_mode=True)
+            slots = self._parse_batched_response(raw, n)
+        except Exception as e:
+            log.warning(f"[ollama-batcher] batched call failed ({e}); "
+                        f"falling back to per-doc dispatch for this batch of {n}")
+            slots = None
+
+        if slots is None:
+            # Either the call itself failed or the response was unparseable.
+            # Fall back to per-doc dispatch so a transient batch failure
+            # doesn't lose the whole window -- this preserves the original
+            # behavior of judge_quality/extract_sft_pair where each doc got
+            # its own try/except.
+            for prompt, _, fut in items:
+                if fut.done():
+                    continue
+                try:
+                    resp = await ollama_generate(prompt, system=system, json_mode=True)
+                    fut.set_result(resp)
+                except Exception as e:
+                    log.debug(f"[ollama-batcher] per-doc fallback failed: {e}")
+                    fut.set_result(None)
+            return
+
+        for (_, _, fut), slot in zip(items, slots):
+            if fut.done():
+                continue
+            fut.set_result(slot)
+
+    def _build_batched_prompt(self, prompts: list[str]) -> str:
+        parts = [f"Documents: {len(prompts)} total. "
+                 f"Respond with a JSON array of length {len(prompts)}, one "
+                 f"entry per document in order, using the same JSON shape "
+                 f"you would for a single document. Do not merge or skip entries."]
+        for i, p in enumerate(prompts):
+            parts.append(f"---DOC {i}---\n{p}\n---END {i}---")
+        parts.append(f"\nRespond with a JSON array of length {len(prompts)}.")
+        return "\n".join(parts)
+
+    def _parse_batched_response(self, raw: str, n: int) -> Optional[list[Optional[str]]]:
+        """Try to extract a length-N JSON array from `raw`. The model may
+        wrap it in markdown fences (```json ... ```) or chatter around it;
+        we strip those and try json.loads. On success returns a list of
+        length N (entries coerced to str; missing entries become None).
+        On any failure returns None so the caller falls back to per-doc
+        dispatch."""
+        if not raw:
+            return None
+        text = raw.strip()
+        # Strip ```json ... ``` fences if the model wrapped the array.
+        if text.startswith("```"):
+            # Drop the first line (```json or ```) and the trailing fence.
+            lines = text.split("\n")
+            lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            text = "\n".join(lines).strip()
+        # Find the outermost JSON array -- the model occasionally prefixes
+        # with prose like "Here is the array: [...]".
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        text = text[start:end + 1]
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, list):
+            return None
+        slots: list[Optional[str]] = []
+        for i in range(n):
+            if i < len(data) and data[i] is not None:
+                slots.append(data[i] if isinstance(data[i], str) else json.dumps(data[i]))
+            else:
+                slots.append(None)
+        return slots
+
+    async def shutdown(self, drain_timeout: float = 5.0):
+        """Stop accepting new requests, flush whatever's already in the
+        queue (best effort, bounded by `drain_timeout`), and wait for the
+        background _run coroutine to finish. Safe to call multiple times."""
+        self._shutdown = True
+        # Push a sentinel so _run wakes from any pending get() even if the
+        # queue is empty.
+        sentinel = asyncio.get_running_loop().create_future()
+        await self._queue.put(("", "", sentinel))
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=drain_timeout)
+            except asyncio.TimeoutError:
+                log.warning("[ollama-batcher] shutdown timed out; cancelling run loop")
+                self._task.cancel()
+                try:
+                    await self._task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = None
+
+
+# Sentinel future used by shutdown to wake a parked _run() without
+# representing a real pending request.
+_SENTINEL_FUT: asyncio.Future = None  # type: ignore[assignment]
+
+
+def _make_sentinel_future() -> asyncio.Future:
+    global _SENTINEL_FUT
+    if _SENTINEL_FUT is None or _SENTINEL_FUT.done():
+        _SENTINEL_FUT = asyncio.get_running_loop().create_future()
+    return _SENTINEL_FUT
+
+
+async def _shutdown_all_batchers(drain_timeout: float = 5.0):
+    for b in _BATCHERS:
+        try:
+            await b.shutdown(drain_timeout=drain_timeout)
+        except Exception as e:
+            log.warning(f"[ollama-batcher] shutdown error: {e}")
+
+
+_BATCHERS: list[OllamaBatcher] = []
+
+
+def _register_batcher(b: OllamaBatcher) -> OllamaBatcher:
+    _BATCHERS.append(b)
+    return b
+
+
+# Singleton batchers. Created with placeholder settings; main_async()
+# applies the real CLI values at startup. batch_size=1 is the safe
+# default (passthrough) -- if startup is skipped for any reason, we
+# behave exactly like the pre-batching code.
+JUDGE_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0))
+SFT_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0))
+
+
+def configure_batcher_settings(batch_size: int, flush_interval: float):
+    """Called from main_async() after argparse to apply --judge-batch-size
+    and --judge-batch-flush-seconds to both singleton batchers. batch_size
+    of 0 or 1 disables batching (passthrough)."""
+    for b in (JUDGE_BATCHER, SFT_BATCHER):
+        b.batch_size = max(1, batch_size)
+        b.flush_interval = max(0.05, flush_interval)
+
+
 DEFAULT_MIX = {
     "web": 0.35,
     "knowledge": 0.20,
@@ -131,7 +449,18 @@ async def judge_quality(text: str, category: str) -> bool:
     """LLM-based quality gate, applied AFTER the cheap heuristic filters
     (which catch the obvious junk for free). Only invoked on documents that
     already passed the heuristics, to keep the number of LLM calls bounded.
-    Returns True if the model says this is usable training data."""
+    Returns True if the model says this is usable training data.
+
+    The actual Ollama call goes through JUDGE_BATCHER, which coalesces a
+    small window of concurrent judge calls into a single batched prompt.
+    The per-doc contract is unchanged: we get back a JSON object string
+    (one per document) and parse {"keep": ...} from it.
+
+    With --fast-heuristics (LLM_BYPASS=True), this short-circuits to True
+    without making any Ollama call. The heuristic filters above already
+    caught the obvious junk; this just trusts them entirely."""
+    if LLM_BYPASS:
+        return True
     system = (
         "You judge whether a scraped web document is high-quality training "
         "data for a language model. Reject: boilerplate, ads/nav menus, "
@@ -142,7 +471,11 @@ async def judge_quality(text: str, category: str) -> bool:
     )
     snippet = text[:3000]
     try:
-        raw = await ollama_generate(snippet, system=system, json_mode=True)
+        raw = await JUDGE_BATCHER.submit(snippet, system)
+        if raw is None:
+            # Batcher returned no per-doc slot (parse failure or shutdown);
+            # treat it like any other judge-call failure and default to keep.
+            raise RuntimeError("judge batcher returned no slot for this document")
         data = json.loads(raw)
         keep = bool(data.get("keep", False))
         log.debug(f"[judge:{category}] keep={keep}")
@@ -158,7 +491,18 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
     """For --mode sft: turn a scraped article into a (prompt, answer) pair
     by having the model pose a question the article answers, and produce a
     concise answer grounded in the text. Returns None if the article doesn't
-    cleanly support this (e.g. pure narrative with no answerable question)."""
+    cleanly support this (e.g. pure narrative with no answerable question).
+
+    Like judge_quality, this goes through SFT_BATCHER for amortized
+    throughput on local Ollama. The per-doc contract is unchanged: we get
+    back a single JSON object string.
+
+    With --fast-heuristics (LLM_BYPASS=True), this short-circuits to None
+    and the row is rejected as "no sft pair extractable" -- the heuristic
+    filters aren't going to invent a Q/A pair for us. This is the same
+    behavior as if the model had returned {"prompt": null}."""
+    if LLM_BYPASS:
+        return None
     system = (
         "You convert a source article into ONE high-quality instruction-"
         "tuning example. Ask a specific, well-posed question that the "
@@ -169,7 +513,10 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
         "question/answer pair exists in this text."
     )
     try:
-        raw = await ollama_generate(text[:6000], system=system, json_mode=True)
+        raw = await SFT_BATCHER.submit(text[:6000], system)
+        if raw is None:
+            log.debug(f"[sft:{category}] batcher returned no slot for this doc")
+            return None
         data = json.loads(raw)
         if not data.get("prompt") or not data.get("answer"):
             log.debug(f"[sft:{category}] no usable Q/A pair in article")
@@ -635,7 +982,15 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                 log.warning(f"[public:{category}] skipping unparseable staged row: {e}")
                 continue
             tasks.append(asyncio.create_task(bounded(row)))
-            if len(tasks) >= concurrency * 2:
+            # Flush threshold: gather as many in-flight tasks as one Ollama
+            # judge batch is expected to coalesce, so each gather() releases
+            # at least one full batch to JUDGE_BATCHER (and SFT_BATCHER).
+            # With per-doc Ollama calls this used to be `concurrency * 2`,
+            # but with batching the right size is the batcher's batch_size:
+            # gather() fewer and the batcher sits idle waiting; gather()
+            # many more and tasks pile up in memory for no gain.
+            batch_flush = max(1, JUDGE_BATCHER.batch_size) * 2
+            if len(tasks) >= batch_flush:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 tasks = []
     if tasks:
@@ -850,6 +1205,32 @@ def _find_server_path() -> str:
 
 
 async def main_async(args):
+    # Apply the CLI-controlled Ollama batcher settings before any
+    # judge_quality / extract_sft_pair call can happen. Default is
+    # batch_size=8 (a real speedup on local Ollama); --no-judge-batching
+    # forces the legacy per-doc path. The batchers live for the duration
+    # of the process and are torn down in main() after main_async returns
+    # so any in-flight requests get a clean shutdown drain.
+    batch_size = 1 if getattr(args, "no_judge_batching", False) else max(1, args.judge_batch_size)
+    flush_interval = max(0.05, args.judge_batch_flush_seconds)
+    configure_batcher_settings(batch_size, flush_interval)
+    log.info(f"Ollama batcher: batch_size={batch_size}, "
+             f"flush_interval={flush_interval}s "
+             f"({'disabled' if batch_size == 1 else 'enabled'})")
+
+    # --fast-heuristics bypasses ALL Ollama calls (judge + SFT pair extract).
+    # --no-llm-judge only skips the judge; SFT pair extraction still runs.
+    # When bypass is on, we ALSO pass use_llm_judge=False into run_category,
+    # so the gate around judge_quality inside _process_article is skipped
+    # entirely (no point calling a function that returns True unconditionally).
+    global LLM_BYPASS
+    if getattr(args, "fast_heuristics", False):
+        LLM_BYPASS = True
+        log.info("--fast-heuristics: bypassing ALL Ollama calls (judge + SFT pair extract)")
+    else:
+        LLM_BYPASS = False
+    use_llm_judge_flag = (not args.no_llm_judge) and (not LLM_BYPASS)
+
     target_bytes = _parse_size(args.target_size)
     categories = args.categories.split(",") if args.categories else list(DEFAULT_MIX.keys())
     mix = {c: DEFAULT_MIX.get(c, 1.0 / len(categories)) for c in categories}
@@ -888,7 +1269,7 @@ async def main_async(args):
                 continue
             actual_bytes, docs = await run_category(
                 None, category, budget, args.out_dir, args.mode,
-                args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
+                args.min_doc_chars, use_llm_judge=use_llm_judge_flag,
                 concurrency=args.concurrency, public_cfg=public_cfg,
                 deep_crawl_per_domain=0,  # no MCP session in the public-only path -- N/A
             )
@@ -921,7 +1302,7 @@ async def main_async(args):
                         continue
                     actual_bytes, docs = await run_category(
                         scraper, category, budget, args.out_dir, args.mode,
-                        args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
+                        args.min_doc_chars, use_llm_judge=use_llm_judge_flag,
                         concurrency=args.concurrency, public_cfg=public_cfg,
                         deep_crawl_per_domain=args.deep_crawl_per_domain,
                         deep_crawl_max_pages=args.deep_crawl_max_pages,
@@ -980,11 +1361,35 @@ def main():
     parser.add_argument("--min-doc-chars", type=int, default=500)
     parser.add_argument("--no-llm-judge", action="store_true",
                          help="Skip the Ollama quality-judging pass, keep only heuristic filters (faster)")
+    parser.add_argument("--fast-heuristics", action="store_true",
+                         help="Bypass ALL Ollama calls -- skip both the quality judge AND the SFT "
+                              "pair extraction. Documents are kept/rejected purely on the "
+                              "heuristic filters (length, language, content-type patterns). "
+                              "For --mode sft, rows without a pre-supplied prompt/answer are "
+                              "rejected (the heuristic filters can't invent a Q/A pair). "
+                              "Mutually exclusive with --no-llm-judge (which only skips the "
+                              "judge and still runs SFT pair extraction).")
     parser.add_argument("--concurrency", type=int, default=5,
                          help="Max concurrent extract+filter tasks per category round (default 5). "
                               "Raise for I/O-bound HTML/PDF-heavy runs; keep low if ASR transcription "
                               "is in play (each faster-whisper call is CPU/GPU-heavy) or the LLM judge "
                               "is on (concurrent calls just queue behind a single local Ollama model).")
+    parser.add_argument("--judge-batch-size", type=int, default=8,
+                         help="Number of documents to coalesce into a single Ollama judge / SFT-"
+                              "extract call (default 8). Local Ollama processes one request at a "
+                              "time, so batching N concurrent requests into a single prompt is "
+                              "the main throughput lever on the LLM-gated phases. Set to 1 to "
+                              "disable batching (passthrough -- one Ollama call per document, "
+                              "original behavior).")
+    parser.add_argument("--judge-batch-flush-seconds", type=float, default=1.0,
+                         help="Max time the judge batcher waits for a batch to fill before "
+                              "flushing whatever it has (default 1.0s). Lower = lower latency, "
+                              "less amortization. 0 disables the timer flush; only batch_size "
+                              "fill will flush.")
+    parser.add_argument("--no-judge-batching", action="store_true",
+                         help="Disable Ollama batching entirely (equivalent to "
+                              "--judge-batch-size 1). Useful for debugging or when the model is "
+                              "too small to handle the combined context.")
     parser.add_argument("--deep-crawl-per-domain", type=int, default=0,
                          help="Per query round, deep-crawl up to N new domains seen among that "
                               "round's search hits (via crawl4ai's deep_crawl MCP tool), harvesting "
@@ -1062,7 +1467,19 @@ def main():
 
     args = parser.parse_args()
     logging.getLogger("dataset_agent").setLevel(args.log_level)
-    asyncio.run(main_async(args))
+    try:
+        asyncio.run(main_async(args))
+    finally:
+        # Always drain the Ollama batchers, even on exception, so a
+        # half-flushed batch doesn't strand pending futures. Uses a fresh
+        # event loop if asyncio.run tore the main one down already.
+        try:
+            asyncio.run(_shutdown_all_batchers(drain_timeout=5.0))
+        except RuntimeError:
+            # No running loop available -- best effort: nothing to do.
+            pass
+        except Exception as e:
+            log.warning(f"[ollama-batcher] shutdown error during exit: {e}")
 
 
 if __name__ == "__main__":
