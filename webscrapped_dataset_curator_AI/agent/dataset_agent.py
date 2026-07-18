@@ -58,7 +58,7 @@ from quality import (
     passes_prose_quality_filter, passes_code_quality_filter,
     passes_transcript_quality_filter,
 )
-from topics import TOPIC_SEEDS
+from topics import TOPIC_SEEDS, HUB_SEARCH_KEYWORDS
 import public_sources
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -438,9 +438,14 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
         "discover_limit": int,                          # datasets to auto-discover per category
     }
     If no explicit dataset ids/refs are given for a category, it falls back
-    to searching the hub using the category name + its topic seeds as the
-    query -- same "steer with topics.py, let it expand" philosophy as the
-    web-search query planner.
+    to auto-discovery: searching the hub with each of that category's
+    HUB_SEARCH_KEYWORDS (topics.py) in turn and merging/deduping the hits,
+    up to discover_limit total. These are short (1-3 word) hub-search
+    terms, deliberately NOT the same as the long natural-language
+    TOPIC_SEEDS sentences used to steer the web-search query planner --
+    HF/Kaggle's dataset search does simple keyword matching against
+    dataset names/tags, so a full sentence like "calculus integration by
+    parts examples" matches nothing and silently discovers zero datasets.
     """
     sem = asyncio.Semaphore(concurrency)
 
@@ -452,16 +457,32 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
 
     max_rows = public_cfg.get("max_rows_per_dataset", 500)
     discover_limit = public_cfg.get("discover_limit", 3)
-    search_query = " ".join(TOPIC_SEEDS.get(category, [category])[:2]) or category
+    search_keywords = HUB_SEARCH_KEYWORDS.get(category, [category])
 
     def _lookup(cat_map: dict) -> Optional[list]:
         return cat_map.get(category) or cat_map.get("__all__")
 
+    async def _discover(discover_fn, label: str) -> list:
+        """Try each short keyword in turn, merging/deduping hits (in
+        discovery order) until discover_limit distinct ids/refs are found
+        or every keyword's been tried. Logs what each individual keyword
+        turned up so a bad keyword is visible in the log instead of just
+        silently contributing nothing."""
+        found: list = []
+        for kw in search_keywords:
+            if len(found) >= discover_limit:
+                break
+            hits = await asyncio.to_thread(discover_fn, kw, discover_limit - len(found))
+            log.info(f"[{label}:{category}] keyword {kw!r} -> {hits}")
+            for h in hits:
+                if h not in found:
+                    found.append(h)
+        return found[:discover_limit]
+
     if "huggingface" in public_cfg.get("sources", set()):
         hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
         if not hf_ids:
-            hf_ids = await asyncio.to_thread(public_sources.discover_hf_datasets,
-                                              search_query, discover_limit)
+            hf_ids = await _discover(public_sources.discover_hf_datasets, "public-hf")
             log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
         for ds_id in hf_ids:
             if writer.total_bytes >= byte_budget:
@@ -484,8 +505,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     if "kaggle" in public_cfg.get("sources", set()):
         kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
         if not kg_refs:
-            kg_refs = await asyncio.to_thread(public_sources.discover_kaggle_datasets,
-                                               search_query, discover_limit)
+            kg_refs = await _discover(public_sources.discover_kaggle_datasets, "public-kaggle")
             log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
         for ref in kg_refs:
             if writer.total_bytes >= byte_budget:

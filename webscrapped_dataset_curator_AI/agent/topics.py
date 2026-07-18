@@ -45,3 +45,27 @@ TOPIC_SEEDS = {
         "biology cell signaling pathways", "astronomy exoplanet detection methods",
     ],
 }
+
+# Short keyword queries for auto-discovering datasets on Hugging Face
+# Hub / Kaggle (agent/public_sources.py's discover_hf_datasets /
+# discover_kaggle_datasets). Deliberately NOT the same as TOPIC_SEEDS
+# above: those are full natural-language sentences meant to seed the
+# web-search query planner, which is exactly the wrong shape for hub
+# search -- both HF's `list_datasets(search=...)` and Kaggle's dataset
+# search do simple keyword/substring matching against dataset names and
+# tags, so a 10-word sentence like "calculus integration by parts
+# examples linear algebra eigenvalues explained" matches nothing and
+# silently returns zero datasets every time. These are short, 1-3 word
+# terms chosen to actually hit real dataset names/tags on each hub.
+# `run_public_sources_for_category` tries each in order and merges/dedups
+# results (up to --public-discover-limit) rather than using just one, so
+# a single overly-specific or unlucky term doesn't zero out discovery for
+# a whole category.
+HUB_SEARCH_KEYWORDS = {
+    "web": ["web text", "common crawl", "openwebtext"],
+    "knowledge": ["wikipedia", "trivia qa", "encyclopedia"],
+    "reasoning": ["reasoning", "chain of thought", "logic"],
+    "code": ["code", "github code", "programming"],
+    "math": ["math", "mathematics", "gsm8k"],
+    "science": ["science qa", "science", "physics"],
+}
