@@ -5,6 +5,23 @@ trafilatura>=1.8
 readability-lxml>=0.8.1
 ddgs>=9.0
 
+# --- Recommended: crawl4ai HTML backend ---
+# Swaps the httpx+trafilatura HTML path for a real (Playwright-driven)
+# headless-browser fetch + LLM-oriented markdown extraction. Handles
+# JS-rendered/SPA pages the plain httpx fetch can't see at all (no content
+# in the raw response to extract from), and its pruning content filter
+# strips nav/ad/boilerplate more aggressively than trafilatura alone. Also
+# powers the new deep_crawl tool (multi-page same-domain crawling in one
+# call). Missing this dependency doesn't break anything -- server.py's
+# SCRAPER_HTML_BACKEND defaults to "auto", which falls back to
+# httpx+trafilatura per-URL if crawl4ai isn't installed; set it to "httpx"
+# to disable crawl4ai entirely, or "crawl4ai" to require it.
+crawl4ai>=0.6
+# After `pip install crawl4ai`, it needs a one-time browser + OS-deps setup
+# (equivalent to `playwright install --with-deps chromium`):
+#   crawl4ai-setup
+#   crawl4ai-doctor      # sanity-checks the install before a real run
+
 # --- Optional: PDF extraction ---
 # Text-layer PDFs work with pdfplumber alone. Scanned/image-only PDFs also
 # need the OCR fallback (pdf2image + pytesseract), which additionally

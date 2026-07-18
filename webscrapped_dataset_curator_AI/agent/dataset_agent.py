@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import time
+import urllib.parse
 from contextlib import AsyncExitStack
 from typing import Optional
 
@@ -213,6 +214,29 @@ class ScraperClient:
         result = await self.session.call_tool("extract_content", {"url": url})
         return _first_json(result)
 
+    async def deep_crawl(self, seed_url: str, max_pages: int = 10, max_depth: int = 1,
+                          keywords: str = "") -> list:
+        """Harvest multiple same-domain pages from one seed URL via the
+        crawl4ai-backed deep_crawl tool -- one call yields many already-
+        extracted documents instead of one extract() per URL. Use for
+        domains already known to be relevant (a hit's own domain looked
+        promising, a docs site, a wiki), not for open-ended discovery --
+        that's what search() is for.
+        Returns a list of extract_content-shaped dicts (never raises for
+        "crawl4ai not installed" -- that comes back as a single-item list
+        with an "error" key, same convention as search())."""
+        result = await self.session.call_tool(
+            "deep_crawl",
+            {"seed_url": seed_url, "max_pages": max_pages, "max_depth": max_depth,
+             "keywords": keywords},
+        )
+        if getattr(result, "isError", False):
+            raise RuntimeError(f"deep_crawl tool error: {_first_json(result)}")
+        parsed = _first_json(result)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        return parsed or []
+
 
 def _first_json(tool_result):
     """Reconstruct a tool's actual return value from a CallToolResult.
@@ -380,6 +404,20 @@ async def _process_public_row(article: dict, category: str, mode: str, min_doc_c
                                    counters)
 
 
+async def _process_deep_crawl_page(page: dict, category: str, mode: str, min_doc_chars: int,
+                                    use_llm_judge: bool, exact_dedup: ExactDedup, near_dedup,
+                                    writer: ShardWriter, byte_budget: int, write_lock: asyncio.Lock,
+                                    counters: dict) -> bool:
+    """Same as _process_hit but for a page that deep_crawl already fetched
+    and extracted server-side (no separate extract_content round-trip
+    needed -- deep_crawl's pages are already in the extract_content
+    shape)."""
+    url = page.get("url", "deep-crawl-page")
+    return await _process_article(page, url, category, mode, min_doc_chars, use_llm_judge,
+                                   exact_dedup, near_dedup, writer, byte_budget, write_lock,
+                                   counters)
+
+
 async def run_public_sources_for_category(category: str, byte_budget: int, mode: str,
                                            min_doc_chars: int, use_llm_judge: bool,
                                            exact_dedup: ExactDedup, near_dedup,
@@ -473,7 +511,8 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
 
 async def run_category(scraper: ScraperClient, category: str, byte_budget: int, out_dir: str,
                         mode: str, min_doc_chars: int, use_llm_judge: bool, concurrency: int = 5,
-                        public_cfg: Optional[dict] = None):
+                        public_cfg: Optional[dict] = None, deep_crawl_per_domain: int = 0,
+                        deep_crawl_max_pages: int = 10):
     writer = ShardWriter(out_dir, category)
     exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
     near_dedup = NearDedup()
@@ -512,6 +551,33 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
             return await _process_hit(scraper, url, category, mode, min_doc_chars,
                                        use_llm_judge, exact_dedup, near_dedup, writer,
                                        byte_budget, write_lock, counters)
+
+    async def bounded_deep_crawl(seed_url: str):
+        async with sem:
+            try:
+                pages = await scraper.deep_crawl(seed_url, max_pages=deep_crawl_max_pages,
+                                                   max_depth=1, keywords=category)
+            except Exception as e:
+                log.warning(f"[deep_crawl:{category}] failed for {seed_url}: {e}")
+                return 0
+            if len(pages) == 1 and pages[0].get("error"):
+                log.info(f"[deep_crawl:{category}] {seed_url} -- {pages[0]['error']}")
+                return 0
+            written = 0
+            for page in pages:
+                page_url = page.get("url", seed_url)
+                if page_url in state.seen_urls:
+                    continue
+                state.seen_urls.add(page_url)
+                if await _process_deep_crawl_page(page, category, mode, min_doc_chars,
+                                                   use_llm_judge, exact_dedup, near_dedup,
+                                                   writer, byte_budget, write_lock, counters):
+                    written += 1
+            log.info(f"[deep_crawl:{category}] {seed_url} -> {len(pages)} pages harvested, "
+                     f"{written} kept")
+            return written
+
+    deep_crawled_domains: set = set()
 
     stall_rounds = 0
     while writer.total_bytes < byte_budget:
@@ -558,6 +624,35 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
                     progressed_this_round = True
                 elif isinstance(r, Exception):
                     log.warning(f"[{category}] worker task raised: {r}")
+
+        # Deep-crawl top-up: this round's search hits already told us which
+        # domains are relevant to this category -- rather than only taking
+        # the one page web_search pointed at, spend a few crawl4ai calls
+        # harvesting more pages from the SAME domains (its docs/blog/wiki
+        # neighbors), which is usually much cheaper per-document than
+        # planning + running more search queries. Each domain is only
+        # deep-crawled once per category run (deep_crawled_domains), and
+        # only up to --deep-crawl-per-domain new domains get this treatment
+        # per round, to keep it a top-up rather than the primary path.
+        if deep_crawl_per_domain > 0 and round_urls:
+            candidate_domains = []
+            for u in round_urls:
+                host = urllib.parse.urlparse(u).netloc.lower()
+                if host and host not in deep_crawled_domains:
+                    deep_crawled_domains.add(host)
+                    candidate_domains.append(u)  # crawl from the hit itself as the seed
+                if len(candidate_domains) >= deep_crawl_per_domain:
+                    break
+            if candidate_domains:
+                dc_results = await asyncio.gather(
+                    *(bounded_deep_crawl(u) for u in candidate_domains),
+                    return_exceptions=True,
+                )
+                for r in dc_results:
+                    if isinstance(r, int) and r > 0:
+                        progressed_this_round = True
+                    elif isinstance(r, Exception):
+                        log.warning(f"[deep_crawl:{category}] worker task raised: {r}")
 
         state.save()
 
@@ -647,6 +742,7 @@ async def main_async(args):
                 None, category, budget, args.out_dir, args.mode,
                 args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
                 concurrency=args.concurrency, public_cfg=public_cfg,
+                deep_crawl_per_domain=0,  # no MCP session in the public-only path -- N/A
             )
             manifest["categories"][category] = {
                 "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
@@ -679,6 +775,8 @@ async def main_async(args):
                         scraper, category, budget, args.out_dir, args.mode,
                         args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
                         concurrency=args.concurrency, public_cfg=public_cfg,
+                        deep_crawl_per_domain=args.deep_crawl_per_domain,
+                        deep_crawl_max_pages=args.deep_crawl_max_pages,
                     )
                     manifest["categories"][category] = {
                         "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
@@ -739,6 +837,18 @@ def main():
                               "Raise for I/O-bound HTML/PDF-heavy runs; keep low if ASR transcription "
                               "is in play (each faster-whisper call is CPU/GPU-heavy) or the LLM judge "
                               "is on (concurrent calls just queue behind a single local Ollama model).")
+    parser.add_argument("--deep-crawl-per-domain", type=int, default=0,
+                         help="Per query round, deep-crawl up to N new domains seen among that "
+                              "round's search hits (via crawl4ai's deep_crawl MCP tool), harvesting "
+                              "several same-domain pages per call instead of just the one page "
+                              "web_search pointed at. 0 (default) disables this top-up entirely. "
+                              "Each domain is only deep-crawled once per category run. Requires "
+                              "crawl4ai to be installed server-side (see requirements.txt); silently "
+                              "yields 0 extra docs per domain if it isn't, same as any other missing "
+                              "optional dependency.")
+    parser.add_argument("--deep-crawl-max-pages", type=int, default=10,
+                         help="Max pages to extract per deep_crawl call (default 10). Only relevant "
+                              "when --deep-crawl-per-domain > 0.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                          help="DEBUG shows every Ollama call, skipped/seen URLs, and full text lengths; "
                               "INFO (default) shows every query, hit list, extract skip reason, filter "

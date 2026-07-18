@@ -103,17 +103,68 @@ already exists.
      with exponential backoff + jitter.
    - **`extract_content(url)`** — the primary tool. Detects format (via
      `Content-Type` header, then URL extension, then known
-     streaming-platform hosts) and dispatches to the right extractor in
-     `web_scraper_mcp/extractors.py`.
+     streaming-platform hosts) and dispatches to the right extractor. HTML
+     pages go through **crawl4ai** first (see below), falling back to the
+     original `httpx` + `trafilatura`/`readability` path in
+     `web_scraper_mcp/extractors.py` if crawl4ai isn't installed or a
+     given page's crawl4ai fetch fails.
+   - **`deep_crawl(seed_url, max_pages, max_depth, keywords, same_domain_only)`**
+     — new. BFS-crawls outward from a seed URL with crawl4ai and extracts
+     every page it visits (up to `max_pages`) in one call — see below.
    - `transcribe_media(url)` — dedicated video/audio → transcript tool.
    - `extract_article(url)` — HTML-only alias kept for backward
      compatibility with anything still calling the old tool name.
-   - `healthcheck()` — reports which optional per-format dependencies are
-     importable, so you can tell "PDF OCR isn't wired up" from "the network
-     is down" before a long run silently underperforms.
+   - `healthcheck()` — reports which optional per-format dependencies
+     (including crawl4ai) are importable, so you can tell "PDF OCR isn't
+     wired up" from "the network is down" before a long run silently
+     underperforms.
    - Rotates User-Agent per request from a small pool (`web_scraper_mcp/
      net_utils.py`) and can round-robin across proxies via `PROXY_LIST`, to
      reduce single-fingerprint WAF blocks on long runs.
+
+### HTML backend: crawl4ai (real headless-browser fetch + pruned markdown)
+
+The original version fetched HTML with plain `httpx` (no JS execution) and
+extracted with `trafilatura`/`readability-lxml`. That's fast and fine for
+static pages, but two things it structurally can't do:
+
+- **Render JS.** A page that builds its article body client-side (a lot of
+  modern blogs, docs sites, and SPAs) comes back nearly empty from `httpx`
+  no matter how good the extractor is downstream — there's no content in
+  the raw response to extract. `web_scraper_mcp/crawl4ai_backend.py` runs a
+  real headless Chromium via [crawl4ai](https://github.com/unclecode/crawl4ai)
+  instead, so it sees the DOM after JS has run.
+- **Harvest a whole domain in one call.** The new `deep_crawl` tool follows
+  in-page links outward from a seed URL (BFS, optionally scored by keyword
+  relevance) and extracts every page it visits — one docs-site homepage or
+  blog index becomes dozens of documents in a single tool call, instead of
+  needing one `web_search` + one `extract_content` round-trip per page.
+
+Both paths use crawl4ai's `PruningContentFilter`, which tends to strip
+nav/ad/sidebar boilerplate more aggressively than `trafilatura` alone, and
+return **the same result shape** (`{title, text, author, date,
+content_type, url, error, extra}`) as every other extractor here, so
+nothing downstream (filtering, dedup, shard writing, `dataset_agent.py`)
+branches on which backend actually produced a given document.
+
+- `SCRAPER_HTML_BACKEND` (default `auto`): `auto` tries crawl4ai first for
+  every HTML URL and falls back per-URL to the original `httpx`+
+  `trafilatura` path if crawl4ai isn't installed or a given page's crawl4ai
+  fetch fails; `crawl4ai` requires it (surfaces its errors instead of
+  silently falling back, useful for confirming it's actually working);
+  `httpx` disables crawl4ai entirely.
+- Missing crawl4ai doesn't break anything — same graceful-degradation
+  pattern as every other optional per-format dependency here. Run
+  `healthcheck()` (reports `crawl4ai_html` under `formats`, plus the
+  configured `html_backend`) to confirm it's wired up before a real run.
+- `agent/dataset_agent.py`'s `--deep-crawl-per-domain N` flag (0/disabled
+  by default) opts a run into using `deep_crawl` as a top-up: each query
+  round, up to `N` domains newly seen among that round's search hits also
+  get deep-crawled for a few more same-domain pages each
+  (`--deep-crawl-max-pages`, default 10) — usually a cheaper way to grow a
+  category's document count than planning and running more search queries,
+  since you already know those domains are relevant. Each domain is only
+  deep-crawled once per category run.
 
 2. **`agent/dataset_agent.py`** — the orchestrator:
    - Asks Ollama for a batch of specific search queries per category,
@@ -152,7 +203,12 @@ already exists.
 
 ```bash
 cd webscrapped_dataset_curator_AI
-pip install -r requirements.txt        # core deps
+pip install -r requirements.txt        # core deps (includes crawl4ai)
+
+# One-time browser setup for the crawl4ai HTML backend (skip only if you
+# intend to run with SCRAPER_HTML_BACKEND=httpx):
+crawl4ai-setup                         # installs Playwright's Chromium + OS deps
+crawl4ai-doctor                        # sanity-checks the install
 
 # Optional, per format you actually need (see requirements.txt for the
 # breakdown) -- e.g. for PDF OCR + video ASR:
@@ -250,6 +306,16 @@ cron/systemd timer) — each run picks up roughly where the last one left off.
   to a paid API (Bing Search, Serper, Tavily, Brave Search API) — the tool
   signature (`query`, `max_results` → list of `{title, url, snippet}`) is
   the only contract the agent depends on.
+- **crawl4ai is heavier than the plain httpx path**: it's a real headless
+  browser, so per-page latency and memory are both higher than a bare GET
+  request, and the first call in a process pays browser-startup cost
+  (subsequent calls reuse the same browser instance). If you're scraping
+  mostly static, non-JS pages at very high volume and don't need
+  `deep_crawl`, set `SCRAPER_HTML_BACKEND=httpx` to skip it entirely and
+  keep the original lightweight path.
+- **`deep_crawl` respects the same domain rules as everything else**:
+  `SCRAPER_ALLOWED_DOMAINS`/`SCRAPER_BLOCKED_DOMAINS` and `robots.txt` are
+  still enforced on every page it visits, not just the seed URL.
 - **robots.txt / rate limiting / domain rules**: the server checks
   robots.txt per host and caps request rate to 1 per 2s per domain
   (`SCRAPER_MIN_HOST_INTERVAL`). Set `SCRAPER_ALLOWED_DOMAINS` and/or
@@ -288,8 +354,15 @@ cron/systemd timer) — each run picks up roughly where the last one left off.
   internet egress. Video/audio transcription in particular (`yt-dlp` +
   `faster-whisper`, plus the `ffmpeg` system dependency) needs a real
   end-to-end run in your own environment to confirm the audio pipeline
-  works with your installed codecs. Run `healthcheck()` first in your
-  environment to confirm which formats are wired up correctly.
+  works with your installed codecs. **The crawl4ai HTML backend and
+  `deep_crawl` (`web_scraper_mcp/crawl4ai_backend.py`) are likewise
+  syntax-checked against crawl4ai's documented API but not exercised
+  against a live Playwright browser or real web traffic here** — after
+  `pip install crawl4ai && crawl4ai-setup`, run `crawl4ai-doctor` and then
+  `healthcheck()` to confirm the browser install actually works in your
+  environment before relying on it for a production run. Run
+  `healthcheck()` first in your environment to confirm which formats are
+  wired up correctly.
 - **`agent/public_sources.py`** (the Hugging Face/Kaggle top-up) is
   likewise syntax-checked but not exercised against a live Hub API or a
   real Kaggle download in this sandbox -- verify `discover_hf_datasets` /

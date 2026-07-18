@@ -14,9 +14,22 @@ Tools:
     extract_content(url)            -> format-agnostic: detects HTML / PDF /
                                         DOCX / PPTX / XLSX / CSV / image /
                                         video / audio and returns clean text
-                                        + metadata via web_scraper_mcp.
-                                        extractors. This is the tool most
-                                        agents should call.
+                                        + metadata. HTML pages go through
+                                        crawl4ai_backend (real headless-
+                                        browser fetch + pruned markdown)
+                                        first, falling back to the legacy
+                                        httpx + trafilatura/readability path
+                                        in web_scraper_mcp.extractors --
+                                        see SCRAPER_HTML_BACKEND below. This
+                                        is the tool most agents should call.
+    deep_crawl(seed_url, ...)       -> crawl4ai-powered: BFS-crawl outward
+                                        from a seed URL, extracting every
+                                        page visited (up to max_pages) in
+                                        ONE call -- much higher yield per
+                                        round than one web_search hit ->
+                                        one extract_content call, for
+                                        domains you already know are
+                                        relevant (docs sites, blogs, wikis).
     extract_article(url)            -> HTML-only alias kept for backward
                                         compatibility with existing callers;
                                         internally now just extract_content
@@ -28,9 +41,12 @@ Tools:
 
 Design notes:
 - Search uses DuckDuckGo's HTML endpoint (via `ddgs`), no API key required.
-- Everything is read-only / GET-only: no clicking, no forms, no JS
-  execution -- just reading public pages/files.
-- Respects robots.txt (in-process cache) and rate-limits per host.
+- Everything is read-only / GET-only: no clicking, no forms -- crawl4ai
+  does run a real browser (so it executes page JS to render content), but
+  never fills in forms or performs write actions; it's still just reading
+  public pages.
+- Respects robots.txt (in-process cache for the httpx path; crawl4ai's own
+  `check_robots_txt` flag for the crawl4ai path) and rate-limits per host.
 - Retries transient failures (timeouts, 429, 5xx) with exponential backoff
   + jitter; does NOT retry permanent failures (403/404/401) since that just
   burns the rate-limit budget for nothing.
@@ -39,13 +55,25 @@ Design notes:
   WAF blocks on long scraping runs.
 - Domain allow/deny lists (SCRAPER_ALLOWED_DOMAINS / SCRAPER_BLOCKED_DOMAINS,
   comma-separated) let an operator hard-exclude sites (paywalled news,
-  social platforms whose ToS forbid scraping) independent of robots.txt.
+  social platforms whose ToS forbid scraping) independent of robots.txt --
+  applied uniformly regardless of which HTML backend actually fetches a
+  page.
+- SCRAPER_HTML_BACKEND (default "auto") picks the HTML fetch/extract
+  backend: "auto" tries crawl4ai first and falls back per-URL to the
+  httpx+trafilatura path if crawl4ai isn't installed or a given page's
+  crawl4ai fetch fails; "crawl4ai" requires it (surfaces its errors
+  instead of silently falling back); "httpx" disables crawl4ai entirely
+  and always uses the original path. crawl4ai adds real JS rendering
+  (catches content on pages that render client-side, which httpx simply
+  can't see) and a boilerplate-pruning content filter tuned for
+  training-data extraction -- see web_scraper_mcp/crawl4ai_backend.py.
 
 Run with:
     python server.py                # stdio transport, for MCP-aware clients
 """
 
 import asyncio
+import atexit
 import base64
 import os
 import sys
@@ -60,6 +88,7 @@ from mcp.server.fastmcp import FastMCP
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import extractors
 import net_utils
+import crawl4ai_backend
 
 mcp = FastMCP(
     "web-scraper",
@@ -75,6 +104,18 @@ MAX_TEXT_BYTES = int(os.environ.get("SCRAPER_MAX_TEXT_MB", "10")) * 1024 * 1024
 MAX_BINARY_BYTES = int(os.environ.get("SCRAPER_MAX_BINARY_MB", "50")) * 1024 * 1024
 FETCH_TIMEOUT = float(os.environ.get("SCRAPER_FETCH_TIMEOUT", "20"))
 RETRY_ATTEMPTS = int(os.environ.get("SCRAPER_RETRY_ATTEMPTS", "3"))
+
+# "auto" (default): try crawl4ai (real headless-browser fetch + pruned
+# markdown) first for every HTML URL, falling back per-URL to the legacy
+# httpx+trafilatura/readability path if crawl4ai isn't installed or fails
+# on a given page. "crawl4ai": require it, surface its errors instead of
+# falling back. "httpx": disable crawl4ai entirely, always use the
+# original path. See crawl4ai_backend.py for what crawl4ai adds.
+HTML_BACKEND = os.environ.get("SCRAPER_HTML_BACKEND", "auto").strip().lower()
+if HTML_BACKEND not in ("auto", "crawl4ai", "httpx"):
+    print(f"[config] SCRAPER_HTML_BACKEND={HTML_BACKEND!r} not recognized "
+          f"(expected auto/crawl4ai/httpx) -- defaulting to 'auto'", file=sys.stderr)
+    HTML_BACKEND = "auto"
 
 _allowed_env = os.environ.get("SCRAPER_ALLOWED_DOMAINS", "")
 _blocked_env = os.environ.get("SCRAPER_BLOCKED_DOMAINS", "")
@@ -354,6 +395,16 @@ async def extract_content(url: str) -> dict:
     kind = extractors.detect_content_kind(url, content_type_hint)
 
     if kind == "html":
+        if HTML_BACKEND in ("auto", "crawl4ai"):
+            await _rate_limit(url)  # crawl4ai does its own fetch, outside _do_fetch's rate limiter
+            c4_result = await crawl4ai_backend.fetch_and_extract(url, timeout=FETCH_TIMEOUT + 10)
+            if not c4_result.get("error"):
+                return c4_result
+            if HTML_BACKEND == "crawl4ai":
+                return c4_result  # explicitly required -- surface its error rather than fall back
+            print(f"[extract_content] crawl4ai path failed for {url} ({c4_result['error']}) "
+                  f"-- falling back to httpx+trafilatura", file=sys.stderr, flush=True)
+
         page = await fetch_page(url)
         if page["error"] or not page["html"]:
             return {"title": None, "text": "", "author": None, "date": None,
@@ -373,7 +424,56 @@ async def extract_content(url: str) -> dict:
 
 
 @mcp.tool()
-async def extract_article(url: str) -> dict:
+async def deep_crawl(seed_url: str, max_pages: int = 20, max_depth: int = 2,
+                      keywords: str = "", same_domain_only: bool = True) -> list[dict]:
+    """Crawl outward from a seed URL (a docs site homepage, a blog index, a
+    wiki category page, ...) using crawl4ai's JS-aware headless-browser
+    crawler, following in-page links up to max_depth hops and extracting up
+    to max_pages pages in ONE call. Much higher yield per round than one
+    web_search hit -> one extract_content call each -- reach for this when
+    you already know a specific domain is relevant and want to harvest it
+    thoroughly, rather than for open-ended topic discovery (use web_search
+    for that).
+
+    keywords: optional comma-separated terms (e.g. "gradient descent,
+    backpropagation, attention mechanism") used to prioritize which
+    discovered links get visited first when the domain has more pages than
+    max_pages allows. Leave empty for plain breadth-first order.
+    same_domain_only: if True (default), never follows links off the seed
+    URL's own host -- keeps "harvest this docs site" from wandering off to
+    unrelated linked domains. Set False only if you deliberately want that.
+
+    Returns a list of {title, text, author, date, content_type, url, error,
+    extra} dicts -- same shape as extract_content -- one per successfully
+    extracted page (pages that fail to extract are silently omitted, not
+    errored). Respects the same SCRAPER_ALLOWED_DOMAINS/
+    SCRAPER_BLOCKED_DOMAINS rules and robots.txt as every other tool here.
+
+    Requires crawl4ai (pip install crawl4ai && crawl4ai-setup). If it isn't
+    installed, or the seed URL itself is blocked/unreachable, returns a
+    single-item [{"error": "...", "url": seed_url}] list -- same
+    "never fails silently" convention as web_search.
+    """
+    reason = _domain_allowed(seed_url)
+    if reason:
+        return [{"error": f"blocked: {reason}", "url": seed_url}]
+
+    kw_list = [k.strip() for k in keywords.split(",") if k.strip()] or None
+    await _rate_limit(seed_url)
+    pages = await crawl4ai_backend.deep_crawl(
+        seed_url, max_pages=max_pages, max_depth=max_depth,
+        keywords=kw_list, same_domain_only=same_domain_only,
+    )
+    if len(pages) == 1 and pages[0].get("error") and set(pages[0].keys()) <= {"error", "url"}:
+        return pages  # crawl4ai-not-installed / seed-unreachable -- propagate as-is
+
+    # crawl4ai's own DomainFilter only enforces "stayed on seed_url's host";
+    # it doesn't know about this server's SCRAPER_BLOCKED_DOMAINS, so
+    # re-apply that here to every discovered page before returning them.
+    return [p for p in pages if not _domain_allowed(p.get("url", seed_url))]
+
+
+
     """DEPRECATED alias for extract_content, kept for backward
     compatibility with existing callers. New code should call
     extract_content directly, which also handles PDFs/Office docs/images/
@@ -450,6 +550,7 @@ def healthcheck() -> dict:
         "image_ocr": ["PIL", "pytesseract"],
         "video_captions": ["yt_dlp"],
         "video_audio_asr": ["yt_dlp", "faster_whisper"],
+        "crawl4ai_html": ["crawl4ai"],
     }
     for label, modules in optional_deps.items():
         ok = True
@@ -461,11 +562,34 @@ def healthcheck() -> dict:
                 break
         report["formats"][label] = ok
 
+    report["html_backend"] = HTML_BACKEND
+    if HTML_BACKEND != "httpx" and not report["formats"]["crawl4ai_html"]:
+        note = ("SCRAPER_HTML_BACKEND is "
+                f"{HTML_BACKEND!r} but crawl4ai isn't importable -- every HTML "
+                "extraction will silently fall back to httpx+trafilatura" +
+                (" (auto mode, so this is fine, just lower-fidelity)"
+                 if HTML_BACKEND == "auto" else
+                 " and error out (backend=crawl4ai requires it)"))
+        report["error"] = (report["error"] + "; " if report["error"] else "") + note
+
     try:
         report["robots_check_ok"] = _robots_allowed("https://example.com/")
     except Exception as e:
         report["error"] = (report["error"] + "; " if report["error"] else "") + f"robots check failed: {e}"
     return report
+
+
+def _cleanup_crawl4ai():
+    """Best-effort close of the shared crawl4ai browser (if it was ever
+    started) so its Playwright subprocess doesn't linger after this process
+    exits. No-op, harmlessly, if crawl4ai was never used this run."""
+    try:
+        asyncio.run(crawl4ai_backend.shutdown())
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_crawl4ai)
 
 
 if __name__ == "__main__":
