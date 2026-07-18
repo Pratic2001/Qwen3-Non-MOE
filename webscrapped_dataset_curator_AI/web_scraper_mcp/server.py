@@ -115,7 +115,7 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
     # your network blocks a different subset.
     backends_env = os.environ.get("DDGS_BACKENDS")
     backends = [b.strip() for b in backends_env.split(",")] if backends_env else \
-        ["brave", "yandex", "bing", "auto"]
+        ["brave", "yandex", "auto"]
 
     last_err = None
     for backend in backends:

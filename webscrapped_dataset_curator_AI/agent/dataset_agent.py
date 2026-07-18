@@ -193,7 +193,16 @@ class ScraperClient:
             # even build a response) -- surface it instead of letting the
             # caller mistake this for "no results."
             raise RuntimeError(f"web_search tool error: {_first_json(result)}")
-        return _first_json(result)
+        parsed = _first_json(result)
+        # Defensive: if structuredContent wasn't available for some reason
+        # and we fell back to reconstructing from content blocks, a single
+        # search hit collapses indistinguishably from a bare dict (same as
+        # extract_article's return shape). web_search always means "a list
+        # of hits," so re-wrap a lone dict rather than let it be mistaken
+        # for a malformed response downstream.
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        return parsed
 
     async def extract(self, url: str) -> dict:
         result = await self.session.call_tool("extract_article", {"url": url})
@@ -201,13 +210,39 @@ class ScraperClient:
 
 
 def _first_json(tool_result):
+    """Reconstruct a tool's actual return value from a CallToolResult.
+
+    IMPORTANT: the MCP SDK's default content serialization
+    (_convert_to_content) splits a list-returning tool's output into ONE
+    SEPARATE CONTENT BLOCK PER LIST ITEM, not a single block containing the
+    whole JSON array. Reading only content[0] -- what this function used to
+    do -- silently truncates every multi-result list down to just its first
+    element, with no error anywhere. That's why `web_search` hits kept
+    showing up client-side as a single dict instead of a list of 8.
+
+    `structuredContent` doesn't have that problem: FastMCP auto-generates
+    an output schema from the tool's return-type annotation (e.g.
+    `-> list[dict]`) and stores the real structured value there as
+    {"result": <value>}, fully intact. Prefer that; only fall back to
+    reassembling content blocks (which works fine for single-dict-return
+    tools like extract_article, since those never get split) if
+    structuredContent isn't present.
+    """
+    sc = getattr(tool_result, "structuredContent", None)
+    if isinstance(sc, dict) and "result" in sc:
+        return sc["result"]
+
+    parsed = []
     for block in tool_result.content:
-        if hasattr(block, "text"):
-            try:
-                return json.loads(block.text)
-            except Exception:
-                return block.text
-    return None
+        if not hasattr(block, "text"):
+            continue
+        try:
+            parsed.append(json.loads(block.text))
+        except Exception:
+            parsed.append(block.text)
+    if not parsed:
+        return None
+    return parsed[0] if len(parsed) == 1 else parsed
 
 
 # ---------------------------------------------------------------------------
