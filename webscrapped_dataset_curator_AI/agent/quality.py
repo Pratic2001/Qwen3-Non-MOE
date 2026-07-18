@@ -60,6 +60,27 @@ def passes_prose_quality_filter(text: str, min_doc_chars: int = 500) -> bool:
     return True
 
 
+_TRANSCRIPT_JUNK_MARKERS = ("[music]", "[applause]", "[laughter]", "♪ ♪ ♪")
+
+
+def passes_transcript_quality_filter(text: str, min_doc_chars: int = 300) -> bool:
+    """Quality bar for video/audio transcripts -- these fail differently
+    than scraped HTML articles (ASR noise, music-only stretches, stuck
+    captions repeating one phrase), so this checks those patterns rather
+    than the HTML junk-marker list."""
+    if len(text) < min_doc_chars:
+        return False
+    if _alpha_ratio(text) < 0.5:
+        return False
+    if _top_word_repetition_ratio(text) > 0.35:
+        return False
+    lowered = text.lower()
+    stripped = re.sub(r"\[music\]|\[applause\]|\[laughter\]|\u266a", "", lowered)
+    if len(stripped) < min_doc_chars * 0.5:
+        return False
+    return True
+
+
 CODE_ALLOWED_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".h", ".cpp", ".hpp",
     ".cc", ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala",
@@ -115,43 +136,115 @@ class ExactDedup:
         return False
 
 
-class NearDedup:
-    """Cheap near-duplicate filter using shingled MinHash-lite: hashes the
+class _ShingleNearDedup:
+    """Fallback near-duplicate filter (no extra dependency): hashes the
     sorted set of 5-word shingles down to a fixed-size fingerprint. Two docs
     that share >= threshold fraction of shingles are treated as duplicates.
-    Good enough to catch scraped mirrors/reprints without pulling in a real
-    MinHash/LSH dependency."""
+    O(n) comparisons against every prior fingerprint -- fine at the scale of
+    a single run but not a substitute for real LSH at millions of docs."""
 
-    def __init__(self, shingle_size: int = 5, num_hashes: int = 32, threshold: float = 0.8):
+    def __init__(self, shingle_size: int = 5, threshold: float = 0.8):
         self.shingle_size = shingle_size
-        self.num_hashes = num_hashes
         self.threshold = threshold
-        self._fingerprints = []  # list of frozenset of hashed shingles (sampled)
+        self._fingerprints = []
 
     def _shingles(self, text: str):
         words = _WORD_RE.findall(text.lower())
         n = self.shingle_size
         return {
             hashlib.md5(" ".join(words[i:i + n]).encode()).hexdigest()
-            for i in range(0, max(0, len(words) - n + 1), n)  # non-overlapping, cheap
+            for i in range(0, max(0, len(words) - n + 1), n)
         }
 
     def is_near_duplicate(self, text: str) -> bool:
         shingles = self._shingles(text)
         if not shingles:
             return False
-        # Sample down to num_hashes*4 shingles max for speed on long docs
         sample = shingles if len(shingles) <= 500 else set(list(shingles)[:500])
         for fp in self._fingerprints:
             inter = len(sample & fp)
             union = len(sample | fp)
             if union and inter / union >= self.threshold:
                 return True
-        # Bound memory: keep only the last ~5000 fingerprints
         if len(self._fingerprints) > 5000:
             self._fingerprints.pop(0)
         self._fingerprints.append(sample)
         return False
+
+
+class _MinHashLSHNearDedup:
+    """Real MinHash + LSH near-dedup via `datasketch`. LSH lookup per doc
+    instead of comparing against every prior fingerprint, so this scales to
+    far more docs than the shingle-set fallback above. Same public
+    interface (is_near_duplicate), so callers don't care which one they got."""
+
+    def __init__(self, shingle_size: int = 5, num_perm: int = 128, threshold: float = 0.8):
+        from datasketch import MinHash, MinHashLSH
+        self._MinHash = MinHash
+        self.shingle_size = shingle_size
+        self.num_perm = num_perm
+        self.lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+        self._counter = 0
+
+    def _minhash(self, text: str):
+        words = _WORD_RE.findall(text.lower())
+        n = self.shingle_size
+        mh = self._MinHash(num_perm=self.num_perm)
+        for i in range(0, max(0, len(words) - n + 1), n):
+            mh.update(" ".join(words[i:i + n]).encode())
+        return mh
+
+    def is_near_duplicate(self, text: str) -> bool:
+        mh = self._minhash(text)
+        if self.lsh.query(mh):
+            return True
+        self._counter += 1
+        self.lsh.insert(f"doc-{self._counter}", mh)
+        return False
+
+
+def NearDedup(shingle_size: int = 5, threshold: float = 0.8):
+    """Factory: returns the datasketch-backed MinHash/LSH near-dedup if
+    `datasketch` is installed (recommended once a run produces more than a
+    few tens of thousands of docs per category), else falls back to the
+    lightweight shingle-overlap version so the pipeline still works with
+    zero extra dependencies at small scale."""
+    try:
+        return _MinHashLSHNearDedup(shingle_size=shingle_size, threshold=threshold)
+    except ImportError:
+        return _ShingleNearDedup(shingle_size=shingle_size, threshold=threshold)
+
+
+class RunState:
+    """Persists used-queries and seen-URLs per category to a JSON file so a
+    run can be killed and resumed (or run nightly via cron) without
+    re-searching queries it already tried or re-extracting URLs it already
+    judged -- important once a category's shards span many process runs."""
+
+    def __init__(self, out_dir: str, category: str):
+        self.path = os.path.join(out_dir, category, ".run_state.json")
+        self.used_queries: list = []
+        self.seen_urls: set = set()
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    data = json.load(f)
+                self.used_queries = data.get("used_queries", [])
+                self.seen_urls = set(data.get("seen_urls", []))
+            except Exception:
+                pass  # corrupt state file -- start fresh rather than crash
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # Cap what's persisted so this file doesn't grow unboundedly across
+        # many resumed runs -- keep the most recent queries/URLs, which is
+        # what the planner's "avoid repeating" prompt and the dedup check
+        # actually need.
+        with open(self.path, "w") as f:
+            json.dump({
+                "used_queries": self.used_queries[-2000:],
+                "seen_urls": list(self.seen_urls)[-50000:],
+            }, f)
 
 
 class ShardWriter:

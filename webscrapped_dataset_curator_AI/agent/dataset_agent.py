@@ -53,10 +53,12 @@ from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, os.path.dirname(__file__))
 from quality import (
-    ExactDedup, NearDedup, ShardWriter,
+    ExactDedup, NearDedup, RunState, ShardWriter,
     passes_prose_quality_filter, passes_code_quality_filter,
+    passes_transcript_quality_filter,
 )
 from topics import TOPIC_SEEDS
+import public_sources
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
@@ -205,7 +207,10 @@ class ScraperClient:
         return parsed
 
     async def extract(self, url: str) -> dict:
-        result = await self.session.call_tool("extract_article", {"url": url})
+        """Format-agnostic extraction: HTML, PDF, DOCX/PPTX/XLSX, images,
+        and video/audio (transcripts) all come back through this one call
+        now, dispatched server-side by extract_content."""
+        result = await self.session.call_tool("extract_content", {"url": url})
         return _first_json(result)
 
 
@@ -249,29 +254,273 @@ def _first_json(tool_result):
 # Main crawl loop
 # ---------------------------------------------------------------------------
 
+def _quality_filter_for(content_type: Optional[str], text: str, url: str, min_doc_chars: int) -> bool:
+    """Dispatch to the right quality bar for what extract_content actually
+    returned. content_type comes back from the server (html/pdf/docx/pptx/
+    xlsx/csv/image/video/audio/text); category alone isn't enough to know
+    this anymore since a "code" category doc might legitimately be a PDF
+    spec or a transcript of a talk, not just a source file."""
+    if content_type in ("video", "audio"):
+        return passes_transcript_quality_filter(text, min_doc_chars)
+    source_ext = os.path.splitext(url.split("?")[0].split("#")[0])[1].lower()
+    if source_ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+                       ".c", ".h", ".cpp", ".hpp", ".rb", ".php", ".sh", ".sql"}:
+        return passes_code_quality_filter(text, url, min_doc_chars)
+    return passes_prose_quality_filter(text, min_doc_chars)
+
+
+async def _process_article(article: dict, url: str, category: str, mode: str,
+                            min_doc_chars: int, use_llm_judge: bool, exact_dedup: ExactDedup,
+                            near_dedup, writer: ShardWriter, byte_budget: int,
+                            write_lock: asyncio.Lock, counters: dict) -> bool:
+    """Filter + (maybe) write one already-extracted article/row. Returns
+    True if a record was written. Shared by both the live-scrape path
+    (_process_hit, article comes from extract_content) and the public
+    dataset-hub path (_process_public_row, article comes from a HF/Kaggle
+    row already normalized to the same shape) -- everything downstream of
+    "I have text and a content_type" is identical regardless of where the
+    text came from."""
+    if not article or article.get("error") or not article.get("text"):
+        reason = article.get("error") if article else "no response"
+        reason_str = str(reason)
+        if "robots.txt" in reason_str or "blocked:" in reason_str:
+            counters["robots_blocked"] += 1
+        elif "video/media" in reason_str or "duration" in reason_str:
+            counters["video_skipped"] += 1
+        elif reason_str.startswith("HTTP "):
+            counters["http_error"] += 1
+        elif "not installed" in reason_str or "deps missing" in reason_str:
+            counters["missing_dependency"] += 1
+        else:
+            counters["other_extract_fail"] += 1
+        log.info(f"[extract:{category}] SKIP {url} -- {reason}")
+        return False
+
+    text = article["text"]
+    content_type = article.get("content_type")
+    log.debug(f"[extract:{category}] OK {url} -- {len(text)} chars, type={content_type}")
+
+    ok = _quality_filter_for(content_type, text, url, min_doc_chars)
+    if not ok:
+        counters["filtered_quality"] += 1
+        log.info(f"[filter:{category}] REJECT (quality heuristics) {url}")
+        return False
+
+    if use_llm_judge:
+        keep = await judge_quality(text, category)
+        if not keep:
+            counters["llm_rejected"] += 1
+            log.info(f"[filter:{category}] REJECT (llm judge) {url}")
+            return False
+
+    if mode == "sft":
+        # If the source already carries its own prompt/answer labels (a HF
+        # instruction dataset, a Kaggle Q&A CSV, ...), trust those over an
+        # LLM guess -- they're the dataset author's ground truth, not a
+        # hallucinated question. Only fall back to the built-in-AI
+        # extraction (Ollama inventing a Q/A pair from raw prose) when the
+        # row genuinely doesn't carry one.
+        extra = article.get("extra") or {}
+        given_prompt, given_answer = extra.get("prompt"), extra.get("answer")
+        if given_prompt and given_answer:
+            pair = {"prompt": given_prompt, "thinking": "", "answer": given_answer}
+        else:
+            pair = await extract_sft_pair(text, category)
+        if pair is None:
+            log.info(f"[filter:{category}] REJECT (no sft pair extractable) {url}")
+            return False
+        record = {**pair, "source": url, "category": category, "content_type": content_type}
+    else:
+        record = {"text": text, "source": url, "category": category, "content_type": content_type}
+
+    async with write_lock:
+        if writer.total_bytes >= byte_budget:
+            return False  # another concurrent task already hit budget
+        if exact_dedup.is_duplicate(text) or near_dedup.is_near_duplicate(text):
+            counters["filtered_dup"] += 1
+            log.info(f"[filter:{category}] REJECT (duplicate) {url}")
+            return False
+        writer.write(record)
+        log.info(f"[write:{category}] KEPT {url} ({len(text)} chars, type={content_type}) "
+                 f"-- total {writer.total_bytes/1024**2:.2f} MB / "
+                 f"{byte_budget/1024**2:.1f} MB, {writer.total_docs} docs")
+        return True
+
+
+async def _process_hit(scraper: ScraperClient, url: str, category: str, mode: str,
+                        min_doc_chars: int, use_llm_judge: bool, exact_dedup: ExactDedup,
+                        near_dedup, writer: ShardWriter, byte_budget: int,
+                        write_lock: asyncio.Lock, counters: dict) -> bool:
+    """Extract + filter + (maybe) write one URL. Returns True if a record
+    was written. Runs concurrently across many URLs; `write_lock` serializes
+    only the dedup-check-and-write step so budget/duplicate checks stay
+    correct under concurrency without serializing the slow network/ASR work."""
+    try:
+        article = await scraper.extract(url)
+    except Exception as e:
+        log.warning(f"[extract:{category}] failed for {url}: {e}")
+        counters["other_extract_fail"] += 1
+        return False
+
+    return await _process_article(article, url, category, mode, min_doc_chars, use_llm_judge,
+                                   exact_dedup, near_dedup, writer, byte_budget, write_lock,
+                                   counters)
+
+
+async def _process_public_row(article: dict, category: str, mode: str, min_doc_chars: int,
+                               use_llm_judge: bool, exact_dedup: ExactDedup, near_dedup,
+                               writer: ShardWriter, byte_budget: int, write_lock: asyncio.Lock,
+                               counters: dict) -> bool:
+    """Same as _process_hit but for a row that's already been fetched from
+    a public dataset hub (no network extract step needed -- public_sources
+    already normalized it to the extract_content shape)."""
+    url = article.get("url", "public-dataset-row")
+    return await _process_article(article, url, category, mode, min_doc_chars, use_llm_judge,
+                                   exact_dedup, near_dedup, writer, byte_budget, write_lock,
+                                   counters)
+
+
+async def run_public_sources_for_category(category: str, byte_budget: int, mode: str,
+                                           min_doc_chars: int, use_llm_judge: bool,
+                                           exact_dedup: ExactDedup, near_dedup,
+                                           writer: ShardWriter, write_lock: asyncio.Lock,
+                                           counters: dict, public_cfg: dict,
+                                           concurrency: int = 5) -> None:
+    """Drains Hugging Face / Kaggle datasets configured for this category
+    before falling back to live web scraping. Public sources are cheaper
+    and more reliable than scraping (no robots.txt, no rate limiting, no
+    HTML boilerplate to strip), so this runs first and only cedes the
+    remaining budget to the search+scrape loop.
+
+    `public_cfg` shape: {
+        "sources": {"huggingface", "kaggle"},       # which backends are on
+        "hf_datasets": {category: [dataset_id, ...]},   # explicit ids, optional
+        "kaggle_datasets": {category: [ref, ...]},      # explicit refs, optional
+        "max_rows_per_dataset": int,
+        "discover_limit": int,                          # datasets to auto-discover per category
+    }
+    If no explicit dataset ids/refs are given for a category, it falls back
+    to searching the hub using the category name + its topic seeds as the
+    query -- same "steer with topics.py, let it expand" philosophy as the
+    web-search query planner.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def bounded(article: dict) -> bool:
+        async with sem:
+            return await _process_public_row(article, category, mode, min_doc_chars,
+                                               use_llm_judge, exact_dedup, near_dedup,
+                                               writer, byte_budget, write_lock, counters)
+
+    max_rows = public_cfg.get("max_rows_per_dataset", 500)
+    discover_limit = public_cfg.get("discover_limit", 3)
+    search_query = " ".join(TOPIC_SEEDS.get(category, [category])[:2]) or category
+
+    def _lookup(cat_map: dict) -> Optional[list]:
+        return cat_map.get(category) or cat_map.get("__all__")
+
+    if "huggingface" in public_cfg.get("sources", set()):
+        hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
+        if not hf_ids:
+            hf_ids = await asyncio.to_thread(public_sources.discover_hf_datasets,
+                                              search_query, discover_limit)
+            log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
+        for ds_id in hf_ids:
+            if writer.total_bytes >= byte_budget:
+                break
+            log.info(f"[public-hf:{category}] streaming {ds_id} (max {max_rows} rows)")
+            batch, tasks = [], []
+            for row in await asyncio.to_thread(
+                    lambda ds=ds_id: list(public_sources.stream_hf_dataset(ds, max_rows=max_rows))):
+                batch.append(row)
+            for row in batch:
+                if writer.total_bytes >= byte_budget:
+                    break
+                tasks.append(asyncio.create_task(bounded(row)))
+                if len(tasks) >= concurrency * 2:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks = []
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    if "kaggle" in public_cfg.get("sources", set()):
+        kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
+        if not kg_refs:
+            kg_refs = await asyncio.to_thread(public_sources.discover_kaggle_datasets,
+                                               search_query, discover_limit)
+            log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
+        for ref in kg_refs:
+            if writer.total_bytes >= byte_budget:
+                break
+            log.info(f"[public-kaggle:{category}] downloading {ref} (max {max_rows} rows)")
+            rows = await asyncio.to_thread(
+                lambda r=ref: list(public_sources.fetch_kaggle_dataset_rows(r, max_rows=max_rows)))
+            tasks = []
+            for row in rows:
+                if writer.total_bytes >= byte_budget:
+                    break
+                tasks.append(asyncio.create_task(bounded(row)))
+                if len(tasks) >= concurrency * 2:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks = []
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"[public:{category}] after public-source top-up: "
+          f"{writer.total_bytes/1024**2:.2f} MB / {byte_budget/1024**2:.1f} MB, "
+          f"{writer.total_docs} docs")
+
+
 async def run_category(scraper: ScraperClient, category: str, byte_budget: int, out_dir: str,
-                        mode: str, min_doc_chars: int, use_llm_judge: bool):
+                        mode: str, min_doc_chars: int, use_llm_judge: bool, concurrency: int = 5,
+                        public_cfg: Optional[dict] = None):
     writer = ShardWriter(out_dir, category)
     exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
     near_dedup = NearDedup()
+    state = RunState(out_dir, category)  # resumable across process runs
+    write_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(concurrency)
 
-    seen_urls = set()
-    used_queries = []
-    n_filtered_quality = 0
-    n_filtered_dup = 0
-    n_llm_rejected = 0
+    counters = {
+        "filtered_quality": 0, "filtered_dup": 0, "llm_rejected": 0,
+        "robots_blocked": 0, "http_error": 0, "video_skipped": 0,
+        "missing_dependency": 0, "other_extract_fail": 0,
+    }
 
-    print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB (live web scraping) ===")
+    resumed = f" (resumed: {len(state.used_queries)} prior queries, {len(state.seen_urls)} prior URLs)" \
+        if state.used_queries or state.seen_urls else ""
+    print(f"\n=== [{category}] target: {byte_budget / 1024**2:.1f} MB "
+          f"(live web scraping, concurrency={concurrency}){resumed} ===")
+
+    if public_cfg and public_cfg.get("sources"):
+        await run_public_sources_for_category(
+            category, byte_budget, mode, min_doc_chars, use_llm_judge,
+            exact_dedup, near_dedup, writer, write_lock, counters, public_cfg,
+            concurrency=concurrency,
+        )
+        if public_cfg.get("public_only"):
+            state.save()
+            print(f"\n[{category}] public-sources-only run done: "
+                  f"{writer.total_bytes / 1024**2:.2f} MB, {writer.total_docs} docs, "
+                  f"filtered {counters['filtered_quality']} low-quality + "
+                  f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected")
+            writer.close()
+            return writer.total_bytes, writer.total_docs
+
+    async def bounded_process(url: str):
+        async with sem:
+            return await _process_hit(scraper, url, category, mode, min_doc_chars,
+                                       use_llm_judge, exact_dedup, near_dedup, writer,
+                                       byte_budget, write_lock, counters)
 
     stall_rounds = 0
     while writer.total_bytes < byte_budget:
-        queries = await plan_queries(category, used_queries, n=6)
-        used_queries.extend(queries)
+        queries = await plan_queries(category, state.used_queries, n=6)
+        state.used_queries.extend(queries)
         progressed_this_round = False
+        round_urls = []
 
         for query in queries:
-            if writer.total_bytes >= byte_budget:
-                break
             log.info(f"[search:{category}] query={query!r}")
             try:
                 hits = await scraper.search(query, max_results=8)
@@ -292,64 +541,25 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
 
             for hit in hits:
                 url = hit.get("url") if isinstance(hit, dict) else None
-                if not url:
+                if not url or url in state.seen_urls:
                     continue
-                if url in seen_urls:
-                    log.debug(f"[skip:{category}] already seen: {url}")
-                    continue
-                seen_urls.add(url)
+                state.seen_urls.add(url)
+                round_urls.append(url)
 
-                try:
-                    article = await scraper.extract(url)
-                except Exception as e:
-                    log.warning(f"[extract:{category}] failed for {url}: {e}")
-                    continue
-                if not article or article.get("error") or not article.get("text"):
-                    reason = article.get("error") if article else "no response"
-                    log.info(f"[extract:{category}] SKIP {url} -- {reason}")
-                    continue
+        # Extract this round's URLs concurrently (bounded by --concurrency)
+        # instead of one at a time -- this is where wall-clock time actually
+        # goes (network fetch + optional ASR/OCR), so serializing it was the
+        # single biggest throughput bottleneck in the original loop.
+        if round_urls:
+            results = await asyncio.gather(*(bounded_process(u) for u in round_urls),
+                                             return_exceptions=True)
+            for r in results:
+                if r is True:
+                    progressed_this_round = True
+                elif isinstance(r, Exception):
+                    log.warning(f"[{category}] worker task raised: {r}")
 
-                text = article["text"]
-                log.debug(f"[extract:{category}] OK {url} -- {len(text)} chars")
-
-                if category == "code":
-                    ok = passes_code_quality_filter(text, url, min_doc_chars)
-                else:
-                    ok = passes_prose_quality_filter(text, min_doc_chars)
-                if not ok:
-                    n_filtered_quality += 1
-                    log.info(f"[filter:{category}] REJECT (quality heuristics) {url}")
-                    continue
-
-                if exact_dedup.is_duplicate(text) or near_dedup.is_near_duplicate(text):
-                    n_filtered_dup += 1
-                    log.info(f"[filter:{category}] REJECT (duplicate) {url}")
-                    continue
-
-                if use_llm_judge:
-                    keep = await judge_quality(text, category)
-                    if not keep:
-                        n_llm_rejected += 1
-                        log.info(f"[filter:{category}] REJECT (llm judge) {url}")
-                        continue
-
-                if mode == "sft":
-                    pair = await extract_sft_pair(text, category)
-                    if pair is None:
-                        log.info(f"[filter:{category}] REJECT (no sft pair extractable) {url}")
-                        continue
-                    record = {**pair, "source": url, "category": category}
-                else:
-                    record = {"text": text, "source": url, "category": category}
-
-                writer.write(record)
-                log.info(f"[write:{category}] KEPT {url} ({len(text)} chars) "
-                         f"-- total {writer.total_bytes/1024**2:.2f} MB / "
-                         f"{byte_budget/1024**2:.1f} MB, {writer.total_docs} docs")
-                progressed_this_round = True
-
-                if writer.total_bytes >= byte_budget:
-                    break
+        state.save()
 
         if not progressed_this_round:
             stall_rounds += 1
@@ -364,8 +574,12 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
 
     print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
           f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s), "
-          f"filtered {n_filtered_quality} low-quality + {n_filtered_dup} duplicate + "
-          f"{n_llm_rejected} llm-rejected")
+          f"filtered {counters['filtered_quality']} low-quality + {counters['filtered_dup']} duplicate + "
+          f"{counters['llm_rejected']} llm-rejected\n"
+          f"[{category}] fetch failures: {counters['robots_blocked']} robots.txt/domain-blocked, "
+          f"{counters['http_error']} HTTP error (403/etc.), {counters['video_skipped']} video/duration-skipped, "
+          f"{counters['missing_dependency']} missing optional dependency, "
+          f"{counters['other_extract_fail']} other extraction failures")
     writer.close()
     return writer.total_bytes, writer.total_docs
 
@@ -402,40 +616,73 @@ async def main_async(args):
     mix = {c: f / total_frac for c, f in mix.items()}
 
     os.makedirs(args.out_dir, exist_ok=True)
-    server_path = os.environ.get("MCP_SERVER_PATH") or _find_server_path()
-    log.info(f"Launching MCP server: {sys.executable} {server_path}")
-    server_params = StdioServerParameters(command=sys.executable, args=[server_path])
 
     manifest_path = os.path.join(args.out_dir, "manifest.json")
     manifest = {"target_bytes": target_bytes, "mix": mix, "categories": {}, "mode": args.mode}
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            try:
-                await asyncio.wait_for(session.initialize(), timeout=30)
-            except asyncio.TimeoutError:
-                log.error(
-                    "Timed out after 30s waiting for the MCP server to respond to "
-                    "initialize(). The subprocess likely crashed on startup (missing "
-                    "dependency, import error) or is hanging before it even prints "
-                    "anything. Run it directly to see the real error:\n"
-                    f"    {sys.executable} {server_path}"
-                )
-                raise
-            log.info("MCP server initialized OK.")
-            scraper = ScraperClient(session)
+    public_cfg = None
+    public_source_set = {s.strip().lower() for s in (args.public_sources or "").split(",") if s.strip()}
+    if public_source_set:
+        public_cfg = {
+            "sources": public_source_set,
+            "hf_datasets": _parse_category_map(args.hf_datasets),
+            "kaggle_datasets": _parse_category_map(args.kaggle_datasets),
+            "max_rows_per_dataset": args.public_max_rows,
+            "discover_limit": args.public_discover_limit,
+            "public_only": args.public_only,
+        }
+        log.info(f"Public dataset sources enabled: {public_source_set} "
+                 f"(public_only={args.public_only})")
 
-            for category, frac in mix.items():
-                budget = int(target_bytes * frac)
-                if budget <= 0:
-                    continue
-                actual_bytes, docs = await run_category(
-                    scraper, category, budget, args.out_dir, args.mode,
-                    args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
-                )
-                manifest["categories"][category] = {
-                    "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
-                }
+    if public_cfg and public_cfg.get("public_only"):
+        # No live scraping requested at all -- skip spinning up the MCP
+        # subprocess entirely, since ScraperClient/scraper is never touched
+        # on the public-sources-only return path in run_category.
+        log.info("public_only=True: skipping MCP scraper subprocess launch.")
+        for category, frac in mix.items():
+            budget = int(target_bytes * frac)
+            if budget <= 0:
+                continue
+            actual_bytes, docs = await run_category(
+                None, category, budget, args.out_dir, args.mode,
+                args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
+                concurrency=args.concurrency, public_cfg=public_cfg,
+            )
+            manifest["categories"][category] = {
+                "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
+            }
+    else:
+        server_path = os.environ.get("MCP_SERVER_PATH") or _find_server_path()
+        log.info(f"Launching MCP server: {sys.executable} {server_path}")
+        server_params = StdioServerParameters(command=sys.executable, args=[server_path])
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                try:
+                    await asyncio.wait_for(session.initialize(), timeout=30)
+                except asyncio.TimeoutError:
+                    log.error(
+                        "Timed out after 30s waiting for the MCP server to respond to "
+                        "initialize(). The subprocess likely crashed on startup (missing "
+                        "dependency, import error) or is hanging before it even prints "
+                        "anything. Run it directly to see the real error:\n"
+                        f"    {sys.executable} {server_path}"
+                    )
+                    raise
+                log.info("MCP server initialized OK.")
+                scraper = ScraperClient(session)
+
+                for category, frac in mix.items():
+                    budget = int(target_bytes * frac)
+                    if budget <= 0:
+                        continue
+                    actual_bytes, docs = await run_category(
+                        scraper, category, budget, args.out_dir, args.mode,
+                        args.min_doc_chars, use_llm_judge=not args.no_llm_judge,
+                        concurrency=args.concurrency, public_cfg=public_cfg,
+                    )
+                    manifest["categories"][category] = {
+                        "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
+                    }
 
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
@@ -444,6 +691,28 @@ async def main_async(args):
     print(f"\n=== Done. Total: {total_actual / 1024**2:.2f} MB across "
           f"{len(manifest['categories'])} categories ===")
     print(f"Manifest written to {manifest_path}")
+
+
+def _parse_category_map(spec: Optional[str]) -> dict:
+    """Parses `category=id1,id2;category2=id3,id4` into
+    {"category": ["id1", "id2"], "category2": ["id3", "id4"]}. A bare
+    comma list with no `category=` prefix (e.g. just `id1,id2`) is applied
+    to every category -- convenient when you want the same dataset(s)
+    pulled regardless of which category bucket they land in."""
+    if not spec:
+        return {}
+    result: dict = {}
+    segments = [s.strip() for s in spec.split(";") if s.strip()]
+    bare_ids = []
+    for seg in segments:
+        if "=" in seg:
+            cat, ids = seg.split("=", 1)
+            result[cat.strip()] = [i.strip() for i in ids.split(",") if i.strip()]
+        else:
+            bare_ids.extend(i.strip() for i in seg.split(",") if i.strip())
+    if bare_ids:
+        result["__all__"] = bare_ids
+    return result
 
 
 def _parse_size(size_str: str) -> int:
@@ -465,10 +734,47 @@ def main():
     parser.add_argument("--min-doc-chars", type=int, default=500)
     parser.add_argument("--no-llm-judge", action="store_true",
                          help="Skip the Ollama quality-judging pass, keep only heuristic filters (faster)")
+    parser.add_argument("--concurrency", type=int, default=5,
+                         help="Max concurrent extract+filter tasks per category round (default 5). "
+                              "Raise for I/O-bound HTML/PDF-heavy runs; keep low if ASR transcription "
+                              "is in play (each faster-whisper call is CPU/GPU-heavy) or the LLM judge "
+                              "is on (concurrent calls just queue behind a single local Ollama model).")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                          help="DEBUG shows every Ollama call, skipped/seen URLs, and full text lengths; "
                               "INFO (default) shows every query, hit list, extract skip reason, filter "
                               "rejection reason, and write, without the very-verbose stuff.")
+
+    public = parser.add_argument_group(
+        "public dataset sources",
+        "Pull rows from Hugging Face / Kaggle as a faster, more reliable top-up before (or "
+        "instead of) live web scraping. Rows go through the exact same quality filters, "
+        "LLM judge, and (in --mode sft) the same built-in-AI Q/A extraction as scraped pages.")
+    public.add_argument("--public-sources", default=None,
+                         help="Comma list of public hub backends to pull from: huggingface,kaggle. "
+                              "Unset (default) disables this feature entirely, matching prior behavior.")
+    public.add_argument("--hf-datasets", default=None,
+                         help="Explicit Hugging Face dataset ids to stream. Syntax: "
+                              "'category=id1,id2;category2=id3', or a bare 'id1,id2' to apply to "
+                              "every category. If omitted, ids are auto-discovered per category via "
+                              "the Hub search API using that category's topic seeds as the query.")
+    public.add_argument("--kaggle-datasets", default=None,
+                         help="Explicit Kaggle dataset refs (owner/dataset-slug), same syntax as "
+                              "--hf-datasets. Requires KAGGLE_USERNAME/KAGGLE_KEY env vars (or "
+                              "~/.kaggle/kaggle.json). If omitted, refs are auto-discovered per "
+                              "category via Kaggle's search API.")
+    public.add_argument("--public-max-rows", type=int, default=500,
+                         help="Max rows to pull per dataset (default 500). Still passes through "
+                              "every quality filter / dedup check / LLM judge, so this is a ceiling "
+                              "on how much is *considered*, not how much is written.")
+    public.add_argument("--public-discover-limit", type=int, default=3,
+                         help="When dataset ids/refs aren't given explicitly, how many datasets to "
+                              "auto-discover per category via hub search (default 3).")
+    public.add_argument("--public-only", action="store_true",
+                         help="Skip live web search/scraping entirely -- fill each category's "
+                              "budget purely from the configured public dataset hubs, and don't "
+                              "even launch the MCP scraper subprocess. Useful when you just want a "
+                              "fast Kaggle/HF-only top-up run.")
+
     args = parser.parse_args()
     logging.getLogger("dataset_agent").setLevel(args.log_level)
     asyncio.run(main_async(args))
