@@ -51,9 +51,29 @@ _TEXT_COLUMNS = (
     "text", "content", "document", "article", "body", "passage",
     "abstract", "sentence", "description",
 )
-_PROMPT_COLUMNS = ("prompt", "question", "instruction", "input", "query")
+# NOTE: "problem" and "task" were added after HuggingFaceH4/MATH-500 (whose
+# real columns are problem/solution/answer) was observed being rejected --
+# without "problem" here, prompt comes back None, the row never counts as a
+# labeled pair, and it silently falls back to the much stricter prose filter
+# regardless of how short-but-valid the actual Q&A content is.
+_PROMPT_COLUMNS = ("prompt", "question", "instruction", "input", "query", "problem", "task")
 _ANSWER_COLUMNS = ("answer", "response", "output", "completion", "solution", "answers")
 _CODE_COLUMNS = ("code", "solution_code", "func_code", "program")
+
+# Chat-format columns hold the whole exchange as a list of turn dicts --
+# ShareGPT-style [{"from": "human", "value": "..."}, {"from": "gpt", ...}]
+# or OpenAI-style [{"role": "user", "content": "..."}, {"role": "assistant",
+# ...}]. These are common across instruct datasets but NEVER match
+# _first_str (they're lists, not strings), so without explicit handling
+# every row from a conversational dataset falls through to the "join every
+# string field" last resort below -- which drops the prompt/answer
+# structure entirely and often produces empty or near-empty text, since the
+# actual content lives one level down inside the list.
+_CONVERSATION_COLUMNS = ("conversations", "messages", "conversation")
+_TURN_ROLE_KEYS = ("from", "role")
+_TURN_VALUE_KEYS = ("value", "content", "text")
+_HUMAN_ROLE_VALUES = {"human", "user", "prompter"}
+_ASSISTANT_ROLE_VALUES = {"gpt", "assistant", "bot", "model"}
 
 
 def _first_str(row: dict, candidates) -> Optional[str]:
@@ -64,15 +84,62 @@ def _first_str(row: dict, candidates) -> Optional[str]:
     return None
 
 
+def _turn_role_and_value(turn: dict) -> tuple:
+    role = None
+    for k in _TURN_ROLE_KEYS:
+        if isinstance(turn.get(k), str):
+            role = turn[k].strip().lower()
+            break
+    value = None
+    for k in _TURN_VALUE_KEYS:
+        if isinstance(turn.get(k), str) and turn[k].strip():
+            value = turn[k].strip()
+            break
+    return role, value
+
+
+def _prompt_answer_from_conversation(row: dict) -> tuple:
+    """Pull a (prompt, answer) pair from the first human->assistant turn of
+    a chat-format column, if one exists. Returns (None, None) if no
+    conversation column is present or it doesn't parse as expected --
+    callers fall back to their existing heuristics in that case."""
+    for col in row:
+        if col.lower() not in _CONVERSATION_COLUMNS:
+            continue
+        turns = row[col]
+        if not isinstance(turns, list) or not turns:
+            continue
+        prompt, answer = None, None
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            role, value = _turn_role_and_value(turn)
+            if not value:
+                continue
+            if prompt is None and role in _HUMAN_ROLE_VALUES:
+                prompt = value
+            elif prompt is not None and answer is None and role in _ASSISTANT_ROLE_VALUES:
+                answer = value
+                break
+        if prompt and answer:
+            return prompt, answer
+    return None, None
+
+
 def row_to_record(row: dict, source_label: str, dataset_id: str, ref: str) -> dict:
     """Normalize one raw dict from a HF/Kaggle dataset into the shared
     extract_content-shaped record. Prefers an explicit prompt/answer pair
     (the dataset author's own labels are more trustworthy than an LLM
-    guessing one), falls back to a generic text column, and as a last
-    resort concatenates every string field so nothing usable is dropped
-    silently."""
+    guessing one) -- checking both flat string columns and chat-format
+    conversation columns -- falls back to a generic text column, and as a
+    last resort concatenates every string field so nothing usable is
+    dropped silently."""
     prompt = _first_str(row, _PROMPT_COLUMNS)
     answer = _first_str(row, _ANSWER_COLUMNS) or _first_str(row, _CODE_COLUMNS)
+    if not (prompt and answer):
+        conv_prompt, conv_answer = _prompt_answer_from_conversation(row)
+        prompt = prompt or conv_prompt
+        answer = answer or conv_answer
 
     text = _first_str(row, _TEXT_COLUMNS)
     if not text:
