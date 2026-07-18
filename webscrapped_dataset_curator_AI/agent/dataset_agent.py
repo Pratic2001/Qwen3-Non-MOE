@@ -418,6 +418,25 @@ async def _process_deep_crawl_page(page: dict, category: str, mode: str, min_doc
                                    counters)
 
 
+def _drain_rows_to_staging(row_iter, fh, budget_remaining: int) -> tuple:
+    """Blocking helper: pull rows from a (streaming, network-backed)
+    generator and append each as one JSON line to an already-open staging
+    file handle, stopping once `budget_remaining` raw text bytes have been
+    written or the generator is exhausted -- whichever comes first. Runs
+    inside asyncio.to_thread since dataset/network iteration blocks.
+    Returns (rows_written, raw_text_bytes_written)."""
+    rows_written = 0
+    raw_bytes = 0
+    for row in row_iter:
+        if raw_bytes >= budget_remaining:
+            break
+        fh.write(json.dumps(row) + "\n")
+        rows_written += 1
+        raw_bytes += len((row.get("text") or "").encode("utf-8", errors="ignore"))
+    fh.flush()
+    return rows_written, raw_bytes
+
+
 async def run_public_sources_for_category(category: str, byte_budget: int, mode: str,
                                            min_doc_chars: int, use_llm_judge: bool,
                                            exact_dedup: ExactDedup, near_dedup,
@@ -430,12 +449,44 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     HTML boilerplate to strip), so this runs first and only cedes the
     remaining budget to the search+scrape loop.
 
+    Two explicit phases, run in order, never interleaved:
+
+    1. **Raw download** -- pull rows from each configured/discovered
+       dataset and stage them as JSON lines in
+       `<out-dir>/<category>/.public_raw_staging.jsonl`, stopping once
+       `byte_budget` worth of raw (pre-filter) text has been pulled across
+       all datasets for this category, or every dataset/row budget is
+       exhausted. Nothing is quality-filtered, judged, deduped, or written
+       to the real output shards yet at this point.
+    2. **Filter + write** -- only after phase 1 finishes, every staged row
+       is run through the same heuristic quality filters + (if enabled)
+       the Ollama LLM judge as any other source, and passing rows are
+       written to the category's shards. The staging file is deleted
+       afterward (unless `public_cfg["keep_raw_staging"]` is set).
+
+    Splitting it this way means the (slow, one-network/API-call-per-row)
+    download step and the (slow, one-Ollama-call-per-doc when the judge is
+    on) filtering step never compete for time in the same pass, and you
+    can see exactly how much raw data was actually available before
+    filtering ran -- rather than the two being interleaved per-dataset and
+    the run silently stopping once *written* (post-filter) bytes hit
+    budget, which could quietly cut a download short well before other
+    available datasets/rows were even tried.
+
+    Because filtering only ever shrinks a raw pull, the final written size
+    for a category will typically end up SMALLER than byte_budget -- that's
+    expected, not a bug. If you need to hit budget after filtering, raise
+    `--public-max-rows` / `--public-discover-limit`, or pass more explicit
+    `--hf-datasets`/`--kaggle-datasets`, so phase 1 has more raw material
+    to draw from.
+
     `public_cfg` shape: {
         "sources": {"huggingface", "kaggle"},       # which backends are on
         "hf_datasets": {category: [dataset_id, ...]},   # explicit ids, optional
         "kaggle_datasets": {category: [ref, ...]},      # explicit refs, optional
         "max_rows_per_dataset": int,
         "discover_limit": int,                          # datasets to auto-discover per category
+        "keep_raw_staging": bool,                       # keep the staged JSONL after filtering
     }
     If no explicit dataset ids/refs are given for a category, it falls back
     to auto-discovery: searching the hub with each of that category's
@@ -457,6 +508,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
 
     max_rows = public_cfg.get("max_rows_per_dataset", 500)
     discover_limit = public_cfg.get("discover_limit", 3)
+    keep_raw_staging = public_cfg.get("keep_raw_staging", False)
     search_keywords = HUB_SEARCH_KEYWORDS.get(category, [category])
 
     def _lookup(cat_map: dict) -> Optional[list]:
@@ -479,50 +531,93 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                     found.append(h)
         return found[:discover_limit]
 
-    if "huggingface" in public_cfg.get("sources", set()):
-        hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
-        if not hf_ids:
-            hf_ids = await _discover(public_sources.discover_hf_datasets, "public-hf")
-            log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
-        for ds_id in hf_ids:
-            if writer.total_bytes >= byte_budget:
-                break
-            log.info(f"[public-hf:{category}] streaming {ds_id} (max {max_rows} rows)")
-            batch, tasks = [], []
-            for row in await asyncio.to_thread(
-                    lambda ds=ds_id: list(public_sources.stream_hf_dataset(ds, max_rows=max_rows))):
-                batch.append(row)
-            for row in batch:
-                if writer.total_bytes >= byte_budget:
-                    break
-                tasks.append(asyncio.create_task(bounded(row)))
-                if len(tasks) >= concurrency * 2:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    tasks = []
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+    # -----------------------------------------------------------------
+    # Phase 1: raw download to budget (no filtering/judging/writing yet)
+    # -----------------------------------------------------------------
+    staging_path = os.path.join(writer.dir, ".public_raw_staging.jsonl")
+    raw_bytes_downloaded = 0
+    raw_rows_downloaded = 0
 
-    if "kaggle" in public_cfg.get("sources", set()):
-        kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
-        if not kg_refs:
-            kg_refs = await _discover(public_sources.discover_kaggle_datasets, "public-kaggle")
-            log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
-        for ref in kg_refs:
+    with open(staging_path, "w") as fh:
+        if "huggingface" in public_cfg.get("sources", set()):
+            hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
+            if not hf_ids:
+                hf_ids = await _discover(public_sources.discover_hf_datasets, "public-hf")
+                log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
+            for ds_id in hf_ids:
+                if raw_bytes_downloaded >= byte_budget:
+                    break
+                remaining = byte_budget - raw_bytes_downloaded
+                log.info(f"[public-hf:{category}] downloading {ds_id} (raw pull, up to "
+                          f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
+                gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows)
+                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
+                raw_rows_downloaded += n
+                raw_bytes_downloaded += b
+                log.info(f"[public-hf:{category}] {ds_id} -> {n} rows, {b/1024**2:.2f} MB "
+                          f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
+
+        if "kaggle" in public_cfg.get("sources", set()) and raw_bytes_downloaded < byte_budget:
+            kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
+            if not kg_refs:
+                kg_refs = await _discover(public_sources.discover_kaggle_datasets, "public-kaggle")
+                log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
+            for ref in kg_refs:
+                if raw_bytes_downloaded >= byte_budget:
+                    break
+                remaining = byte_budget - raw_bytes_downloaded
+                log.info(f"[public-kaggle:{category}] downloading {ref} (raw pull, up to "
+                          f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
+                gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows)
+                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
+                raw_rows_downloaded += n
+                raw_bytes_downloaded += b
+                log.info(f"[public-kaggle:{category}] {ref} -> {n} rows, {b/1024**2:.2f} MB "
+                          f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
+
+    print(f"[public:{category}] raw download done: {raw_rows_downloaded} rows, "
+          f"{raw_bytes_downloaded/1024**2:.2f} MB staged to {staging_path} "
+          f"(target was {byte_budget/1024**2:.1f} MB)")
+    if raw_bytes_downloaded < byte_budget:
+        log.warning(f"[public:{category}] raw download fell short of target "
+                     f"({raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB) -- ran out of "
+                     f"discovered/configured datasets or rows-per-dataset before hitting budget. "
+                     f"Raise --public-max-rows and/or --public-discover-limit, or pass explicit "
+                     f"--hf-datasets/--kaggle-datasets, to pull more raw material next time.")
+
+    # -----------------------------------------------------------------
+    # Phase 2: filter (heuristics + optional LLM judge) + write, only now
+    # -----------------------------------------------------------------
+    print(f"[public:{category}] starting filter pass over {raw_rows_downloaded} staged rows"
+          + (" (LLM judge on)" if use_llm_judge else " (heuristics only, --no-llm-judge)"))
+    tasks = []
+    with open(staging_path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
             if writer.total_bytes >= byte_budget:
                 break
-            log.info(f"[public-kaggle:{category}] downloading {ref} (max {max_rows} rows)")
-            rows = await asyncio.to_thread(
-                lambda r=ref: list(public_sources.fetch_kaggle_dataset_rows(r, max_rows=max_rows)))
-            tasks = []
-            for row in rows:
-                if writer.total_bytes >= byte_budget:
-                    break
-                tasks.append(asyncio.create_task(bounded(row)))
-                if len(tasks) >= concurrency * 2:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    tasks = []
-            if tasks:
+            try:
+                row = json.loads(line)
+            except Exception as e:
+                log.warning(f"[public:{category}] skipping unparseable staged row: {e}")
+                continue
+            tasks.append(asyncio.create_task(bounded(row)))
+            if len(tasks) >= concurrency * 2:
                 await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    if keep_raw_staging:
+        log.info(f"[public:{category}] keeping raw staging file at {staging_path} "
+                  f"(--public-keep-raw-staging)")
+    else:
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
 
     print(f"[public:{category}] after public-source top-up: "
           f"{writer.total_bytes/1024**2:.2f} MB / {byte_budget/1024**2:.1f} MB, "
@@ -745,6 +840,7 @@ async def main_async(args):
             "max_rows_per_dataset": args.public_max_rows,
             "discover_limit": args.public_discover_limit,
             "public_only": args.public_only,
+            "keep_raw_staging": args.public_keep_raw_staging,
         }
         log.info(f"Public dataset sources enabled: {public_source_set} "
                  f"(public_only={args.public_only})")
@@ -877,8 +973,13 @@ def main():
     public = parser.add_argument_group(
         "public dataset sources",
         "Pull rows from Hugging Face / Kaggle as a faster, more reliable top-up before (or "
-        "instead of) live web scraping. Rows go through the exact same quality filters, "
-        "LLM judge, and (in --mode sft) the same built-in-AI Q/A extraction as scraped pages.")
+        "instead of) live web scraping. For each category: first ALL configured/discovered "
+        "datasets are downloaded (raw, unfiltered) to a staging file until that category's "
+        "byte budget worth of raw text is pulled or datasets/rows run out; only THEN does the "
+        "filter pass run -- the exact same heuristic quality filters, LLM judge, and (in "
+        "--mode sft) the same built-in-AI Q/A extraction as scraped pages -- over everything "
+        "staged, writing passing rows to the category's shards. Final written size is usually "
+        "smaller than the byte budget, since filtering discards some of what was downloaded.")
     public.add_argument("--public-sources", default=None,
                          help="Comma list of public hub backends to pull from: huggingface,kaggle. "
                               "Unset (default) disables this feature entirely, matching prior behavior.")
@@ -886,19 +987,29 @@ def main():
                          help="Explicit Hugging Face dataset ids to stream. Syntax: "
                               "'category=id1,id2;category2=id3', or a bare 'id1,id2' to apply to "
                               "every category. If omitted, ids are auto-discovered per category via "
-                              "the Hub search API using that category's topic seeds as the query.")
+                              "the Hub search API using short curated keywords (see topics.py's "
+                              "HUB_SEARCH_KEYWORDS), not the long natural-language web-search topics.")
     public.add_argument("--kaggle-datasets", default=None,
                          help="Explicit Kaggle dataset refs (owner/dataset-slug), same syntax as "
                               "--hf-datasets. Requires KAGGLE_USERNAME/KAGGLE_KEY env vars (or "
                               "~/.kaggle/kaggle.json). If omitted, refs are auto-discovered per "
                               "category via Kaggle's search API.")
     public.add_argument("--public-max-rows", type=int, default=500,
-                         help="Max rows to pull per dataset (default 500). Still passes through "
-                              "every quality filter / dedup check / LLM judge, so this is a ceiling "
-                              "on how much is *considered*, not how much is written.")
+                         help="Max rows to pull per dataset during the raw-download phase (default "
+                              "500) -- a per-dataset safety ceiling, separate from the overall "
+                              "per-category byte budget the download phase stops at. For large "
+                              "target sizes (multi-GB+ per category), raise this substantially, since "
+                              "the default 500 rows/dataset x a handful of discovered datasets won't "
+                              "get remotely close to a multi-GB raw pull on its own.")
     public.add_argument("--public-discover-limit", type=int, default=3,
                          help="When dataset ids/refs aren't given explicitly, how many datasets to "
                               "auto-discover per category via hub search (default 3).")
+    public.add_argument("--public-keep-raw-staging", action="store_true",
+                         help="Keep each category's raw (pre-filter) staged JSONL "
+                              "(<out-dir>/<category>/.public_raw_staging.jsonl) after the filter pass "
+                              "instead of deleting it -- useful for inspecting exactly what was "
+                              "downloaded before filtering, or for re-running the filter pass "
+                              "yourself without re-downloading.")
     public.add_argument("--public-only", action="store_true",
                          help="Skip live web search/scraping entirely -- fill each category's "
                               "budget purely from the configured public dataset hubs, and don't "
