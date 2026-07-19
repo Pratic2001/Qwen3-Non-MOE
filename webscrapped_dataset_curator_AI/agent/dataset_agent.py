@@ -507,6 +507,20 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
         payload["system"] = system
     if json_mode:
         payload["format"] = "json"
+        # Reasoning-capable models (qwen3, deepseek-r1, gpt-oss, ...)
+        # default to an internal "thinking" pass. Observed failure modes
+        # without this: (1) the model narrates its reasoning in plain
+        # prose ("We have a dataset schema with columns... So we need to
+        # output JSON...") and the generation budget runs out before it
+        # ever emits the actual JSON, so `response` is truncated prose,
+        # not JSON; (2) on some Ollama versions the entire completion
+        # routes into a separate `thinking` field and `response` comes
+        # back completely empty despite HTTP 200. Every json_mode caller
+        # here wants machine-parseable structured output, never a
+        # reasoning trace, so disable it explicitly. Ollama silently
+        # ignores unknown request fields, so this is a harmless no-op on
+        # models that don't support extended thinking at all.
+        payload["think"] = False
     log.debug(f"[ollama] -> model={OLLAMA_MODEL} prompt={prompt[:120]!r}...")
     start = time.time()
     async with httpx.AsyncClient(timeout=120) as client:
@@ -527,7 +541,17 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
                 f"entirely, re-run with --no-llm-judge or --fast-heuristics."
             )
         resp.raise_for_status()
-        text = resp.json().get("response", "")
+        data = resp.json()
+        text = data.get("response", "")
+        if not text and data.get("thinking"):
+            # Belt-and-suspenders: think=False didn't fully suppress it (or
+            # this Ollama version always splits response/thinking
+            # regardless) and the model's actual answer ended up in the
+            # thinking trace. Better to try recovering JSON from it than
+            # return nothing and force every caller to fall back.
+            log.debug(f"[ollama] response empty but thinking field present "
+                      f"({len(data['thinking'])} chars); using it as fallback")
+            text = data["thinking"]
     log.debug(f"[ollama] <- ({time.time()-start:.1f}s) {text[:120]!r}...")
     return text
 
@@ -586,7 +610,9 @@ async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
         "You generate web search queries for building a language-model "
         "training corpus. Return ONLY a JSON object: "
         '{"queries": ["...", "..."]}. Queries must be short (3-8 words), '
-        "specific, and diverse -- avoid vague single-word queries."
+        "specific, and diverse -- avoid vague single-word queries. Do not "
+        "explain your reasoning or add any text before/after the JSON -- "
+        "the JSON object must be your entire response."
     )
     prompt = (
         f"Category: {category}\n"
@@ -643,8 +669,9 @@ async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bo
             "answer a correct, on-topic response to the prompt, (2) is the "
             "pair coherent (not garbled, not truncated mid-thought, not "
             "boilerplate/placeholder text). Do NOT reject for brevity alone. "
-            f"Category: {category}. "
-            'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
+            f"Category: {category}. Do not explain your reasoning -- respond "
+            'with ONLY this JSON object, nothing before or after it: '
+            '{"keep": true} or {"keep": false}.'
         )
     else:
         system = (
@@ -652,8 +679,9 @@ async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bo
             "data for a language model. Reject: boilerplate, ads/nav menus, "
             "listicles with no substance, spam, incoherent machine-translated "
             "text, or content that's mostly links/references with little prose. "
-            f"Accept substantive {category} content. "
-            'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
+            f"Accept substantive {category} content. Do not explain your "
+            "reasoning -- respond with ONLY this JSON object, nothing before "
+            'or after it: {"keep": true} or {"keep": false}.'
         )
     snippet = text[:3000]
     try:
@@ -696,7 +724,8 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
         "tuning example. Ask a specific, well-posed question that the "
         "article answers, then answer it accurately using ONLY information "
         "in the article, in your own words (do not quote the article "
-        'verbatim). Respond ONLY with JSON: '
+        "verbatim). Do not explain your reasoning -- respond with ONLY "
+        'this JSON object, nothing before or after it: '
         '{"prompt": "...", "answer": "..."} or {"prompt": null} if no good '
         "question/answer pair exists in this text."
     )
@@ -798,7 +827,9 @@ async def infer_column_mapping(dataset_id: str, config: Optional[str],
         "(only relevant if the row is NOT a Q&A pair, e.g. a plain "
         "article/passage). Use EXACT column names from the list given, or "
         "null if none fits -- never invent a name that isn't in the list. "
-        'Respond ONLY with JSON: {"prompt_col": "..."|null, '
+        "Do not explain your reasoning or narrate your analysis -- respond "
+        'with ONLY this JSON object, nothing before or after it: '
+        '{"prompt_col": "..."|null, '
         '"answer_col": "..."|null, "conversation_col": "..."|null, '
         '"text_col": "..."|null}'
     )
