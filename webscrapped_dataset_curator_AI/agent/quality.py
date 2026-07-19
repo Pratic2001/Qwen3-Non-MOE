@@ -34,6 +34,19 @@ def _alpha_ratio(text: str) -> float:
     return alpha / len(text)
 
 
+def _alnum_ratio(text: str) -> float:
+    """Like _alpha_ratio but counts digits as content too. Pure-alpha
+    ratio scores a correct answer like '42' or 'x = 3/4' as mostly
+    non-content (digits and math operators aren't str.isalpha()), which
+    was silently rejecting perfectly good terse numeric/symbolic answers
+    -- exactly the kind math/science SFT data is full of. Still catches
+    real junk (markup soup, whitespace runs, garbled encoding)."""
+    if not text:
+        return 0.0
+    content = sum(1 for c in text if c.isalnum())
+    return content / len(text)
+
+
 def _top_word_repetition_ratio(text: str) -> float:
     words = _WORD_RE.findall(text.lower())
     if len(words) < 10:
@@ -44,74 +57,86 @@ def _top_word_repetition_ratio(text: str) -> float:
     return max(counts.values()) / len(words)
 
 
-def passes_prose_quality_filter(text: str, min_doc_chars: int = 500) -> bool:
+def passes_prose_quality_filter(text: str, min_doc_chars: int = 500) -> tuple:
+    """Returns (passed: bool, reason: Optional[str]) -- reason is None on
+    pass, else a short machine-readable tag identifying which check failed,
+    so a REJECT log line can say *why* instead of just 'quality heuristics'.
+    Thresholds loosened from the original defaults (alpha_ratio 0.6->0.5,
+    repetition 0.30->0.40): scraped technical/math/code-adjacent prose
+    legitimately has more digits, symbols, and repeated domain terms
+    (variable names, function names, math notation) than general web
+    prose, and the tighter defaults were rejecting real content along
+    with actual junk."""
     if len(text) < min_doc_chars:
-        return False
-    if _alpha_ratio(text) < 0.6:
-        return False
-    if _top_word_repetition_ratio(text) > 0.30:
-        return False
+        return False, "too_short"
+    if _alpha_ratio(text) < 0.5:
+        return False, "low_alpha_ratio"
+    if _top_word_repetition_ratio(text) > 0.40:
+        return False, "high_repetition"
     lines = text.split("\n")
     if len(lines) < 3 and len(text) > 2000:
-        return False
+        return False, "single_block_too_long"
     lowered = text.lower()
-    if any(marker in lowered for marker in _JUNK_MARKERS):
-        return False
-    return True
+    for marker in _JUNK_MARKERS:
+        if marker in lowered:
+            return False, f"junk_marker:{marker}"
+    return True, None
 
 
-def passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> bool:
+def passes_sft_pair_quality_filter(prompt: str, answer: str, min_chars: int = 20) -> tuple:
     """Quality bar for a (prompt, answer) pair that the source dataset
     already labeled itself (an HF instruction dataset, a Kaggle Q&A CSV,
     ...), as opposed to raw scraped prose. These are semantically complete
     even when short -- a math problem + a short numeric answer, a one-line
     code question + a one-line fix -- so this deliberately does NOT reuse
     passes_prose_quality_filter's 500-char default floor, which is tuned
-    for scraped web articles and rejects almost all short Q&A pairs
-    (an entire math/code SFT dataset can come back 100% REJECTed against
-    that bar, well before anything reaches the LLM judge).
+    for scraped web articles and rejects almost all short Q&A pairs.
 
-    Checks that matter for a labeled pair instead:
+    Returns (passed, reason). Checks:
     - both sides present and non-trivial (not just whitespace/punctuation)
     - combined length clears a much lower floor than prose (min_chars)
-    - not degenerate repetition (e.g. answer == prompt, or all one char)
+    - alnum ratio (not alpha -- see _alnum_ratio) isn't degenerate
+    - not a trivial echo (answer == prompt)
     """
     prompt = (prompt or "").strip()
     answer = (answer or "").strip()
-    if not prompt or not answer:
-        return False
+    if not prompt:
+        return False, "empty_prompt"
+    if not answer:
+        return False, "empty_answer"
     combined = f"{prompt}\n\n{answer}"
     if len(combined) < min_chars:
-        return False
-    if _alpha_ratio(combined) < 0.3:
-        return False
+        return False, "too_short"
+    if _alnum_ratio(combined) < 0.25:
+        return False, "low_content_ratio"
     if answer.strip().lower() == prompt.strip().lower():
-        return False
+        return False, "answer_echoes_prompt"
     lowered = combined.lower()
-    if any(marker in lowered for marker in _JUNK_MARKERS):
-        return False
-    return True
+    for marker in _JUNK_MARKERS:
+        if marker in lowered:
+            return False, f"junk_marker:{marker}"
+    return True, None
 
 
 _TRANSCRIPT_JUNK_MARKERS = ("[music]", "[applause]", "[laughter]", "♪ ♪ ♪")
 
 
-def passes_transcript_quality_filter(text: str, min_doc_chars: int = 300) -> bool:
+def passes_transcript_quality_filter(text: str, min_doc_chars: int = 300) -> tuple:
     """Quality bar for video/audio transcripts -- these fail differently
     than scraped HTML articles (ASR noise, music-only stretches, stuck
     captions repeating one phrase), so this checks those patterns rather
-    than the HTML junk-marker list."""
+    than the HTML junk-marker list. Returns (passed, reason)."""
     if len(text) < min_doc_chars:
-        return False
+        return False, "too_short"
     if _alpha_ratio(text) < 0.5:
-        return False
+        return False, "low_alpha_ratio"
     if _top_word_repetition_ratio(text) > 0.35:
-        return False
+        return False, "high_repetition"
     lowered = text.lower()
     stripped = re.sub(r"\[music\]|\[applause\]|\[laughter\]|\u266a", "", lowered)
     if len(stripped) < min_doc_chars * 0.5:
-        return False
-    return True
+        return False, "mostly_nonspeech"
+    return True, None
 
 
 CODE_ALLOWED_EXTENSIONS = {
@@ -127,22 +152,24 @@ CODE_MAX_LINE_LEN = 1000
 CODE_MAX_AVG_LINE_LEN = 200
 
 
-def passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -> bool:
+def passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -> tuple:
+    """Returns (passed, reason)."""
     if len(text) < min_doc_chars:
-        return False
+        return False, "too_short"
     lower_path = path.lower()
     ext = os.path.splitext(lower_path)[1]
     if ext and ext not in CODE_ALLOWED_EXTENSIONS:
-        return False
-    if any(marker in lower_path for marker in CODE_SKIP_PATH_MARKERS):
-        return False
+        return False, "disallowed_extension"
+    for marker in CODE_SKIP_PATH_MARKERS:
+        if marker in lower_path:
+            return False, f"skip_path:{marker}"
     lines = text.split("\n")
     if any(len(l) > CODE_MAX_LINE_LEN for l in lines):
-        return False
+        return False, "line_too_long"
     avg_line_len = sum(len(l) for l in lines) / max(1, len(lines))
     if avg_line_len > CODE_MAX_AVG_LINE_LEN:
-        return False
-    return True
+        return False, "avg_line_too_long"
+    return True, None
 
 
 class ExactDedup:

@@ -98,13 +98,29 @@ def _turn_role_and_value(turn: dict) -> tuple:
     return role, value
 
 
-def _prompt_answer_from_conversation(row: dict) -> tuple:
+def _str_from_col(row: dict, col_name: Optional[str]) -> Optional[str]:
+    """Case-insensitive lookup of one specific column name, returned only
+    if it's actually a non-empty string. Used for LLM-inferred column
+    hints, which name one exact column rather than a candidate list."""
+    if not col_name:
+        return None
+    target = col_name.strip().lower()
+    for col, val in row.items():
+        if col.lower() == target and isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _prompt_answer_from_conversation(row: dict, column_names=_CONVERSATION_COLUMNS) -> tuple:
     """Pull a (prompt, answer) pair from the first human->assistant turn of
-    a chat-format column, if one exists. Returns (None, None) if no
-    conversation column is present or it doesn't parse as expected --
-    callers fall back to their existing heuristics in that case."""
+    a chat-format column, if one exists. `column_names` defaults to the
+    static candidate list but can be narrowed to one LLM-inferred column
+    name. Returns (None, None) if no matching column is present or it
+    doesn't parse as expected -- callers fall back to their existing
+    heuristics in that case."""
+    names = {c.lower() for c in column_names} if column_names else set()
     for col in row:
-        if col.lower() not in _CONVERSATION_COLUMNS:
+        if col.lower() not in names:
             continue
         turns = row[col]
         if not isinstance(turns, list) or not turns:
@@ -126,22 +142,51 @@ def _prompt_answer_from_conversation(row: dict) -> tuple:
     return None, None
 
 
-def row_to_record(row: dict, source_label: str, dataset_id: str, ref: str) -> dict:
+def row_to_record(row: dict, source_label: str, dataset_id: str, ref: str,
+                   column_hint: Optional[dict] = None) -> dict:
     """Normalize one raw dict from a HF/Kaggle dataset into the shared
     extract_content-shaped record. Prefers an explicit prompt/answer pair
     (the dataset author's own labels are more trustworthy than an LLM
     guessing one) -- checking both flat string columns and chat-format
     conversation columns -- falls back to a generic text column, and as a
     last resort concatenates every string field so nothing usable is
-    dropped silently."""
-    prompt = _first_str(row, _PROMPT_COLUMNS)
-    answer = _first_str(row, _ANSWER_COLUMNS) or _first_str(row, _CODE_COLUMNS)
+    dropped silently.
+
+    `column_hint`, if given, is a per-dataset schema mapping inferred once
+    (via infer_column_mapping in dataset_agent.py, not called from here to
+    avoid a circular import) and reused for every row of that dataset/
+    config -- {"prompt_col": str|None, "answer_col": str|None,
+    "text_col": str|None, "conversation_col": str|None}. It's tried FIRST
+    since it's schema-aware (handles arbitrary column names the static
+    candidate lists don't know about), but every hinted field is validated
+    against the actual row (must resolve to real non-empty content) and
+    anything that doesn't resolve falls through to the static heuristics
+    below -- a wrong or stale hint degrades to the old behavior instead of
+    silently dropping the row."""
+    prompt = answer = text = None
+    if column_hint:
+        prompt = _str_from_col(row, column_hint.get("prompt_col"))
+        answer = (_str_from_col(row, column_hint.get("answer_col"))
+                  or _str_from_col(row, column_hint.get("code_col")))
+        if not (prompt and answer) and column_hint.get("conversation_col"):
+            conv_prompt, conv_answer = _prompt_answer_from_conversation(
+                row, column_names=[column_hint["conversation_col"]])
+            prompt = prompt or conv_prompt
+            answer = answer or conv_answer
+        text = _str_from_col(row, column_hint.get("text_col"))
+
+    if not (prompt and answer):
+        fb_prompt = _first_str(row, _PROMPT_COLUMNS)
+        fb_answer = _first_str(row, _ANSWER_COLUMNS) or _first_str(row, _CODE_COLUMNS)
+        prompt = prompt or fb_prompt
+        answer = answer or fb_answer
     if not (prompt and answer):
         conv_prompt, conv_answer = _prompt_answer_from_conversation(row)
         prompt = prompt or conv_prompt
         answer = answer or conv_answer
 
-    text = _first_str(row, _TEXT_COLUMNS)
+    if not text:
+        text = _first_str(row, _TEXT_COLUMNS)
     if not text:
         if prompt and answer:
             text = f"{prompt}\n\n{answer}"
@@ -220,7 +265,7 @@ def discover_hf_configs(dataset_id: str, token: Optional[str] = None) -> list:
 
 
 def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str] = None,
-                       config: Optional[str] = None) -> Iterator[dict]:
+                       config: Optional[str] = None, column_mapper=None) -> Iterator[dict]:
     """Yields normalized records from a Hugging Face dataset via streaming
     mode (no full download to disk, no waiting for the whole dataset to
     materialize).
@@ -244,7 +289,14 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
     loads) yields a single {"error": ...} record and returns, rather than
     raising -- consistent with how extract_content reports failures to the
     agent loop, so one bad dataset id doesn't kill a whole category's
-    run."""
+    run.
+
+    `column_mapper`, if given, is called as
+    `column_mapper(dataset_id, config, columns, sample_row)` on the FIRST
+    row of each config only (not every row -- that would mean one Ollama
+    call per row, which doesn't scale) and should return a column_hint
+    dict (or None) for row_to_record. The mapping is cached for the rest
+    of that config's rows."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -290,13 +342,25 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
         any_success = True
         cfg_count = 0
         cfg_label = f":{cfg_attempt}" if cfg_attempt else ""
+        column_hint = None
+        hint_resolved = False
         for row in ds:
             if count >= max_rows or cfg_count >= per_config_cap:
                 break
             if not isinstance(row, dict):
                 continue
+            if not hint_resolved:
+                # One inference call per config, using the first row we
+                # actually see -- not one per row.
+                if column_mapper is not None:
+                    try:
+                        column_hint = column_mapper(dataset_id, cfg_attempt, list(row.keys()), row)
+                    except Exception as e:
+                        log.warning(f"[hf] column_mapper failed for {dataset_id}{cfg_label}: {e}")
+                        column_hint = None
+                hint_resolved = True
             ref = f"hf://{dataset_id}{cfg_label}#{used_split}:{cfg_count}"
-            yield row_to_record(row, "huggingface", dataset_id, ref)
+            yield row_to_record(row, "huggingface", dataset_id, ref, column_hint=column_hint)
             count += 1
             cfg_count += 1
 
@@ -337,13 +401,16 @@ def discover_kaggle_datasets(query: str, limit: int = 5) -> list:
 _TABULAR_EXTS = (".csv", ".tsv", ".json", ".jsonl")
 
 
-def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200) -> Iterator[dict]:
+def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200, column_mapper=None) -> Iterator[dict]:
     """Downloads a Kaggle dataset (public metadata + files, requires
     credentials) into a temp dir, then reads whatever tabular/text files it
     contains, yielding normalized records row-by-row up to max_rows total
     across all files in the dataset. Falls back to reading plain .txt files
     directly (one record per file) for datasets that are just loose text
-    files rather than CSV/JSON tables."""
+    files rather than CSV/JSON tables.
+
+    `column_mapper`, if given, is called once per file (on its first row)
+    the same way as in stream_hf_dataset -- see that docstring."""
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
     except ImportError:
@@ -405,12 +472,23 @@ def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200) -> Iterator
             log.warning(f"[kaggle] failed reading {rel} from {dataset_ref}: {e}")
             continue
 
+        file_hint = None
+        file_hint_resolved = False
         for chunk in df_iter:
             for i, row in chunk.iterrows():
                 if count >= max_rows:
                     break
-                record = row_to_record(row.dropna().to_dict(), "kaggle", dataset_ref,
-                                        f"kaggle://{dataset_ref}/{rel}#{i}")
+                row_dict = row.dropna().to_dict()
+                if not file_hint_resolved:
+                    if column_mapper is not None:
+                        try:
+                            file_hint = column_mapper(dataset_ref, rel, list(row_dict.keys()), row_dict)
+                        except Exception as e:
+                            log.warning(f"[kaggle] column_mapper failed for {dataset_ref}/{rel}: {e}")
+                            file_hint = None
+                    file_hint_resolved = True
+                record = row_to_record(row_dict, "kaggle", dataset_ref,
+                                        f"kaggle://{dataset_ref}/{rel}#{i}", column_hint=file_hint)
                 yield record
                 count += 1
             if count >= max_rows:

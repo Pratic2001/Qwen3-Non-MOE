@@ -560,7 +560,7 @@ async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
         return fallback
 
 
-async def judge_quality(text: str, category: str) -> bool:
+async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bool:
     """LLM-based quality gate, applied AFTER the cheap heuristic filters
     (which catch the obvious junk for free). Only invoked on documents that
     already passed the heuristics, to keep the number of LLM calls bounded.
@@ -571,19 +571,41 @@ async def judge_quality(text: str, category: str) -> bool:
     The per-doc contract is unchanged: we get back a JSON object string
     (one per document) and parse {"keep": ...} from it.
 
+    `pair_mode` must be True when `text` is a labeled (prompt, answer) pair
+    from a dataset hub, NOT scraped prose. The original system prompt was
+    written entirely in terms of "scraped web document" quality (boilerplate,
+    ads/nav menus, listicles, machine-translated prose) -- criteria that
+    don't apply to a short, already-correct math/code Q&A pair, and were
+    rejecting good terse answers ("42", "2x", a one-line fix) as if they
+    were thin web content. pair_mode swaps in a judge that only asks whether
+    the pair is a valid, coherent, on-topic training example.
+
     With --fast-heuristics (LLM_BYPASS=True), this short-circuits to True
     without making any Ollama call. The heuristic filters above already
     caught the obvious junk; this just trusts them entirely."""
     if LLM_BYPASS:
         return True
-    system = (
-        "You judge whether a scraped web document is high-quality training "
-        "data for a language model. Reject: boilerplate, ads/nav menus, "
-        "listicles with no substance, spam, incoherent machine-translated "
-        "text, or content that's mostly links/references with little prose. "
-        f"Accept substantive {category} content. "
-        'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
-    )
+    if pair_mode:
+        system = (
+            "You judge whether a (prompt, answer) pair is usable instruction-"
+            "tuning data. The pair may be very short -- a math problem with a "
+            "one-line or purely numeric/symbolic answer, or a one-line code "
+            "fix, is normal and GOOD, not low quality. Judge only: (1) is the "
+            "answer a correct, on-topic response to the prompt, (2) is the "
+            "pair coherent (not garbled, not truncated mid-thought, not "
+            "boilerplate/placeholder text). Do NOT reject for brevity alone. "
+            f"Category: {category}. "
+            'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
+        )
+    else:
+        system = (
+            "You judge whether a scraped web document is high-quality training "
+            "data for a language model. Reject: boilerplate, ads/nav menus, "
+            "listicles with no substance, spam, incoherent machine-translated "
+            "text, or content that's mostly links/references with little prose. "
+            f"Accept substantive {category} content. "
+            'Respond ONLY with JSON: {"keep": true} or {"keep": false}.'
+        )
     snippet = text[:3000]
     try:
         raw = await JUDGE_BATCHER.submit(snippet, system)
@@ -640,6 +662,108 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
         return {"prompt": data["prompt"].strip(), "thinking": "", "answer": data["answer"].strip()}
     except Exception as e:
         log.debug(f"[sft:{category}] extraction failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Dataset schema inference (LLM-driven column mapping)
+# ---------------------------------------------------------------------------
+# The static column-name heuristics in public_sources.py (_PROMPT_COLUMNS,
+# _ANSWER_COLUMNS, ...) cover common cases but miss anything with an
+# unfamiliar schema -- that's exactly what happened with MATH-500's
+# "problem" column not being in the candidate list. Rather than keep
+# growing that list by hand every time a new dataset trips it up, ask
+# Ollama to look at one sample row per dataset/config and name the actual
+# columns itself. This runs ONCE per (dataset_id, config) -- not once per
+# row, which would make column mapping another per-row Ollama bottleneck
+# on top of the judge/SFT-extract calls -- and is cached for the life of
+# the process. It's a hint, never the only path: row_to_record always
+# falls back to the static heuristics if the hint is missing, wrong, or
+# doesn't resolve to real content in a given row.
+
+_COLUMN_MAPPING_CACHE: dict = {}  # (dataset_id, config) -> mapping dict | None
+
+
+def _truncate_val(v, n: int = 200) -> str:
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
+    s = s.strip()
+    return s[:n] + ("..." if len(s) > n else "")
+
+
+async def infer_column_mapping(dataset_id: str, config: Optional[str],
+                                columns: list, sample_row: dict) -> Optional[dict]:
+    """Ask Ollama which columns in a dataset row hold the prompt, the
+    answer, a chat-format conversation, or generic free-text. Returns a
+    dict like {"prompt_col": "problem", "answer_col": "answer",
+    "conversation_col": None, "text_col": None} using EXACT column names
+    from `columns` (case-normalized against the real column list so a
+    slightly-off-case model answer still resolves), or None if inference
+    isn't possible/enabled/useful. Results are cached per (dataset_id,
+    config) so a dataset with many rows or configs only gets asked once."""
+    cache_key = (dataset_id, config)
+    if cache_key in _COLUMN_MAPPING_CACHE:
+        return _COLUMN_MAPPING_CACHE[cache_key]
+    if LLM_BYPASS:
+        _COLUMN_MAPPING_CACHE[cache_key] = None
+        return None
+
+    sample_preview = {k: _truncate_val(v) for k, v in list(sample_row.items())[:20]}
+    system = (
+        "You analyze the schema of one row from a machine-learning training "
+        "dataset. Identify which column (if any) holds the question/"
+        "instruction/prompt, which holds the answer/response/solution, "
+        "which holds a chat-format conversation (a list of turn objects "
+        "with role/from + content/value keys), and which holds generic "
+        "free-form document text (only relevant if the row is NOT a Q&A "
+        "pair, e.g. a plain article/passage). Use EXACT column names from "
+        "the list given, or null if none fits -- never invent a name that "
+        "isn't in the list. Respond ONLY with JSON: "
+        '{"prompt_col": "..."|null, "answer_col": "..."|null, '
+        '"conversation_col": "..."|null, "text_col": "..."|null}'
+    )
+    prompt = (
+        f"Columns: {columns}\n"
+        f"Sample row (values truncated): {json.dumps(sample_preview, ensure_ascii=False)}"
+    )
+    mapping = None
+    try:
+        raw = await ollama_generate(prompt, system=system, json_mode=True)
+        data = json.loads(raw)
+        col_lookup = {c.lower(): c for c in columns}
+        resolved = {}
+        for key in ("prompt_col", "answer_col", "conversation_col", "text_col"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip().lower() in col_lookup:
+                # Snap to the real column casing so downstream
+                # case-insensitive lookups always have something concrete
+                # even if the model echoed the name with different case.
+                resolved[key] = col_lookup[val.strip().lower()]
+            else:
+                resolved[key] = None
+        mapping = resolved if any(resolved.values()) else None
+        cfg_label = f":{config}" if config else ""
+        log.info(f"[schema:{dataset_id}{cfg_label}] inferred column mapping: {mapping}")
+    except Exception as e:
+        log.warning(f"[schema:{dataset_id}] column mapping inference failed "
+                     f"({e}); falling back to static column heuristics")
+        mapping = None
+
+    _COLUMN_MAPPING_CACHE[cache_key] = mapping
+    return mapping
+
+
+def _infer_column_mapping_sync(dataset_id: str, config: Optional[str],
+                                columns: list, sample_row: dict) -> Optional[dict]:
+    """Sync wrapper for infer_column_mapping, passed as the column_mapper
+    callback into public_sources.stream_hf_dataset / fetch_kaggle_dataset_
+    rows. Those generators run inside asyncio.to_thread (see
+    _drain_rows_to_staging) -- a plain OS thread with no event loop of its
+    own -- so asyncio.run() here is safe; this is never called from
+    inside the main event loop."""
+    try:
+        return asyncio.run(infer_column_mapping(dataset_id, config, columns, sample_row))
+    except Exception as e:
+        log.warning(f"[schema:{dataset_id}] column mapping sync wrapper failed: {e}")
         return None
 
 
@@ -740,12 +864,13 @@ def _first_json(tool_result):
 # Main crawl loop
 # ---------------------------------------------------------------------------
 
-def _quality_filter_for(content_type: Optional[str], text: str, url: str, min_doc_chars: int) -> bool:
+def _quality_filter_for(content_type: Optional[str], text: str, url: str, min_doc_chars: int) -> tuple:
     """Dispatch to the right quality bar for what extract_content actually
     returned. content_type comes back from the server (html/pdf/docx/pptx/
     xlsx/csv/image/video/audio/text); category alone isn't enough to know
     this anymore since a "code" category doc might legitimately be a PDF
-    spec or a transcript of a talk, not just a source file."""
+    spec or a transcript of a talk, not just a source file. Returns
+    (passed, reason) -- reason is None on pass."""
     if content_type in ("video", "audio"):
         return passes_transcript_quality_filter(text, min_doc_chars)
     source_ext = os.path.splitext(url.split("?")[0].split("#")[0])[1].lower()
@@ -802,17 +927,18 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
     has_given_pair = bool(mode == "sft" and given_prompt and given_answer)
 
     if has_given_pair:
-        ok = passes_sft_pair_quality_filter(given_prompt, given_answer, MIN_SFT_PAIR_CHARS)
+        ok, reason = passes_sft_pair_quality_filter(given_prompt, given_answer, MIN_SFT_PAIR_CHARS)
     else:
-        ok = _quality_filter_for(content_type, text, url, min_doc_chars)
+        ok, reason = _quality_filter_for(content_type, text, url, min_doc_chars)
     if not ok:
         counters["filtered_quality"] += 1
-        log.info(f"[filter:{category}] REJECT (quality heuristics) {url}")
+        counters["filtered_quality_reasons"][reason] = counters["filtered_quality_reasons"].get(reason, 0) + 1
+        log.info(f"[filter:{category}] REJECT (quality heuristics: {reason}) {url}")
         return False
 
     judge_text = f"{given_prompt}\n\n{given_answer}" if has_given_pair else text
     if use_llm_judge:
-        keep = await judge_quality(judge_text, category)
+        keep = await judge_quality(judge_text, category, pair_mode=has_given_pair)
         if not keep:
             counters["llm_rejected"] += 1
             log.info(f"[filter:{category}] REJECT (llm judge) {url}")
@@ -823,10 +949,24 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
             pair = {"prompt": given_prompt, "thinking": "", "answer": given_answer}
         else:
             # Row genuinely doesn't carry a labeled pair -- fall back to
-            # Ollama inventing one from raw prose.
+            # Ollama inventing one from raw prose. Under --fast-heuristics
+            # (LLM_BYPASS), extract_sft_pair always returns None here --
+            # there's no way to synthesize a question from raw prose
+            # without an LLM, full stop. That's expected, but it means
+            # --fast-heuristics + --mode sft can ONLY ever keep rows whose
+            # prompt/answer columns were detected by the static heuristics
+            # in public_sources.py (no LLM schema inference either, same
+            # reason) -- any dataset with an unrecognized schema and no
+            # labeled pair will reject 100% of its rows in this combination.
             pair = await extract_sft_pair(text, category)
         if pair is None:
-            log.info(f"[filter:{category}] REJECT (no sft pair extractable) {url}")
+            counters["no_sft_pair"] += 1
+            if LLM_BYPASS:
+                log.info(f"[filter:{category}] REJECT (no sft pair extractable -- row has no "
+                          f"detected prompt/answer columns, and --fast-heuristics disables the "
+                          f"LLM fallback that would otherwise synthesize one) {url}")
+            else:
+                log.info(f"[filter:{category}] REJECT (no sft pair extractable) {url}")
             return False
         record = {**pair, "source": url, "category": category, "content_type": content_type}
     else:
@@ -1054,7 +1194,8 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                 remaining = byte_budget - raw_bytes_downloaded
                 log.info(f"[public-hf:{category}] downloading {ds_id} (raw pull, up to "
                           f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows)
+                gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows,
+                                                         column_mapper=_infer_column_mapping_sync)
                 n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
                 raw_rows_downloaded += n
                 raw_bytes_downloaded += b
@@ -1074,7 +1215,8 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                 remaining = byte_budget - raw_bytes_downloaded
                 log.info(f"[public-kaggle:{category}] downloading {ref} (raw pull, up to "
                           f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows)
+                gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows,
+                                                                 column_mapper=_infer_column_mapping_sync)
                 n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
                 raw_rows_downloaded += n
                 raw_bytes_downloaded += b
@@ -1152,7 +1294,8 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
     counters = {
         "filtered_quality": 0, "filtered_dup": 0, "llm_rejected": 0,
         "robots_blocked": 0, "http_error": 0, "video_skipped": 0,
-        "missing_dependency": 0, "other_extract_fail": 0,
+        "missing_dependency": 0, "other_extract_fail": 0, "no_sft_pair": 0,
+        "filtered_quality_reasons": {},
     }
 
     resumed = f" (resumed: {len(state.used_queries)} prior queries, {len(state.seen_urls)} prior URLs)" \
@@ -1171,7 +1314,9 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
             print(f"\n[{category}] public-sources-only run done: "
                   f"{writer.total_bytes / 1024**2:.2f} MB, {writer.total_docs} docs, "
                   f"filtered {counters['filtered_quality']} low-quality + "
-                  f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected")
+                  f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected + "
+                  f"{counters['no_sft_pair']} no-labeled-pair"
+                  f" -- quality reject breakdown: {counters['filtered_quality_reasons']}")
             writer.close()
             return writer.total_bytes, writer.total_docs
 
@@ -1299,7 +1444,8 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
     print(f"\n[{category}] done: {writer.total_bytes / 1024**2:.2f} MB, "
           f"{writer.total_docs} docs, {writer.shard_idx + 1} shard(s), "
           f"filtered {counters['filtered_quality']} low-quality + {counters['filtered_dup']} duplicate + "
-          f"{counters['llm_rejected']} llm-rejected\n"
+          f"{counters['llm_rejected']} llm-rejected + {counters['no_sft_pair']} no-labeled-pair\n"
+          f"[{category}] quality reject breakdown: {counters['filtered_quality_reasons']}\n"
           f"[{category}] fetch failures: {counters['robots_blocked']} robots.txt/domain-blocked, "
           f"{counters['http_error']} HTTP error (403/etc.), {counters['video_skipped']} video/duration-skipped, "
           f"{counters['missing_dependency']} missing optional dependency, "
@@ -1354,7 +1500,18 @@ async def main_async(args):
     global LLM_BYPASS
     if getattr(args, "fast_heuristics", False):
         LLM_BYPASS = True
-        log.info("--fast-heuristics: bypassing ALL Ollama calls (judge + SFT pair extract)")
+        log.info("--fast-heuristics: bypassing ALL Ollama calls (judge + SFT pair extract + "
+                  "schema/column-mapping inference)")
+        if args.mode == "sft":
+            log.warning(
+                "--fast-heuristics + --mode sft: rows can ONLY be kept if their prompt/answer "
+                "columns are recognized by the static heuristics in public_sources.py "
+                "(_PROMPT_COLUMNS/_ANSWER_COLUMNS/conversation-format detection) -- there is no "
+                "LLM available in this mode to synthesize a Q/A pair from unlabeled prose, or to "
+                "infer a column mapping for a dataset with an unfamiliar schema. If a dataset's "
+                "reject log is dominated by 'no sft pair extractable', that dataset's columns "
+                "aren't matching the static list; either extend it or drop --fast-heuristics for "
+                "that run so the LLM-based schema inference and pair extraction can run.")
     else:
         LLM_BYPASS = False
     use_llm_judge_flag = (not args.no_llm_judge) and (not LLM_BYPASS)
