@@ -502,6 +502,16 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        # Without this, Ollama falls back to its default keep_alive (5m of
+        # idle time before the model is evicted from VRAM). Phase 1 of a
+        # public-source run (raw download to byte budget) makes zero Ollama
+        # calls and can easily run for well over 5 minutes on a multi-GB
+        # pull, so by the time phase 2 (the filter pass) makes its first
+        # real judge call, the model _prewarm_ollama() loaded at startup has
+        # already been evicted. -1 means "never unload on idle"; the model
+        # only leaves VRAM if this process exits or something else asks
+        # Ollama to load a different model.
+        "keep_alive": -1,
     }
     if system:
         payload["system"] = system
@@ -523,7 +533,16 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
         payload["think"] = False
     log.debug(f"[ollama] -> model={OLLAMA_MODEL} prompt={prompt[:120]!r}...")
     start = time.time()
-    async with httpx.AsyncClient(timeout=120) as client:
+    # 300s, not 120s: if the model was evicted from VRAM for any reason
+    # (Ollama restarted, another model was loaded in between, etc.) this
+    # call also has to pay the full cold-load cost documented in
+    # _prewarm_ollama (30s-5min), on top of actual inference time. A
+    # shorter client-side timeout would abort the HTTP request before
+    # Ollama finishes loading, which looks identical to a real hang from
+    # the caller's side -- and since every retry pays the same cold-load
+    # cost and gets cut off the same way, it can appear to "never load
+    # back" even though the server would have finished given the time.
+    async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
         # Detect model-not-found explicitly. Without this branch, the 404
         # body `{"error": "model 'X' not found"}` gets parsed as if it
@@ -574,7 +593,7 @@ async def _prewarm_ollama(timeout: float = 300.0) -> bool:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": "ok", "stream": False},
+                json={"model": OLLAMA_MODEL, "prompt": "ok", "stream": False, "keep_alive": -1},
             )
             if resp.status_code == 404:
                 log.error(
@@ -871,9 +890,9 @@ def _infer_column_mapping_sync(dataset_id: str, config: Optional[str],
     """Sync wrapper for infer_column_mapping, passed as the column_mapper
     callback into public_sources.stream_hf_dataset / fetch_kaggle_dataset_
     rows. Those generators run inside asyncio.to_thread (see
-    _drain_rows_to_staging) -- a plain OS thread with no event loop of its
-    own -- so asyncio.run() here is safe; this is never called from
-    inside the main event loop."""
+    _drain_dataset_rows in run_public_sources_for_category) -- a plain OS
+    thread with no event loop of its own -- so asyncio.run() here is
+    safe; this is never called from inside the main event loop."""
     try:
         return asyncio.run(infer_column_mapping(dataset_id, config, columns, sample_row))
     except Exception as e:
@@ -1147,25 +1166,6 @@ async def _process_deep_crawl_page(page: dict, category: str, mode: str, min_doc
                                    counters)
 
 
-def _drain_rows_to_staging(row_iter, fh, budget_remaining: int) -> tuple:
-    """Blocking helper: pull rows from a (streaming, network-backed)
-    generator and append each as one JSON line to an already-open staging
-    file handle, stopping once `budget_remaining` raw text bytes have been
-    written or the generator is exhausted -- whichever comes first. Runs
-    inside asyncio.to_thread since dataset/network iteration blocks.
-    Returns (rows_written, raw_text_bytes_written)."""
-    rows_written = 0
-    raw_bytes = 0
-    for row in row_iter:
-        if raw_bytes >= budget_remaining:
-            break
-        fh.write(json.dumps(row) + "\n")
-        rows_written += 1
-        raw_bytes += len((row.get("text") or "").encode("utf-8", errors="ignore"))
-    fh.flush()
-    return rows_written, raw_bytes
-
-
 async def run_public_sources_for_category(category: str, byte_budget: int, mode: str,
                                            min_doc_chars: int, use_llm_judge: bool,
                                            exact_dedup: ExactDedup, near_dedup,
@@ -1178,36 +1178,37 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     HTML boilerplate to strip), so this runs first and only cedes the
     remaining budget to the search+scrape loop.
 
-    Two explicit phases, run in order, never interleaved:
+    One dataset at a time, in order:
 
-    1. **Raw download** -- pull rows from each configured/discovered
-       dataset and stage them as JSON lines in
-       `<out-dir>/<category>/.public_raw_staging.jsonl`, stopping once
-       `byte_budget` worth of raw (pre-filter) text has been pulled across
-       all datasets for this category, or every dataset/row budget is
-       exhausted. Nothing is quality-filtered, judged, deduped, or written
-       to the real output shards yet at this point.
-    2. **Filter + write** -- only after phase 1 finishes, every staged row
-       is run through the same heuristic quality filters + (if enabled)
-       the Ollama LLM judge as any other source, and passing rows are
-       written to the category's shards. The staging file is deleted
-       afterward (unless `public_cfg["keep_raw_staging"]` is set).
+    1. **Download** -- pull all rows (up to `max_rows_per_dataset`) from
+       one configured/discovered dataset. If `keep_raw_staging` is set,
+       each raw row is also echoed to
+       `<out-dir>/<category>/.public_raw_staging.jsonl` for audit/debug
+       purposes, but nothing is quality-filtered, judged, deduped, or
+       written to the real output shards at this point.
+    2. **Filter + write** -- that dataset's rows are run through the same
+       heuristic quality filters + (if enabled) the Ollama LLM judge as
+       any other source, and passing rows are written to the category's
+       shards.
+    3. **Check quota** -- if `writer.total_bytes >= byte_budget`, stop
+       entirely: no further dataset (Hugging Face or Kaggle) is even
+       downloaded. Otherwise move on to the next configured/discovered
+       dataset and repeat.
 
-    Splitting it this way means the (slow, one-network/API-call-per-row)
-    download step and the (slow, one-Ollama-call-per-doc when the judge is
-    on) filtering step never compete for time in the same pass, and you
-    can see exactly how much raw data was actually available before
-    filtering ran -- rather than the two being interleaved per-dataset and
-    the run silently stopping once *written* (post-filter) bytes hit
-    budget, which could quietly cut a download short well before other
-    available datasets/rows were even tried.
+    This means a run only ever downloads as many datasets as it actually
+    needs to hit budget, rather than always pulling every configured/
+    discovered dataset up front. The tradeoff (vs. the old download-
+    everything-then-filter design) is that you no longer see the full raw
+    total available across every dataset before filtering starts -- but
+    for a --public-only run that's the right tradeoff: no point in paying
+    for (or waiting on) a multi-GB download of a dataset you'll never
+    need because an earlier one already filled the budget.
 
-    Because filtering only ever shrinks a raw pull, the final written size
-    for a category will typically end up SMALLER than byte_budget -- that's
-    expected, not a bug. If you need to hit budget after filtering, raise
-    `--public-max-rows` / `--public-discover-limit`, or pass more explicit
-    `--hf-datasets`/`--kaggle-datasets`, so phase 1 has more raw material
-    to draw from.
+    Because filtering only ever shrinks what a dataset contributes, if
+    you exhaust every configured/discovered dataset and still haven't
+    hit budget, raise `--public-max-rows` / `--public-discover-limit`, or
+    pass more explicit `--hf-datasets`/`--kaggle-datasets`, for more raw
+    material to draw from next time.
 
     `public_cfg` shape: {
         "sources": {"huggingface", "kaggle"},       # which backends are on
@@ -1216,7 +1217,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
         "blacklist_datasets": {category: [dataset_id_or_ref, ...]},  # excluded ids/refs, optional
         "max_rows_per_dataset": int,
         "discover_limit": int,                          # datasets to auto-discover per category
-        "keep_raw_staging": bool,                       # keep the staged JSONL after filtering
+        "keep_raw_staging": bool,                       # keep an audit copy of every raw row pulled
     }
     If no explicit dataset ids/refs are given for a category, it falls back
     to auto-discovery: searching the hub with each of that category's
@@ -1227,6 +1228,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     HF/Kaggle's dataset search does simple keyword matching against
     dataset names/tags, so a full sentence like "calculus integration by
     parts examples" matches nothing and silently discovers zero datasets.
+
 
     `blacklist_datasets` (same {category: [...]} / bare-list-applies-to-
     every-category shape as hf_datasets/kaggle_datasets, matched
@@ -1288,106 +1290,117 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
         return found[:discover_limit]
 
     # -----------------------------------------------------------------
-    # Phase 1: raw download to budget (no filtering/judging/writing yet)
+    # Per-dataset interleaved loop: download one dataset -> filter+judge+
+    # write it -> check quota -> move to the next dataset, stopping as
+    # soon as `byte_budget` (post-filter, written bytes) is met. This
+    # trades the old two-phase design's "always know the full raw total
+    # before filtering starts" property for the more common-sense
+    # behavior of not downloading datasets you'll never need: once
+    # writer.total_bytes hits budget, no further dataset is even
+    # requested. `_process_article` (reached via `bounded()`) already
+    # re-checks writer.total_bytes under write_lock before every write, so
+    # quota is still enforced precisely even with concurrent in-flight
+    # judge calls for the current dataset's rows.
     # -----------------------------------------------------------------
     staging_path = os.path.join(writer.dir, ".public_raw_staging.jsonl")
-    raw_bytes_downloaded = 0
-    raw_rows_downloaded = 0
+    raw_fh = open(staging_path, "w") if keep_raw_staging else None
+    total_raw_rows = 0
 
-    with open(staging_path, "w") as fh:
-        if "huggingface" in public_cfg.get("sources", set()):
-            hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
-            if hf_ids:
-                hf_ids = _drop_blacklisted(hf_ids, "public-hf")
-            else:
-                hf_ids = await _discover(public_sources.discover_hf_datasets, "public-hf")
-                log.info(f"[public-hf:{category}] discovered datasets: {hf_ids}")
-            for ds_id in hf_ids:
-                if raw_bytes_downloaded >= byte_budget:
-                    break
-                remaining = byte_budget - raw_bytes_downloaded
-                log.info(f"[public-hf:{category}] downloading {ds_id} (raw pull, up to "
-                          f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.stream_hf_dataset(ds_id, max_rows=max_rows,
-                                                         column_mapper=_infer_column_mapping_sync)
-                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
-                raw_rows_downloaded += n
-                raw_bytes_downloaded += b
-                log.info(f"[public-hf:{category}] {ds_id} -> {n} rows, {b/1024**2:.2f} MB "
-                          f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
+    # Ollama prewarm happens once, up front, rather than "after phase 1" --
+    # there's no separate download-everything phase anymore, so the first
+    # dataset's filter pass is the first real judge call.
+    if use_llm_judge:
+        await _prewarm_ollama()
 
-        if "kaggle" in public_cfg.get("sources", set()) and raw_bytes_downloaded < byte_budget:
-            kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
-            if kg_refs:
-                kg_refs = _drop_blacklisted(kg_refs, "public-kaggle")
-            else:
-                kg_refs = await _discover(public_sources.discover_kaggle_datasets, "public-kaggle")
-                log.info(f"[public-kaggle:{category}] discovered datasets: {kg_refs}")
-            for ref in kg_refs:
-                if raw_bytes_downloaded >= byte_budget:
-                    break
-                remaining = byte_budget - raw_bytes_downloaded
-                log.info(f"[public-kaggle:{category}] downloading {ref} (raw pull, up to "
-                          f"{remaining/1024**2:.1f} MB remaining, max {max_rows} rows)")
-                gen = public_sources.fetch_kaggle_dataset_rows(ref, max_rows=max_rows,
-                                                                 column_mapper=_infer_column_mapping_sync)
-                n, b = await asyncio.to_thread(_drain_rows_to_staging, gen, fh, remaining)
-                raw_rows_downloaded += n
-                raw_bytes_downloaded += b
-                log.info(f"[public-kaggle:{category}] {ref} -> {n} rows, {b/1024**2:.2f} MB "
-                          f"(raw total: {raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
+    def _drain_dataset_rows(row_iter) -> list:
+        """Blocking helper: pull all rows out of a (streaming, network-
+        backed) generator for ONE dataset into a list, optionally echoing
+        each raw row to the audit staging file. Runs inside
+        asyncio.to_thread since dataset/network iteration blocks. Bounded
+        by max_rows already, via the generator itself (stream_hf_dataset /
+        fetch_kaggle_dataset_rows are both called with max_rows=max_rows)."""
+        rows = []
+        for row in row_iter:
+            rows.append(row)
+            if raw_fh is not None:
+                raw_fh.write(json.dumps(row) + "\n")
+        if raw_fh is not None:
+            raw_fh.flush()
+        return rows
 
-    print(f"[public:{category}] raw download done: {raw_rows_downloaded} rows, "
-          f"{raw_bytes_downloaded/1024**2:.2f} MB staged to {staging_path} "
-          f"(target was {byte_budget/1024**2:.1f} MB)")
-    if raw_bytes_downloaded < byte_budget:
-        log.warning(f"[public:{category}] raw download fell short of target "
-                     f"({raw_bytes_downloaded/1024**2:.2f}/{byte_budget/1024**2:.1f} MB) -- ran out of "
-                     f"discovered/configured datasets or rows-per-dataset before hitting budget. "
-                     f"Raise --public-max-rows and/or --public-discover-limit, or pass explicit "
-                     f"--hf-datasets/--kaggle-datasets, to pull more raw material next time.")
-
-    # -----------------------------------------------------------------
-    # Phase 2: filter (heuristics + optional LLM judge) + write, only now
-    # -----------------------------------------------------------------
-    print(f"[public:{category}] starting filter pass over {raw_rows_downloaded} staged rows"
-          + (" (LLM judge on)" if use_llm_judge else " (heuristics only, --no-llm-judge)"))
-    tasks = []
-    with open(staging_path, "r") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
+    async def _process_dataset(label: str, ref: str, rows: list) -> None:
+        """Run the existing filter + (LLM judge) + dedup + write pipeline
+        over one dataset's already-downloaded rows, same batching/flush
+        policy as before (gather in JUDGE_BATCHER-sized chunks so Ollama
+        batching still coalesces requests)."""
+        print(f"[public-{label}:{category}] processing {len(rows)} rows from {ref}"
+              + (" (LLM judge on)" if use_llm_judge else " (heuristics only, --no-llm-judge)"))
+        tasks = []
+        batch_flush = max(1, JUDGE_BATCHER.batch_size) * 2
+        for row in rows:
             if writer.total_bytes >= byte_budget:
                 break
-            try:
-                row = json.loads(line)
-            except Exception as e:
-                log.warning(f"[public:{category}] skipping unparseable staged row: {e}")
-                continue
             tasks.append(asyncio.create_task(bounded(row)))
-            # Flush threshold: gather as many in-flight tasks as one Ollama
-            # judge batch is expected to coalesce, so each gather() releases
-            # at least one full batch to JUDGE_BATCHER (and SFT_BATCHER).
-            # With per-doc Ollama calls this used to be `concurrency * 2`,
-            # but with batching the right size is the batcher's batch_size:
-            # gather() fewer and the batcher sits idle waiting; gather()
-            # many more and tasks pile up in memory for no gain.
-            batch_flush = max(1, JUDGE_BATCHER.batch_size) * 2
             if len(tasks) >= batch_flush:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 tasks = []
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"[public-{label}:{category}] after {ref}: "
+              f"{writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB written, "
+              f"{writer.total_docs} docs")
 
-    if keep_raw_staging:
-        log.info(f"[public:{category}] keeping raw staging file at {staging_path} "
-                  f"(--public-keep-raw-staging)")
-    else:
-        try:
-            os.remove(staging_path)
-        except OSError:
-            pass
+    async def _run_source(label: str, ds_ids: list, stream_fn, discover_fn) -> bool:
+        """Iterate one source's dataset list (already explicit or about to
+        be discovered), download+process+check-quota one dataset at a
+        time. Returns True if quota was met (caller can skip the next
+        source entirely) else False."""
+        nonlocal total_raw_rows
+        if ds_ids:
+            ds_ids = _drop_blacklisted(ds_ids, f"public-{label}")
+        else:
+            ds_ids = await _discover(discover_fn, f"public-{label}")
+            log.info(f"[public-{label}:{category}] discovered datasets: {ds_ids}")
+        for i, ref in enumerate(ds_ids):
+            if writer.total_bytes >= byte_budget:
+                log.info(f"[public-{label}:{category}] quota already met "
+                          f"({writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB) -- "
+                          f"skipping remaining datasets: {ds_ids[i:]}")
+                return True
+            log.info(f"[public-{label}:{category}] downloading {ref} (max {max_rows} rows)")
+            gen = stream_fn(ref, max_rows=max_rows, column_mapper=_infer_column_mapping_sync)
+            rows = await asyncio.to_thread(_drain_dataset_rows, gen)
+            total_raw_rows += len(rows)
+            print(f"[public-{label}:{category}] {ref} downloaded: {len(rows)} rows")
+            await _process_dataset(label, ref, rows)
+            if writer.total_bytes >= byte_budget:
+                log.info(f"[public-{label}:{category}] quota met after {ref} "
+                          f"({writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB)")
+                return True
+        return False
+
+    sources = public_cfg.get("sources", set())
+    quota_met = False
+    if "huggingface" in sources:
+        hf_ids = _lookup(public_cfg.get("hf_datasets", {}))
+        quota_met = await _run_source("hf", hf_ids, public_sources.stream_hf_dataset,
+                                       public_sources.discover_hf_datasets)
+
+    if "kaggle" in sources and not quota_met:
+        kg_refs = _lookup(public_cfg.get("kaggle_datasets", {}))
+        quota_met = await _run_source("kaggle", kg_refs, public_sources.fetch_kaggle_dataset_rows,
+                                       public_sources.discover_kaggle_datasets)
+
+    if raw_fh is not None:
+        raw_fh.close()
+        log.info(f"[public:{category}] kept raw staging file at {staging_path} "
+                  f"(--public-keep-raw-staging, {total_raw_rows} rows total)")
+
+    if not quota_met:
+        log.warning(f"[public:{category}] finished every discovered/configured dataset without "
+                     f"hitting budget ({writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB). "
+                     f"Raise --public-max-rows and/or --public-discover-limit, or pass explicit "
+                     f"--hf-datasets/--kaggle-datasets, for more raw material next time.")
 
     print(f"[public:{category}] after public-source top-up: "
           f"{writer.total_bytes/1024**2:.2f} MB / {byte_budget/1024**2:.1f} MB, "
