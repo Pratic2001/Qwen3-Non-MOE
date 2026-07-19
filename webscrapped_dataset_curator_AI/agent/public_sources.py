@@ -482,7 +482,15 @@ def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200, column_mapp
                 if not file_hint_resolved:
                     if column_mapper is not None:
                         try:
-                            file_hint = column_mapper(dataset_ref, rel, list(row_dict.keys()), row_dict)
+                            # Use the FULL row (not the dropna'd one used for
+                            # the actual record) + the DataFrame's real
+                            # column list. row.dropna() can silently omit
+                            # whichever column happens to be null in this
+                            # particular first row -- if that's the answer
+                            # column, the mapper would never even see it as
+                            # a candidate. NaN -> None so it's JSON-safe.
+                            full_row = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
+                            file_hint = column_mapper(dataset_ref, rel, list(chunk.columns), full_row)
                         except Exception as e:
                             log.warning(f"[kaggle] column_mapper failed for {dataset_ref}/{rel}: {e}")
                             file_hint = None

@@ -684,7 +684,7 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
 _COLUMN_MAPPING_CACHE: dict = {}  # (dataset_id, config) -> mapping dict | None
 
 
-def _truncate_val(v, n: int = 200) -> str:
+def _truncate_val(v, n: int = 300) -> str:
     s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
     s = s.strip()
     return s[:n] + ("..." if len(s) > n else "")
@@ -693,7 +693,11 @@ def _truncate_val(v, n: int = 200) -> str:
 async def infer_column_mapping(dataset_id: str, config: Optional[str],
                                 columns: list, sample_row: dict) -> Optional[dict]:
     """Ask Ollama which columns in a dataset row hold the prompt, the
-    answer, a chat-format conversation, or generic free-text. Returns a
+    answer, a chat-format conversation, or generic free-text -- shown ONE
+    concrete example row (not just the bare column names) so the model is
+    mapping against actual content, not guessing from names alone (a
+    column named "output" could be code, a numeric answer, or a full
+    article depending on the dataset; only the value tells you). Returns a
     dict like {"prompt_col": "problem", "answer_col": "answer",
     "conversation_col": None, "text_col": None} using EXACT column names
     from `columns` (case-normalized against the real column list so a
@@ -708,22 +712,45 @@ async def infer_column_mapping(dataset_id: str, config: Optional[str],
         return None
 
     sample_preview = {k: _truncate_val(v) for k, v in list(sample_row.items())[:20]}
+    has_content = any(
+        v is not None and str(v).strip() not in ("", "nan", "NaN")
+        for v in sample_row.values()
+    )
+    if not has_content:
+        # First row was entirely empty/null across every column -- nothing
+        # for the model to look at, and an empty example is worse than no
+        # example (it invites guessing from column names alone, which is
+        # exactly what the static heuristics already do for free). Skip
+        # the call rather than waste it.
+        log.info(f"[schema:{dataset_id}] sample row is empty across all columns, "
+                  f"skipping LLM mapping -- static heuristics only")
+        _COLUMN_MAPPING_CACHE[cache_key] = None
+        return None
+
+    cfg_label = f":{config}" if config else ""
+    log.info(f"[schema:{dataset_id}{cfg_label}] inferring column mapping from example row: "
+             f"{json.dumps(sample_preview, ensure_ascii=False)}")
+
     system = (
-        "You analyze the schema of one row from a machine-learning training "
-        "dataset. Identify which column (if any) holds the question/"
-        "instruction/prompt, which holds the answer/response/solution, "
-        "which holds a chat-format conversation (a list of turn objects "
-        "with role/from + content/value keys), and which holds generic "
-        "free-form document text (only relevant if the row is NOT a Q&A "
-        "pair, e.g. a plain article/passage). Use EXACT column names from "
-        "the list given, or null if none fits -- never invent a name that "
-        "isn't in the list. Respond ONLY with JSON: "
-        '{"prompt_col": "..."|null, "answer_col": "..."|null, '
-        '"conversation_col": "..."|null, "text_col": "..."|null}'
+        "You analyze the schema of a machine-learning training dataset by "
+        "looking at ONE concrete example row from it (not just column "
+        "names -- the actual values matter, since a column's real content "
+        "is the only reliable signal for what it holds). Identify which "
+        "column (if any) holds the question/instruction/prompt, which "
+        "holds the answer/response/solution, which holds a chat-format "
+        "conversation (a list of turn objects with role/from + content/"
+        "value keys), and which holds generic free-form document text "
+        "(only relevant if the row is NOT a Q&A pair, e.g. a plain "
+        "article/passage). Use EXACT column names from the list given, or "
+        "null if none fits -- never invent a name that isn't in the list. "
+        'Respond ONLY with JSON: {"prompt_col": "..."|null, '
+        '"answer_col": "..."|null, "conversation_col": "..."|null, '
+        '"text_col": "..."|null}'
     )
     prompt = (
         f"Columns: {columns}\n"
-        f"Sample row (values truncated): {json.dumps(sample_preview, ensure_ascii=False)}"
+        f"Here is one example row from this dataset (values truncated for length):\n"
+        f"{json.dumps(sample_preview, ensure_ascii=False, indent=2)}"
     )
     mapping = None
     try:
@@ -741,7 +768,6 @@ async def infer_column_mapping(dataset_id: str, config: Optional[str],
             else:
                 resolved[key] = None
         mapping = resolved if any(resolved.values()) else None
-        cfg_label = f":{config}" if config else ""
         log.info(f"[schema:{dataset_id}{cfg_label}] inferred column mapping: {mapping}")
     except Exception as e:
         log.warning(f"[schema:{dataset_id}] column mapping inference failed "
