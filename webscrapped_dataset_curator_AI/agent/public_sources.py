@@ -458,6 +458,26 @@ def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200, column_mapp
             elif ext == ".jsonl":
                 df_iter = pd.read_json(fpath, lines=True, chunksize=200)
             elif ext == ".json":
+                # Unlike .csv/.tsv/.jsonl above, a plain JSON array can't be
+                # read incrementally with pandas -- pd.read_json(fpath) has
+                # to parse the whole file into memory in one shot before
+                # yielding a single row. That's normally fine (most Kaggle
+                # JSON files are small), but an unusually large one (a
+                # multi-GB JSON export, say) would spike memory regardless
+                # of --concurrency or the MemoryGovernor in dataset_agent.py
+                # -- neither can intervene mid-parse. Guard against that
+                # case explicitly rather than silently OOMing on it.
+                size_mb = os.path.getsize(fpath) / 1024**2
+                max_json_mb = float(os.environ.get("KAGGLE_MAX_JSON_FILE_MB", "300"))
+                if size_mb > max_json_mb:
+                    log.warning(f"[kaggle] skipping {rel} from {dataset_ref}: "
+                                f"{size_mb:.0f}MB plain .json file exceeds "
+                                f"KAGGLE_MAX_JSON_FILE_MB={max_json_mb:.0f} -- it can't be "
+                                f"read incrementally like .csv/.jsonl, so loading it would "
+                                f"pull the whole thing into memory at once. Raise "
+                                f"KAGGLE_MAX_JSON_FILE_MB if you have the RAM for it, or "
+                                f"prefer datasets that ship .jsonl instead.")
+                    continue
                 df_iter = [pd.read_json(fpath)]
             elif ext == ".txt":
                 with open(fpath, "r", errors="ignore") as f:

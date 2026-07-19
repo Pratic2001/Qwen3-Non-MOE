@@ -47,8 +47,25 @@ real run.
 from __future__ import annotations
 
 import asyncio
+import os
 import urllib.parse
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Memory caps -- independent of whatever --concurrency/--category-concurrency
+# the caller (dataset_agent.py) is configured with. A headless Chromium
+# process run for hours across thousands of navigations tends to grow
+# regardless of how many pages are open at once (renderer/GPU-process
+# caches, V8 heap fragmentation, etc.), so this module enforces its own
+# hard ceiling and periodically throws the whole browser away and starts
+# fresh rather than relying purely on caller-side concurrency limits.
+#
+# CRAWL4AI_MAX_CONCURRENT_PAGES: hard cap on simultaneous crawler.arun()
+# calls sharing the one browser instance, regardless of caller concurrency.
+# CRAWL4AI_RECYCLE_EVERY: after this many completed requests, close and
+# restart the browser on the next call to reclaim any leaked memory.
+_MAX_CONCURRENT_PAGES = int(os.environ.get("CRAWL4AI_MAX_CONCURRENT_PAGES", "3"))
+_RECYCLE_EVERY = int(os.environ.get("CRAWL4AI_RECYCLE_EVERY", "200"))
 
 # ---------------------------------------------------------------------------
 # Shared result shape (mirrors extractors._result so callers never branch on
@@ -75,6 +92,8 @@ _MIN_TEXT_CHARS = 200
 
 _crawler = None
 _crawler_lock: Optional[asyncio.Lock] = None
+_page_sem: Optional[asyncio.Semaphore] = None
+_requests_since_start = 0
 
 
 def _lock() -> asyncio.Lock:
@@ -84,13 +103,40 @@ def _lock() -> asyncio.Lock:
     return _crawler_lock
 
 
+def _page_semaphore() -> asyncio.Semaphore:
+    """Hard cap on simultaneous browser pages, enforced here regardless of
+    how many concurrent callers dataset_agent.py's own --concurrency /
+    --category-concurrency lets through -- defense in depth so a
+    misconfigured or very high caller-side concurrency can't blow up
+    Chromium's memory on its own."""
+    global _page_sem
+    if _page_sem is None:
+        _page_sem = asyncio.Semaphore(_MAX_CONCURRENT_PAGES)
+    return _page_sem
+
+
 async def _get_crawler():
     """Lazily start (once) and return the shared AsyncWebCrawler. Raises
     ImportError if crawl4ai isn't installed -- callers catch this and
     return a normal {"error": ...} result rather than letting it propagate
-    as a raw exception."""
-    global _crawler
+    as a raw exception.
+
+    Also recycles the browser (closes it and starts a fresh one) every
+    CRAWL4AI_RECYCLE_EVERY completed requests. Long-lived headless-Chromium
+    processes tend to grow in memory over thousands of navigations even
+    with a bounded number of concurrently-open pages -- periodically
+    throwing the whole process away and starting clean is the reliable fix,
+    the same trick browser-based scraping frameworks (e.g. Scrapy+Splash,
+    Puppeteer-cluster) generally use for long crawls."""
+    global _crawler, _requests_since_start
     async with _lock():
+        if _crawler is not None and _requests_since_start >= _RECYCLE_EVERY:
+            try:
+                await _crawler.close()
+            except Exception:
+                pass
+            _crawler = None
+            _requests_since_start = 0
         if _crawler is None:
             from crawl4ai import AsyncWebCrawler, BrowserConfig
             import net_utils
@@ -98,6 +144,14 @@ async def _get_crawler():
                 headless=True,
                 verbose=False,
                 user_agent=net_utils.user_agents.get(),
+                # Memory/perf: this pipeline only ever wants extracted text,
+                # never renders images to a viewport anyone looks at, and
+                # doesn't need GPU compositing -- all three cost real RAM
+                # per open page for zero benefit here.
+                text_mode=True,     # skip loading images/rich content entirely
+                light_mode=True,    # disable background browser features not needed headless
+                extra_args=["--disable-dev-shm-usage", "--disable-gpu",
+                            "--disable-extensions"],
             )
             crawler = AsyncWebCrawler(config=browser_cfg)
             await crawler.start()
@@ -105,18 +159,24 @@ async def _get_crawler():
     return _crawler
 
 
+def _note_request_completed():
+    global _requests_since_start
+    _requests_since_start += 1
+
+
 async def shutdown():
     """Close the shared browser if it was ever started. Safe to call even
     if it never was (no-op then). server.py calls this once at process
     exit via atexit -- crawl4ai's Playwright subprocess otherwise tends to
     linger past the parent process exiting."""
-    global _crawler
+    global _crawler, _requests_since_start
     if _crawler is not None:
         try:
             await _crawler.close()
         except Exception:
             pass
         _crawler = None
+        _requests_since_start = 0
 
 
 def _extract_markdown(result) -> str:
@@ -179,10 +239,14 @@ async def fetch_and_extract(url: str, timeout: float = 30.0,
             magic=True,           # best-effort auto-handling of cookie banners/overlays
             simulate_user=True,   # small randomized mouse/scroll jitter, reduces bot-detection blocks
             check_robots_txt=True,
+            exclude_all_images=True,  # never needed for text extraction; images are the
+                                       # single biggest per-page memory cost in a real browser
             verbose=False,
         )
         crawler = await _get_crawler()
-        result = await crawler.arun(url=url, config=run_config)
+        async with _page_semaphore():
+            result = await crawler.arun(url=url, config=run_config)
+        _note_request_completed()
     except ImportError as e:
         return _result(url=url, error=f"crawl4ai not installed: {e}")
     except Exception as e:
@@ -274,11 +338,19 @@ async def deep_crawl(seed_url: str, max_pages: int = 20, max_depth: int = 2,
             deep_crawl_strategy=strategy,
             markdown_generator=_make_markdown_generator(),
             check_robots_txt=True,
+            exclude_all_images=True,
             stream=False,
             verbose=False,
         )
         crawler = await _get_crawler()
-        results = await crawler.arun(url=seed_url, config=run_config)
+        # deep_crawl visits up to max_pages pages in one call -- count it as
+        # max_pages worth of "requests" toward the recycle threshold, not 1,
+        # or a run heavy on deep_crawl could visit thousands of pages
+        # between recycles.
+        async with _page_semaphore():
+            results = await crawler.arun(url=seed_url, config=run_config)
+        for _ in range(max(1, max_pages)):
+            _note_request_completed()
     except ImportError as e:
         return [{"error": f"crawl4ai not installed: {e}", "url": seed_url}]
     except Exception as e:

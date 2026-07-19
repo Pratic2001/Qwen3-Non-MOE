@@ -4,6 +4,11 @@ httpx>=0.27
 trafilatura>=1.8
 readability-lxml>=0.8.1
 ddgs>=9.0
+# Used by dataset_agent.py's MemoryGovernor to pause launching new work when
+# system RAM+swap crosses --max-memory-percent (default 90%). Already pulled
+# in transitively by crawl4ai, but listed explicitly since the governor is
+# useful even in httpx-only mode (SCRAPER_HTML_BACKEND=httpx, no crawl4ai).
+psutil>=5.9
 
 # --- Recommended: crawl4ai HTML backend ---
 # Swaps the httpx+trafilatura HTML path for a real (Playwright-driven)

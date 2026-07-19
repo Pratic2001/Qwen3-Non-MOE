@@ -56,6 +56,120 @@ log = logging.getLogger("dataset_agent")
 # identical-looking log lines.
 _ollama_call_seq = itertools.count(1)
 
+
+class MemoryGovernor:
+    """Process-wide back-pressure valve.
+
+    --concurrency and --category-concurrency only cap how many tasks *start*
+    at once. They don't help when memory grows because of something that
+    accumulates over the life of the run (a long-lived headless-browser
+    process, cached Ollama batch buffers, whisper models, page-parse
+    fragmentation, etc.) -- ten tasks running one-at-a-time back-to-back for
+    an hour can exhaust RAM just as surely as thirty running in parallel for
+    two minutes can.
+
+    This adds a real ceiling: every task checks in before doing its (memory-
+    heavy) work and blocks -- without holding its concurrency-semaphore slot
+    hostage forever, since it re-checks on an interval -- until system memory
+    drops back under `threshold_percent`. It also forces a `gc.collect()`
+    periodically, since CPython doesn't always return freed memory to the OS
+    promptly under bursty alloc/free patterns.
+
+    Silently becomes a no-op if psutil isn't installed (it's an optional
+    dependency here even though crawl4ai pulls it in transitively) --
+    the rest of the mitigations (browser recycling, page semaphore, image
+    blocking in crawl4ai_backend.py) still apply either way.
+    """
+
+    def __init__(self, threshold_percent: float = 90.0, check_interval: float = 2.0,
+                 gc_every: int = 25):
+        self.threshold_percent = threshold_percent
+        self.check_interval = check_interval
+        self.gc_every = max(1, gc_every)
+        self._checks_since_gc = 0
+        self._warned_no_psutil = False
+        self._last_log = 0.0
+
+    def _current_percent(self) -> Optional[float]:
+        if not _HAVE_PSUTIL:
+            if not self._warned_no_psutil:
+                log.warning("psutil not installed -- MemoryGovernor is disabled "
+                            "(pip install psutil to enable memory-based throttling)")
+                self._warned_no_psutil = True
+            return None
+        return psutil.virtual_memory().percent
+
+    async def wait_if_needed(self, tag: str = "") -> None:
+        pct = self._current_percent()
+        if pct is None:
+            return
+        waited = False
+        while pct is not None and pct >= self.threshold_percent:
+            waited = True
+            now = time.monotonic()
+            if now - self._last_log > 5:
+                log.warning(f"[mem-governor] system memory at {pct:.1f}% "
+                            f">= threshold {self.threshold_percent:.1f}% -- "
+                            f"pausing new work{f' ({tag})' if tag else ''} "
+                            f"until it drops")
+                self._last_log = now
+            gc.collect()
+            await asyncio.sleep(self.check_interval)
+            pct = self._current_percent()
+        if waited:
+            log.info(f"[mem-governor] memory back under threshold "
+                     f"({pct:.1f}%), resuming")
+        self._checks_since_gc += 1
+        if self._checks_since_gc >= self.gc_every:
+            self._checks_since_gc = 0
+            gc.collect()
+
+    def wait_if_needed_sync(self, tag: str = "") -> None:
+        """Blocking twin of wait_if_needed, for code that runs inside
+        asyncio.to_thread (e.g. _drain_dataset_rows, or pandas'
+        synchronous file-reading calls in public_sources.py) where there's
+        no event loop to await against. Uses time.sleep instead of
+        asyncio.sleep -- fine here since the caller is already off the
+        event loop in a worker thread."""
+        pct = self._current_percent()
+        if pct is None:
+            return
+        waited = False
+        while pct is not None and pct >= self.threshold_percent:
+            waited = True
+            now = time.monotonic()
+            if now - self._last_log > 5:
+                log.warning(f"[mem-governor] system memory at {pct:.1f}% "
+                            f">= threshold {self.threshold_percent:.1f}% -- "
+                            f"pausing new work{f' ({tag})' if tag else ''} "
+                            f"until it drops")
+                self._last_log = now
+            gc.collect()
+            time.sleep(self.check_interval)
+            pct = self._current_percent()
+        if waited:
+            log.info(f"[mem-governor] memory back under threshold "
+                     f"({pct:.1f}%), resuming")
+        self._checks_since_gc += 1
+        if self._checks_since_gc >= self.gc_every:
+            self._checks_since_gc = 0
+            gc.collect()
+
+
+# Configured for real in main() from --max-memory-percent /
+# --memory-check-interval; this default instance means every call site that
+# does `await MEM_GOVERNOR.wait_if_needed()` works even in code paths (tests,
+# import-time) that never touch argparse.
+MEM_GOVERNOR = MemoryGovernor()
+
+import gc
+
+try:
+    import psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
+
 import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -1374,6 +1488,7 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
                   f"(concurrency={concurrency})")
         async with sem:
             log.debug(f"[public:{category}] row #{row_id} ({url}) acquired semaphore, processing")
+            await MEM_GOVERNOR.wait_if_needed(tag=f"public:{category}")
             try:
                 result = await _process_public_row(article, category, mode, min_doc_chars,
                                                     use_llm_judge, exact_dedup, near_dedup,
@@ -1456,12 +1571,22 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
         each raw row to the audit staging file. Runs inside
         asyncio.to_thread since dataset/network iteration blocks. Bounded
         by max_rows already, via the generator itself (stream_hf_dataset /
-        fetch_kaggle_dataset_rows are both called with max_rows=max_rows)."""
+        fetch_kaggle_dataset_rows are both called with max_rows=max_rows).
+
+        This is the main place --public-only mode's memory actually lives:
+        with no live scraping happening at all, this is the only step that
+        accumulates rows before the per-row MEM_GOVERNOR check in bounded()
+        ever gets a chance to run. Checked periodically (not every row --
+        psutil.virtual_memory() isn't free) so a large --public-max-rows on
+        a dataset with big rows still gets throttled instead of piling the
+        whole thing into memory uninterrupted."""
         rows = []
-        for row in row_iter:
+        for i, row in enumerate(row_iter):
             rows.append(row)
             if raw_fh is not None:
                 raw_fh.write(json.dumps(row) + "\n")
+            if i % 25 == 0:
+                MEM_GOVERNOR.wait_if_needed_sync(tag=f"drain:{category}")
         if raw_fh is not None:
             raw_fh.flush()
         return rows
@@ -1611,12 +1736,14 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
 
     async def bounded_process(url: str):
         async with sem:
+            await MEM_GOVERNOR.wait_if_needed(tag=f"extract:{category}")
             return await _process_hit(scraper, url, category, mode, min_doc_chars,
                                        use_llm_judge, exact_dedup, near_dedup, writer,
                                        byte_budget, write_lock, counters)
 
     async def bounded_deep_crawl(seed_url: str):
         async with sem:
+            await MEM_GOVERNOR.wait_if_needed(tag=f"deep_crawl:{category}")
             try:
                 pages = await scraper.deep_crawl(seed_url, max_pages=deep_crawl_max_pages,
                                                    max_depth=1, keywords=category)
@@ -1769,6 +1896,15 @@ def _find_server_path() -> str:
 
 
 async def main_async(args):
+    global MEM_GOVERNOR
+    MEM_GOVERNOR = MemoryGovernor(
+        threshold_percent=max(1.0, min(99.0, args.max_memory_percent)),
+        check_interval=max(0.1, args.memory_check_interval),
+    )
+    log.info(f"Memory governor: threshold={MEM_GOVERNOR.threshold_percent:.1f}%, "
+             f"check_interval={MEM_GOVERNOR.check_interval}s"
+             f"{'' if _HAVE_PSUTIL else ' (DISABLED -- psutil not installed)'}")
+
     # Apply the CLI-controlled Ollama batcher settings before any
     # judge_quality / extract_sft_pair call can happen. Default is
     # batch_size=8 (a real speedup on local Ollama); --no-judge-batching
@@ -2064,6 +2200,18 @@ def main():
     parser.add_argument("--deep-crawl-max-pages", type=int, default=10,
                          help="Max pages to extract per deep_crawl call (default 10). Only relevant "
                               "when --deep-crawl-per-domain > 0.")
+    parser.add_argument("--max-memory-percent", type=float, default=90.0,
+                         help="Hard memory ceiling (default 90.0). Whenever system RAM+swap "
+                              "usage hits this percentage, every category pauses launching new "
+                              "extract/ASR/deep_crawl work (existing in-flight tasks finish) and "
+                              "forces a gc.collect() until usage drops back below it. This is "
+                              "independent of --concurrency/--category-concurrency -- it catches "
+                              "the case where memory grows over the life of a long run rather "
+                              "than from too many tasks starting at once. Requires psutil "
+                              "(pip install psutil); silently disabled if it's not installed.")
+    parser.add_argument("--memory-check-interval", type=float, default=2.0,
+                         help="Seconds between memory re-checks while paused above "
+                              "--max-memory-percent (default 2.0).")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                          help="DEBUG shows every Ollama call, skipped/seen URLs, and full text lengths; "
                               "INFO (default) shows every query, hit list, extract skip reason, filter "
