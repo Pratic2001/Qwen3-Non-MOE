@@ -93,6 +93,59 @@ MIN_SFT_PAIR_CHARS: int = 20
 # the per-doc futures. With batch_size=8, throughput on a local 8B model
 # jumps ~5-8x on the judge phase.
 
+# ---------------------------------------------------------------------------
+# Defensive JSON parsing for Ollama responses
+# ---------------------------------------------------------------------------
+# Ollama's format="json" constrains decoding but doesn't guarantee the
+# model emits ONLY the JSON object -- smaller/quantized models in
+# particular routinely wrap it in ```json fences, prefix it with "Here is
+# the mapping:", or occasionally emit nothing at all for a turn. A bare
+# json.loads(raw) on that is what produced the opaque "Expecting value:
+# line 1 column 1 (char 0)" report -- which tells you json.loads failed
+# but nothing about what Ollama actually sent back. _extract_json_object
+# strips the common wrapping patterns before giving up, and every caller
+# now logs a preview of the raw response on failure instead of just the
+# exception text.
+
+def _strip_json_fences(text: str) -> str:
+    """Strip a wrapping ```json ... ``` or ``` ... ``` markdown fence, if
+    present. Returns text unchanged (just whitespace-stripped) if no
+    fence is found."""
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    lines = [ln for ln in lines if not ln.strip().startswith("```")]
+    return "\n".join(lines).strip()
+
+
+def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
+    """Best-effort parse of a single JSON object out of a raw Ollama
+    response. Tries, in order: (1) direct parse after fence-stripping,
+    (2) slicing out the outermost {...} span in case the model added
+    prose before/after it. Returns None (never raises) if nothing
+    parseable is found -- callers already have a fallback path for that,
+    they just need to know it happened."""
+    if not raw:
+        return None
+    text = _strip_json_fences(raw)
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 class OllamaBatcher:
     """Async batching wrapper for ollama_generate.
 
@@ -339,13 +392,7 @@ class OllamaBatcher:
         dispatch."""
         if not raw:
             return None
-        text = raw.strip()
-        # Strip ```json ... ``` fences if the model wrapped the array.
-        if text.startswith("```"):
-            # Drop the first line (```json or ```) and the trailing fence.
-            lines = text.split("\n")
-            lines = [ln for ln in lines if not ln.strip().startswith("```")]
-            text = "\n".join(lines).strip()
+        text = _strip_json_fences(raw)
         # Find the outermost JSON array -- the model occasionally prefixes
         # with prose like "Here is the array: [...]".
         start = text.find("[")
@@ -549,7 +596,9 @@ async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
     )
     try:
         raw = await ollama_generate(prompt, system=system, json_mode=True)
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if data is None:
+            raise ValueError(f"no parseable JSON object in response: {raw[:300]!r}")
         queries = data.get("queries", [])
         queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()][:n]
         log.info(f"[plan:{category}] planner produced {len(queries)} queries: {queries}")
@@ -613,7 +662,9 @@ async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bo
             # Batcher returned no per-doc slot (parse failure or shutdown);
             # treat it like any other judge-call failure and default to keep.
             raise RuntimeError("judge batcher returned no slot for this document")
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if data is None:
+            raise ValueError(f"no parseable JSON object in judge response: {raw[:300]!r}")
         keep = bool(data.get("keep", False))
         log.debug(f"[judge:{category}] keep={keep}")
         return keep
@@ -654,14 +705,18 @@ async def extract_sft_pair(text: str, category: str) -> Optional[dict]:
         if raw is None:
             log.debug(f"[sft:{category}] batcher returned no slot for this doc")
             return None
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if data is None:
+            log.warning(f"[sft:{category}] no parseable JSON object in extraction "
+                         f"response, rejecting row: {raw[:300]!r}")
+            return None
         if not data.get("prompt") or not data.get("answer"):
             log.debug(f"[sft:{category}] no usable Q/A pair in article")
             return None
         log.debug(f"[sft:{category}] extracted pair, prompt={data['prompt'][:80]!r}...")
         return {"prompt": data["prompt"].strip(), "thinking": "", "answer": data["answer"].strip()}
     except Exception as e:
-        log.debug(f"[sft:{category}] extraction failed: {e}")
+        log.warning(f"[sft:{category}] extraction failed: {e}")
         return None
 
 
@@ -755,7 +810,9 @@ async def infer_column_mapping(dataset_id: str, config: Optional[str],
     mapping = None
     try:
         raw = await ollama_generate(prompt, system=system, json_mode=True)
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if data is None:
+            raise ValueError(f"no parseable JSON object in response: {raw[:300]!r}")
         col_lookup = {c.lower(): c for c in columns}
         resolved = {}
         for key in ("prompt_col", "answer_col", "conversation_col", "text_col"):
