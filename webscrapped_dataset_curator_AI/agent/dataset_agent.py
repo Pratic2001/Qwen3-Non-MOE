@@ -300,7 +300,20 @@ class OllamaBatcher:
                     item = self._queue.get_nowait()
                     if self._is_sentinel(item):
                         continue
+                    was_empty = not pending
                     pending.append(item)
+                    if was_empty:
+                        # This is the first item of a new window. The other
+                        # branch that can add a "first" item (the idle/parked
+                        # queue.get() above) sets window_deadline when it
+                        # does so; this fast path must do the same, or
+                        # window_deadline stays None forever, should_flush
+                        # is permanently False, and the final "wait on
+                        # deadline" branch below is skipped too (it only
+                        # runs when window_deadline is not None) -- the loop
+                        # then spins with no await at all, pinning a CPU
+                        # core and hanging silently forever.
+                        window_deadline = asyncio.get_running_loop().time() + self.flush_interval
                     continue
                 # Wait up to (deadline - now) for an item, whichever first.
                 if window_deadline is not None:
