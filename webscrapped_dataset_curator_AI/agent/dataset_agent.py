@@ -32,6 +32,7 @@ an Ollama daemon running locally (default http://localhost:11434).
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -47,6 +48,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("dataset_agent")
+
+# Monotonic id shared by every Ollama call (batcher submit, per-doc
+# generate) so concurrent/serialized requests can be told apart in the
+# logs when tracking down a hang -- e.g. "call #7 still waiting" tells you
+# exactly which in-flight request is stuck, instead of a wall of
+# identical-looking log lines.
+_ollama_call_seq = itertools.count(1)
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -166,7 +174,8 @@ class OllamaBatcher:
     --no-judge-batching without any code path divergence."""
 
     def __init__(self, batch_size: int = 8, flush_interval: float = 1.0,
-                 submit_timeout: float = 180.0):
+                 submit_timeout: float = 180.0, name: str = "batcher"):
+        self.name = name
         self.batch_size = max(1, batch_size)
         self.flush_interval = max(0.05, flush_interval)
         # Upper bound on how long submit() will wait for a result before
@@ -179,10 +188,15 @@ class OllamaBatcher:
         self._task: Optional[asyncio.Task] = None
         self._shutdown = False
         self._all_batches: list[asyncio.Task] = []
+        self._submit_seq = itertools.count(1)
 
     def _ensure_running(self):
         if self._task is None or self._task.done():
+            log.info(f"[{self.name}] starting background _run task "
+                     f"(was {'never started' if self._task is None else 'done/dead'})")
             self._task = asyncio.create_task(self._run())
+        else:
+            log.debug(f"[{self.name}] _run task already alive, not restarting")
 
     def _resolve_drain_queue(self):
         """Resolve every future still sitting in the queue to None. Called
@@ -204,16 +218,23 @@ class OllamaBatcher:
         Returns None if the batcher is shutting down, the request times out,
         or the underlying ollama call fails (callers fall back to their own
         parse-failure path, which is the right thing to do)."""
+        sid = next(self._submit_seq)
         if self._shutdown:
+            log.info(f"[{self.name} #{sid}] submit() called after shutdown; returning None")
             return None
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         await self._queue.put((prompt, system, fut))
+        log.info(f"[{self.name} #{sid}] queued (qsize={self._queue.qsize()}); ensuring _run task is alive")
         self._ensure_running()
+        t0 = time.time()
         try:
-            return await asyncio.wait_for(fut, timeout=self.submit_timeout)
+            result = await asyncio.wait_for(fut, timeout=self.submit_timeout)
+            log.info(f"[{self.name} #{sid}] resolved after {time.time()-t0:.1f}s "
+                     f"({'empty/None' if result is None else f'{len(result)} chars'})")
+            return result
         except asyncio.TimeoutError:
-            log.warning(f"[ollama-batcher] submit timed out after "
+            log.warning(f"[{self.name} #{sid}] submit timed out after "
                         f"{self.submit_timeout:.0f}s; resolving to None "
                         f"so the caller can fall through")
             if not fut.done():
@@ -226,6 +247,7 @@ class OllamaBatcher:
         (exception in ollama_generate, malformed response) resolve the
         per-doc futures to None so the caller's existing try/except
         fallbacks fire -- no doc silently disappears."""
+        log.info(f"[{self.name}] _run task started")
         pending: list[tuple[str, str, asyncio.Future]] = []
         window_deadline: Optional[float] = None  # absolute time at which to flush whatever we have
         try:
@@ -239,6 +261,7 @@ class OllamaBatcher:
                     # Park until something arrives or shutdown is signalled.
                     if self._shutdown:
                         break
+                    log.debug(f"[{self.name}] idle, parked on queue.get()")
                     item = await self._queue.get()
                     if self._is_sentinel(item):
                         continue
@@ -246,6 +269,7 @@ class OllamaBatcher:
                     window_deadline = asyncio.get_running_loop().time() + self.flush_interval
                     # Fast path: if the batch is already full, flush now.
                     if len(pending) >= self.batch_size:
+                        log.debug(f"[{self.name}] batch full ({len(pending)}/{self.batch_size}), flushing immediately")
                         await self._flush(pending)
                         pending = []
                         window_deadline = None
@@ -263,6 +287,9 @@ class OllamaBatcher:
                     or interval_elapsed
                 )
                 if should_flush:
+                    log.debug(f"[{self.name}] flushing {len(pending)} item(s) "
+                              f"(full={len(pending) >= self.batch_size}, "
+                              f"shutdown={self._shutdown}, interval_elapsed={interval_elapsed})")
                     await self._flush(pending)
                     pending = []
                     window_deadline = None
@@ -288,9 +315,27 @@ class OllamaBatcher:
         except asyncio.CancelledError:
             # shutdown() cancelled us mid-flush (drain_timeout elapsed).
             # Make sure the in-flight flush's futures aren't left dangling.
+            log.info(f"[{self.name}] _run task cancelled ({len(pending)} pending resolved to None)")
             for _, _, fut in pending:
                 if not fut.done():
                     fut.set_result(None)
+            raise
+        except Exception as e:
+            # Anything else escaping the loop above (a bug, not a
+            # transient per-batch failure -- those are already caught
+            # inside _flush) used to kill this task silently: asyncio
+            # just stores the exception on the Task and moves on unless
+            # someone awaits/retrieves it, which nobody here does. Every
+            # submit() after that point would enqueue into a queue that
+            # NOTHING is reading anymore and sit waiting the full
+            # submit_timeout before giving up -- which looks exactly like
+            # a permanent hang with zero log output. Log it loudly here so
+            # that failure mode is no longer silent.
+            log.error(f"[{self.name}] _run task CRASHED: {type(e).__name__}: {e}", exc_info=True)
+            for _, _, fut in pending:
+                if not fut.done():
+                    fut.set_result(None)
+            self._resolve_drain_queue()
             raise
         finally:
             # Always drain whatever's in the queue on exit, so any submit()
@@ -300,6 +345,7 @@ class OllamaBatcher:
                 if not fut.done():
                     fut.set_result(None)
             self._resolve_drain_queue()
+            log.info(f"[{self.name}] _run task exiting")
 
     @staticmethod
     def _is_sentinel(item: tuple) -> bool:
@@ -326,20 +372,24 @@ class OllamaBatcher:
                         f"happen if each batcher is bound to one role.")
         system = items[0][1]
         n = len(prompts)
+        log.info(f"[{self.name}] _flush: dispatching batch of {n} "
+                 f"(mode={'passthrough' if self.batch_size == 1 or n == 1 else 'batched'})")
 
         if self.batch_size == 1 or n == 1:
             # Passthrough: no batched prompt, just dispatch one at a time
             # to preserve the original per-doc semantics. (batch_size==1
             # is the "I turned batching off" knob.)
-            for prompt, _, fut in items:
+            for i, (prompt, _, fut) in enumerate(items):
                 if fut.done():
                     continue
+                log.debug(f"[{self.name}] _flush: passthrough item {i+1}/{n} -> ollama_generate")
                 try:
                     resp = await ollama_generate(prompt, system=system, json_mode=True)
                     fut.set_result(resp)
                 except Exception as e:
                     log.warning(f"[ollama-batcher] per-doc call failed: {e}")
                     fut.set_result(None)
+            log.debug(f"[{self.name}] _flush: passthrough batch of {n} complete")
             return
 
         try:
@@ -357,6 +407,7 @@ class OllamaBatcher:
             # doesn't lose the whole window -- this preserves the original
             # behavior of judge_quality/extract_sft_pair where each doc got
             # its own try/except.
+            log.info(f"[{self.name}] _flush: falling back to per-doc dispatch for {n} item(s)")
             for prompt, _, fut in items:
                 if fut.done():
                     continue
@@ -372,6 +423,7 @@ class OllamaBatcher:
             if fut.done():
                 continue
             fut.set_result(slot)
+        log.debug(f"[{self.name}] _flush: batched call complete, {n} slots resolved")
 
     def _build_batched_prompt(self, prompts: list[str]) -> str:
         parts = [f"Documents: {len(prompts)} total. "
@@ -462,8 +514,8 @@ def _register_batcher(b: OllamaBatcher) -> OllamaBatcher:
 # applies the real CLI values at startup. batch_size=1 is the safe
 # default (passthrough) -- if startup is skipped for any reason, we
 # behave exactly like the pre-batching code.
-JUDGE_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0))
-SFT_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0))
+JUDGE_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0, name="judge-batcher"))
+SFT_BATCHER = _register_batcher(OllamaBatcher(batch_size=1, flush_interval=1.0, name="sft-batcher"))
 
 
 def configure_batcher_settings(batch_size: int, flush_interval: float):
@@ -497,7 +549,24 @@ class OllamaModelNotFoundError(Exception):
     corpus is built with no LLM gate at all."""
 
 
+async def _heartbeat(call_id: int, stage: str, interval: float = 15.0):
+    """Background task: log a 'still waiting' line every `interval`
+    seconds until cancelled. Started right before a potentially slow
+    await (e.g. the Ollama HTTP call) and cancelled as soon as it
+    returns, so a genuine hang shows up as a repeating log line naming
+    the exact call-id and stage instead of just going silent."""
+    waited = 0.0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            waited += interval
+            log.info(f"[ollama #{call_id}] still waiting on {stage} after {waited:.0f}s...")
+    except asyncio.CancelledError:
+        pass
+
+
 async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: bool = False) -> str:
+    call_id = next(_ollama_call_seq)
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -531,7 +600,9 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
         # ignores unknown request fields, so this is a harmless no-op on
         # models that don't support extended thinking at all.
         payload["think"] = False
-    log.debug(f"[ollama] -> model={OLLAMA_MODEL} prompt={prompt[:120]!r}...")
+    log.info(f"[ollama #{call_id}] -> POST {OLLAMA_URL}/api/generate model={OLLAMA_MODEL} "
+             f"prompt_chars={len(prompt)} json_mode={json_mode}")
+    log.debug(f"[ollama #{call_id}] prompt={prompt[:120]!r}...")
     start = time.time()
     # 300s, not 120s: if the model was evicted from VRAM for any reason
     # (Ollama restarted, another model was loaded in between, etc.) this
@@ -542,36 +613,53 @@ async def ollama_generate(prompt: str, system: Optional[str] = None, json_mode: 
     # the caller's side -- and since every retry pays the same cold-load
     # cost and gets cut off the same way, it can appear to "never load
     # back" even though the server would have finished given the time.
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        # Detect model-not-found explicitly. Without this branch, the 404
-        # body `{"error": "model 'X' not found"}` gets parsed as if it
-        # were a success response, the caller gets "" back, and
-        # `json.loads("")` raises -- caught and silently swallowed in
-        # judge_quality's except, which returns True. So a missing model
-        # looks identical to a working one and the quality gate is
-        # effectively disabled. The explicit 404 check makes the failure
-        # mode loud and actionable.
-        if resp.status_code == 404:
-            raise OllamaModelNotFoundError(
-                f"Ollama model {OLLAMA_MODEL!r} not found at {OLLAMA_URL}. "
-                f"Run `ollama list` to see installed models, or set "
-                f"OLLAMA_MODEL=... to one of them. To skip the LLM judge "
-                f"entirely, re-run with --no-llm-judge or --fast-heuristics."
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("response", "")
-        if not text and data.get("thinking"):
-            # Belt-and-suspenders: think=False didn't fully suppress it (or
-            # this Ollama version always splits response/thinking
-            # regardless) and the model's actual answer ended up in the
-            # thinking trace. Better to try recovering JSON from it than
-            # return nothing and force every caller to fall back.
-            log.debug(f"[ollama] response empty but thinking field present "
-                      f"({len(data['thinking'])} chars); using it as fallback")
-            text = data["thinking"]
-    log.debug(f"[ollama] <- ({time.time()-start:.1f}s) {text[:120]!r}...")
+    hb = asyncio.create_task(_heartbeat(call_id, "POST /api/generate (client-side, waiting on Ollama)"))
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            log.debug(f"[ollama #{call_id}] httpx client opened, sending request now")
+            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            log.info(f"[ollama #{call_id}] <- HTTP {resp.status_code} after "
+                     f"{time.time()-start:.1f}s")
+            # Detect model-not-found explicitly. Without this branch, the 404
+            # body `{"error": "model 'X' not found"}` gets parsed as if it
+            # were a success response, the caller gets "" back, and
+            # `json.loads("")` raises -- caught and silently swallowed in
+            # judge_quality's except, which returns True. So a missing model
+            # looks identical to a working one and the quality gate is
+            # effectively disabled. The explicit 404 check makes the failure
+            # mode loud and actionable.
+            if resp.status_code == 404:
+                raise OllamaModelNotFoundError(
+                    f"Ollama model {OLLAMA_MODEL!r} not found at {OLLAMA_URL}. "
+                    f"Run `ollama list` to see installed models, or set "
+                    f"OLLAMA_MODEL=... to one of them. To skip the LLM judge "
+                    f"entirely, re-run with --no-llm-judge or --fast-heuristics."
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data.get("response", "")
+            if not text and data.get("thinking"):
+                # Belt-and-suspenders: think=False didn't fully suppress it (or
+                # this Ollama version always splits response/thinking
+                # regardless) and the model's actual answer ended up in the
+                # thinking trace. Better to try recovering JSON from it than
+                # return nothing and force every caller to fall back.
+                log.debug(f"[ollama #{call_id}] response empty but thinking field present "
+                          f"({len(data['thinking'])} chars); using it as fallback")
+                text = data["thinking"]
+    except Exception as e:
+        log.warning(f"[ollama #{call_id}] FAILED after {time.time()-start:.1f}s: "
+                    f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+    log.info(f"[ollama #{call_id}] done in {time.time()-start:.1f}s, "
+             f"response_chars={len(text)}")
+    log.debug(f"[ollama #{call_id}] response={text[:120]!r}...")
     return text
 
 
@@ -589,6 +677,8 @@ async def _prewarm_ollama(timeout: float = 300.0) -> bool:
         return False
     log.info(f"prewarm: loading {OLLAMA_MODEL!r} into Ollama (up to {timeout:.0f}s)...")
     t0 = time.time()
+    call_id = next(_ollama_call_seq)
+    hb = asyncio.create_task(_heartbeat(call_id, f"prewarm POST /api/generate (loading {OLLAMA_MODEL!r})"))
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -618,6 +708,12 @@ async def _prewarm_ollama(timeout: float = 300.0) -> bool:
             f"continuing -- first real call may be slow"
         )
         return False
+    finally:
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
 
 
 async def plan_queries(category: str, recent_topics: list, n: int = 8) -> list:
@@ -703,6 +799,9 @@ async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bo
             'or after it: {"keep": true} or {"keep": false}.'
         )
     snippet = text[:3000]
+    log.info(f"[judge:{category}] calling judge_quality (pair_mode={pair_mode}, "
+             f"snippet_chars={len(snippet)})")
+    t0 = time.time()
     try:
         raw = await JUDGE_BATCHER.submit(snippet, system)
         if raw is None:
@@ -713,12 +812,13 @@ async def judge_quality(text: str, category: str, pair_mode: bool = False) -> bo
         if data is None:
             raise ValueError(f"no parseable JSON object in judge response: {raw[:300]!r}")
         keep = bool(data.get("keep", False))
-        log.debug(f"[judge:{category}] keep={keep}")
+        log.info(f"[judge:{category}] keep={keep} ({time.time()-t0:.1f}s)")
         return keep
     except Exception as e:
         # If the judge fails/times out, don't block the pipeline on it --
         # fall back to trusting the heuristic filters alone.
-        log.warning(f"[judge:{category}] judge call failed ({e}), defaulting to keep=True")
+        log.warning(f"[judge:{category}] judge call failed after {time.time()-t0:.1f}s "
+                    f"({e}), defaulting to keep=True")
         return True
 
 
@@ -1024,6 +1124,7 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
     row already normalized to the same shape) -- everything downstream of
     "I have text and a content_type" is identical regardless of where the
     text came from."""
+    log.debug(f"[process:{category}] enter _process_article for {url}")
     if not article or article.get("error") or not article.get("text"):
         reason = article.get("error") if article else "no response"
         reason_str = str(reason)
@@ -1068,10 +1169,14 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
         counters["filtered_quality_reasons"][reason] = counters["filtered_quality_reasons"].get(reason, 0) + 1
         log.info(f"[filter:{category}] REJECT (quality heuristics: {reason}) {url}")
         return False
+    log.debug(f"[filter:{category}] quality heuristics passed for {url}, "
+              f"use_llm_judge={use_llm_judge}")
 
     judge_text = f"{given_prompt}\n\n{given_answer}" if has_given_pair else text
     if use_llm_judge:
+        log.debug(f"[filter:{category}] entering judge_quality for {url}")
         keep = await judge_quality(judge_text, category, pair_mode=has_given_pair)
+        log.debug(f"[filter:{category}] returned from judge_quality for {url}, keep={keep}")
         if not keep:
             counters["llm_rejected"] += 1
             log.info(f"[filter:{category}] REJECT (llm judge) {url}")
@@ -1091,7 +1196,9 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
             # in public_sources.py (no LLM schema inference either, same
             # reason) -- any dataset with an unrecognized schema and no
             # labeled pair will reject 100% of its rows in this combination.
+            log.debug(f"[filter:{category}] entering extract_sft_pair for {url}")
             pair = await extract_sft_pair(text, category)
+            log.debug(f"[filter:{category}] returned from extract_sft_pair for {url}")
         if pair is None:
             counters["no_sft_pair"] += 1
             if LLM_BYPASS:
@@ -1105,7 +1212,9 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
     else:
         record = {"text": text, "source": url, "category": category, "content_type": content_type}
 
+    log.debug(f"[write:{category}] waiting on write_lock for {url}")
     async with write_lock:
+        log.debug(f"[write:{category}] acquired write_lock for {url}")
         if writer.total_bytes >= byte_budget:
             return False  # another concurrent task already hit budget
         if exact_dedup.is_duplicate(text) or near_dedup.is_near_duplicate(text):
@@ -1243,12 +1352,28 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
     that happens to auto-discover it.
     """
     sem = asyncio.Semaphore(concurrency)
+    _row_seq = itertools.count(1)
 
     async def bounded(article: dict) -> bool:
+        row_id = next(_row_seq)
+        url = article.get("url", "public-dataset-row")
+        log.debug(f"[public:{category}] row #{row_id} ({url}) waiting on semaphore "
+                  f"(concurrency={concurrency})")
         async with sem:
-            return await _process_public_row(article, category, mode, min_doc_chars,
-                                               use_llm_judge, exact_dedup, near_dedup,
-                                               writer, byte_budget, write_lock, counters)
+            log.debug(f"[public:{category}] row #{row_id} ({url}) acquired semaphore, processing")
+            try:
+                result = await _process_public_row(article, category, mode, min_doc_chars,
+                                                    use_llm_judge, exact_dedup, near_dedup,
+                                                    writer, byte_budget, write_lock, counters)
+                log.debug(f"[public:{category}] row #{row_id} ({url}) done, kept={result}")
+                return result
+            except Exception as e:
+                # asyncio.gather(..., return_exceptions=True) swallows this
+                # into the results list without a trace -- log it here so a
+                # per-row bug doesn't look identical to a silent hang.
+                log.error(f"[public:{category}] row #{row_id} ({url}) RAISED: "
+                          f"{type(e).__name__}: {e}", exc_info=True)
+                raise
 
     max_rows = public_cfg.get("max_rows_per_dataset", 500)
     discover_limit = public_cfg.get("discover_limit", 3)
@@ -1337,15 +1462,38 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
               + (" (LLM judge on)" if use_llm_judge else " (heuristics only, --no-llm-judge)"))
         tasks = []
         batch_flush = max(1, JUDGE_BATCHER.batch_size) * 2
+        log.info(f"[public-{label}:{category}] batch_flush size = {batch_flush} "
+                 f"(JUDGE_BATCHER.batch_size={JUDGE_BATCHER.batch_size})")
+        rows_queued = 0
         for row in rows:
             if writer.total_bytes >= byte_budget:
+                log.debug(f"[public-{label}:{category}] quota met mid-dataset, "
+                          f"stopping after queuing {rows_queued}/{len(rows)} rows")
                 break
             tasks.append(asyncio.create_task(bounded(row)))
+            rows_queued += 1
             if len(tasks) >= batch_flush:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                log.info(f"[public-{label}:{category}] gathering batch of {len(tasks)} task(s) "
+                         f"({rows_queued}/{len(rows)} rows queued so far)")
+                t0 = time.time()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        log.error(f"[public-{label}:{category}] task in batch raised: "
+                                  f"{type(r).__name__}: {r}")
+                log.info(f"[public-{label}:{category}] batch of {len(tasks)} gathered "
+                         f"in {time.time()-t0:.1f}s")
                 tasks = []
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            log.info(f"[public-{label}:{category}] gathering final batch of {len(tasks)} task(s)")
+            t0 = time.time()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    log.error(f"[public-{label}:{category}] task in final batch raised: "
+                              f"{type(r).__name__}: {r}")
+            log.info(f"[public-{label}:{category}] final batch of {len(tasks)} gathered "
+                     f"in {time.time()-t0:.1f}s")
         print(f"[public-{label}:{category}] after {ref}: "
               f"{writer.total_bytes/1024**2:.2f}/{byte_budget/1024**2:.1f} MB written, "
               f"{writer.total_docs} docs")
