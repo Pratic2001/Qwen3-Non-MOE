@@ -75,6 +75,7 @@ Run with:
 import asyncio
 import atexit
 import base64
+import concurrent.futures
 import os
 import sys
 import time
@@ -121,6 +122,62 @@ _allowed_env = os.environ.get("SCRAPER_ALLOWED_DOMAINS", "")
 _blocked_env = os.environ.get("SCRAPER_BLOCKED_DOMAINS", "")
 ALLOWED_DOMAINS = {d.strip().lower() for d in _allowed_env.split(",") if d.strip()}
 BLOCKED_DOMAINS = {d.strip().lower() for d in _blocked_env.split(",") if d.strip()}
+
+# ---------------------------------------------------------------------------
+# CPU-bound work offload
+# ---------------------------------------------------------------------------
+# This server is a single asyncio event loop in a single OS process. Every
+# extractor in extractors.py (trafilatura/readability HTML parsing,
+# pdfplumber, OCR via pytesseract, python-docx/pptx/openpyxl parsing,
+# faster-whisper ASR) is a *synchronous, CPU-bound* function. Calling any of
+# them directly from an `async def` tool -- which is what this file did
+# before -- runs them on the event loop thread, which blocks it: every other
+# in-flight request (search, fetch, extract for a totally different
+# category/domain) queues behind it until it finishes. At small scale this
+# is invisible; at "hundreds of GB, OCR/ASR/parsing genuinely happening"
+# scale it silently caps end-to-end throughput at roughly one extraction at
+# a time, no matter how high --concurrency is set on the orchestrator side
+# -- the client-side semaphore just controls how many requests are
+# *in flight*, not how many actually run concurrently once they hit this
+# process. A ProcessPoolExecutor moves that work off the event loop AND off
+# the GIL entirely, so extraction actually parallelizes across CPU cores.
+# Sized via SCRAPER_EXTRACT_WORKERS (default: all cores). Set to 1 to
+# reproduce the old fully-serial behavior (e.g. for debugging).
+EXTRACT_WORKERS = int(os.environ.get("SCRAPER_EXTRACT_WORKERS", str(os.cpu_count() or 4)))
+_extract_pool = concurrent.futures.ProcessPoolExecutor(max_workers=EXTRACT_WORKERS)
+
+# Video/audio transcription (yt-dlp download + faster-whisper ASR) is a
+# different animal from the extractors above: individual jobs run for
+# minutes, not milliseconds, and there are usually far fewer of them in a
+# given round. Sharing _extract_pool with them would let a handful of long
+# ASR jobs occupy every worker slot and starve the many fast HTML/PDF/
+# Office extractions that should be flowing through concurrently. A
+# separate, smaller, dedicated pool keeps the two from competing. Sized via
+# SCRAPER_MEDIA_WORKERS (default: half the CPUs, min 1) -- deliberately
+# conservative since ASR is itself CPU/GPU-heavy per job (see README's
+# existing --concurrency guidance for ASR-heavy runs).
+MEDIA_WORKERS = int(os.environ.get("SCRAPER_MEDIA_WORKERS", str(max(1, (os.cpu_count() or 4) // 2))))
+_media_pool = concurrent.futures.ProcessPoolExecutor(max_workers=MEDIA_WORKERS)
+
+# Small thread pool for blocking-but-not-CPU-heavy work that isn't safe/
+# worth sending to a separate process: DDGS search (network I/O + the
+# library's own internal time.sleep backoff) and robots.txt fetches. A
+# thread is enough here since these release the GIL during I/O; the point
+# is only to get them off the event loop thread, not off the GIL.
+_io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="scraper-io")
+
+
+async def _run_cpu(fn, *args):
+    """Run a synchronous, CPU-bound extractor in the process pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_extract_pool, fn, *args)
+
+
+async def _run_io(fn, *args):
+    """Run a synchronous, I/O-bound (blocking-socket) function in the
+    thread pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_io_pool, fn, *args)
 
 # Video/streaming/social platforms whose player pages are JS-rendered with
 # no extractable article prose -- these get routed to extract_video instead
@@ -180,18 +237,35 @@ _last_request_time: dict = {}
 MIN_SECONDS_BETWEEN_REQUESTS_PER_HOST = float(os.environ.get("SCRAPER_MIN_HOST_INTERVAL", "2.0"))
 
 
-def _robots_allowed(url: str) -> bool:
+_robots_locks: dict = {}
+
+
+async def _robots_allowed(url: str) -> bool:
+    """Async + per-host locked. Was a bare synchronous httpx.get() call
+    directly on the event loop thread -- every FIRST request to a new host
+    blocked every other in-flight request on this server for the duration
+    of that GET. Also raced: two concurrent first-hits on the same new host
+    could both miss the cache and both fetch robots.txt. The per-host lock
+    makes that a single fetch with the second caller just waiting on the
+    cache instead of duplicating the request."""
     host = _host(url)
-    if host not in _robots_cache:
-        rp = urllib.robotparser.RobotFileParser()
-        robots_url = f"{urllib.parse.urlparse(url).scheme}://{host}/robots.txt"
-        try:
-            resp = httpx.get(robots_url, timeout=5, headers=_default_headers())
-            rp.parse(resp.text.splitlines())
-        except Exception:
-            _robots_cache[host] = None
-            return True
-        _robots_cache[host] = rp
+    if host in _robots_cache:
+        rp = _robots_cache[host]
+        return True if rp is None else rp.can_fetch(net_utils.user_agents.get(), url)
+
+    lock = _robots_locks.setdefault(host, asyncio.Lock())
+    async with lock:
+        if host not in _robots_cache:  # re-check: another task may have filled it while we waited
+            rp = urllib.robotparser.RobotFileParser()
+            robots_url = f"{urllib.parse.urlparse(url).scheme}://{host}/robots.txt"
+            try:
+                async with httpx.AsyncClient(timeout=5, headers=_default_headers()) as client:
+                    resp = await client.get(robots_url)
+                rp.parse(resp.text.splitlines())
+                _robots_cache[host] = rp
+            except Exception:
+                _robots_cache[host] = None
+
     rp = _robots_cache[host]
     if rp is None:
         return True
@@ -212,20 +286,10 @@ async def _rate_limit(url: str):
 # Search
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def web_search(query: str, max_results: int = 10) -> list[dict]:
-    """Search the public web and return title/url/snippet hits.
-
-    Use this to discover candidate pages for a topic before fetching them.
-    Keep queries short and specific (3-8 words), the same way you'd type
-    into a search box.
-
-    IMPORTANT: never fails silently. If every backend errors out or
-    returns zero hits, this returns a single-item list containing
-    {"error": "...", "query": "..."} instead of an empty list or a raised
-    exception -- so the caller can distinguish "genuinely no results" from
-    "the search backend is broken/blocked."
-    """
+def _web_search_sync(query: str, max_results: int) -> list[dict]:
+    """The actual blocking implementation -- unchanged logic, just factored
+    out so it can run in the thread pool instead of directly on the event
+    loop (see web_search below)."""
     from ddgs import DDGS
     try:
         from ddgs.exceptions import DDGSException
@@ -269,6 +333,30 @@ def web_search(query: str, max_results: int = 10) -> list[dict]:
     return [{"error": last_err or "unknown search failure", "query": query}]
 
 
+@mcp.tool()
+async def web_search(query: str, max_results: int = 10) -> list[dict]:
+    """Search the public web and return title/url/snippet hits.
+
+    Use this to discover candidate pages for a topic before fetching them.
+    Keep queries short and specific (3-8 words), the same way you'd type
+    into a search box.
+
+    IMPORTANT: never fails silently. If every backend errors out or
+    returns zero hits, this returns a single-item list containing
+    {"error": "...", "query": "..."} instead of an empty list or a raised
+    exception -- so the caller can distinguish "genuinely no results" from
+    "the search backend is broken/blocked."
+    """
+    # This used to be a plain `def` (synchronous) tool, which meant every
+    # search -- including ddgs's network calls and its own internal
+    # time.sleep(1) retry backoff -- ran directly on the server's single
+    # event loop thread, stalling every other in-flight extract_content/
+    # fetch_page/search call for that whole duration. Now it's async and
+    # the blocking work happens on a thread, so a slow/retrying search for
+    # one category doesn't stall extraction work for every other category.
+    return await _run_io(_web_search_sync, query, max_results)
+
+
 # ---------------------------------------------------------------------------
 # Fetching (text + binary), retried and rate-limited
 # ---------------------------------------------------------------------------
@@ -277,7 +365,7 @@ async def _do_fetch(url: str, max_bytes: int, want_text: bool) -> dict:
     reason = _domain_allowed(url)
     if reason:
         return {"status": None, "content_type": None, "error": f"blocked: {reason}"}
-    if not _robots_allowed(url):
+    if not await _robots_allowed(url):
         return {"status": None, "content_type": None, "error": "disallowed by robots.txt"}
 
     await _rate_limit(url)
@@ -385,7 +473,7 @@ async def extract_content(url: str) -> dict:
     # fall back to sniffing the URL extension only.
     content_type_hint = None
     try:
-        if _robots_allowed(url):
+        if await _robots_allowed(url):
             async with httpx.AsyncClient(headers=_default_headers(), **_client_kwargs()) as client:
                 head = await client.head(url)
                 content_type_hint = head.headers.get("content-type")
@@ -410,7 +498,10 @@ async def extract_content(url: str) -> dict:
             return {"title": None, "text": "", "author": None, "date": None,
                     "content_type": "html", "url": url,
                     "error": page["error"] or "empty page", "extra": {}}
-        return extractors.extract_html(page["html"], url)
+        # trafilatura/readability parsing is CPU-bound (real work on large
+        # pages) -- run it in the process pool so it doesn't block every
+        # other in-flight request on this server while it parses.
+        return await _run_cpu(extractors.extract_html, page["html"], url)
 
     if kind in ("video", "audio"):
         return await transcribe_media(url)
@@ -420,7 +511,11 @@ async def extract_content(url: str) -> dict:
         return {"title": None, "text": "", "author": None, "date": None,
                 "content_type": kind, "url": url, "error": binary["error"], "extra": {}}
     data = base64.b64decode(binary["data_base64"])
-    return extractors.extract_from_bytes(kind, data, url)
+    # This is where the genuinely expensive CPU work lives: pdfplumber (and
+    # its pytesseract OCR fallback for scanned pages), python-docx/pptx,
+    # openpyxl. Same reasoning as extract_html above -- process pool, not
+    # the event loop thread.
+    return await _run_cpu(extractors.extract_from_bytes, kind, data, url)
 
 
 @mcp.tool()
@@ -473,7 +568,8 @@ async def deep_crawl(seed_url: str, max_pages: int = 20, max_depth: int = 2,
     return [p for p in pages if not _domain_allowed(p.get("url", seed_url))]
 
 
-
+@mcp.tool()
+async def extract_article(url: str) -> dict:
     """DEPRECATED alias for extract_content, kept for backward
     compatibility with existing callers. New code should call
     extract_content directly, which also handles PDFs/Office docs/images/
@@ -513,14 +609,17 @@ async def transcribe_media(url: str, asr_fallback: bool = True,
                     "content_type": "audio", "url": url,
                     "error": "direct audio file with asr_fallback=False -- no transcript possible",
                     "extra": {}}
-        return extractors.extract_audio(url, is_local_file=False, model_size=asr_model_size)
-    return extractors.extract_video(url, asr_fallback=asr_fallback,
-                                     asr_model_size=asr_model_size,
-                                     max_duration_seconds=max_duration_seconds)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _media_pool, extractors.extract_audio, url, False, asr_model_size)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _media_pool, extractors.extract_video, url, True, asr_fallback,
+        asr_model_size, max_duration_seconds)
 
 
 @mcp.tool()
-def healthcheck() -> dict:
+async def healthcheck() -> dict:
     """Cheap connectivity/config probe -- call this from an orchestrator
     before kicking off a real scrape, or on a schedule to catch a broken
     search backend or missing optional dependency before it silently eats
@@ -563,6 +662,7 @@ def healthcheck() -> dict:
         report["formats"][label] = ok
 
     report["html_backend"] = HTML_BACKEND
+    report["extract_workers"] = EXTRACT_WORKERS
     if HTML_BACKEND != "httpx" and not report["formats"]["crawl4ai_html"]:
         note = ("SCRAPER_HTML_BACKEND is "
                 f"{HTML_BACKEND!r} but crawl4ai isn't importable -- every HTML "
@@ -573,7 +673,7 @@ def healthcheck() -> dict:
         report["error"] = (report["error"] + "; " if report["error"] else "") + note
 
     try:
-        report["robots_check_ok"] = _robots_allowed("https://example.com/")
+        report["robots_check_ok"] = await _robots_allowed("https://example.com/")
     except Exception as e:
         report["error"] = (report["error"] + "; " if report["error"] else "") + f"robots check failed: {e}"
     return report
@@ -589,7 +689,18 @@ def _cleanup_crawl4ai():
         pass
 
 
+def _cleanup_pools():
+    """Best-effort shutdown of the extraction/media process pools so their
+    worker subprocesses don't linger after this process exits."""
+    for pool in (_extract_pool, _media_pool, _io_pool):
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
 atexit.register(_cleanup_crawl4ai)
+atexit.register(_cleanup_pools)
 
 
 if __name__ == "__main__":

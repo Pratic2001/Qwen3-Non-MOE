@@ -1606,6 +1606,7 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
                   f"{counters['no_sft_pair']} no-labeled-pair"
                   f" -- quality reject breakdown: {counters['filtered_quality_reasons']}")
             writer.close()
+            exact_dedup.close()
             return writer.total_bytes, writer.total_docs
 
     async def bounded_process(url: str):
@@ -1739,6 +1740,7 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
           f"{counters['missing_dependency']} missing optional dependency, "
           f"{counters['other_extract_fail']} other extraction failures")
     writer.close()
+    exact_dedup.close()
     return writer.total_bytes, writer.total_docs
 
 
@@ -1854,21 +1856,60 @@ async def main_async(args):
             )
             return manifest
 
+    # Categories used to run strictly one after another (`for category: await
+    # run_category(...)`), so total wall-clock time was the SUM across
+    # categories rather than roughly the time of the slowest one. Nothing
+    # about run_category's internals actually requires that: each call gets
+    # its own ShardWriter/ExactDedup/RunState/write_lock rooted at
+    # <out-dir>/<category>/, so there's no shared mutable state between
+    # categories to race on. The MCP session (shared across categories in
+    # the non-public-only branch) already supports concurrent calls -- a
+    # single category's own --concurrency workers already prove that, since
+    # they fire concurrent tool calls down the same session. The Ollama
+    # judge batchers are module-level singletons *designed* to coalesce
+    # concurrent callers, so more concurrent categories means better
+    # batching, not worse. --category-concurrency (0 = unbounded, i.e. all
+    # categories at once) caps how many run in parallel if that's ever
+    # worth limiting independently of --concurrency.
+    category_sem = asyncio.Semaphore(args.category_concurrency) if args.category_concurrency > 0 \
+        else None
+
+    async def _bounded(coro):
+        if category_sem is None:
+            return await coro
+        async with category_sem:
+            return await coro
+
+    # Computed once and reused for both branches below -- avoids re-deriving
+    # "which categories have nonzero budget" twice (once to build the task
+    # list, once to line results back up with category names) and risking
+    # the two derivations drifting apart.
+    runnable = [(category, int(target_bytes * frac))
+                for category, frac in mix.items() if int(target_bytes * frac) > 0]
+
     if public_cfg and public_cfg.get("public_only"):
         # No live scraping requested at all -- skip spinning up the MCP
         # subprocess entirely, since ScraperClient/scraper is never touched
         # on the public-sources-only return path in run_category.
         log.info("public_only=True: skipping MCP scraper subprocess launch.")
-        for category, frac in mix.items():
-            budget = int(target_bytes * frac)
-            if budget <= 0:
-                continue
-            actual_bytes, docs = await run_category(
+
+        async def _run_one(category: str, budget: int):
+            return await run_category(
                 None, category, budget, args.out_dir, args.mode,
                 args.min_doc_chars, use_llm_judge=use_llm_judge_flag,
                 concurrency=args.concurrency, public_cfg=public_cfg,
                 deep_crawl_per_domain=0,  # no MCP session in the public-only path -- N/A
             )
+
+        results = await asyncio.gather(
+            *(_bounded(_run_one(category, budget)) for category, budget in runnable),
+            return_exceptions=True,
+        )
+        for (category, budget), r in zip(runnable, results):
+            if isinstance(r, Exception):
+                log.error(f"[{category}] run failed: {r}")
+                continue
+            actual_bytes, docs = r
             manifest["categories"][category] = {
                 "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
             }
@@ -1892,17 +1933,24 @@ async def main_async(args):
                 log.info("MCP server initialized OK.")
                 scraper = ScraperClient(session)
 
-                for category, frac in mix.items():
-                    budget = int(target_bytes * frac)
-                    if budget <= 0:
-                        continue
-                    actual_bytes, docs = await run_category(
+                async def _run_one(category: str, budget: int):
+                    return await run_category(
                         scraper, category, budget, args.out_dir, args.mode,
                         args.min_doc_chars, use_llm_judge=use_llm_judge_flag,
                         concurrency=args.concurrency, public_cfg=public_cfg,
                         deep_crawl_per_domain=args.deep_crawl_per_domain,
                         deep_crawl_max_pages=args.deep_crawl_max_pages,
                     )
+
+                results = await asyncio.gather(
+                    *(_bounded(_run_one(category, budget)) for category, budget in runnable),
+                    return_exceptions=True,
+                )
+                for (category, budget), r in zip(runnable, results):
+                    if isinstance(r, Exception):
+                        log.error(f"[{category}] run failed: {r}")
+                        continue
+                    actual_bytes, docs = r
                     manifest["categories"][category] = {
                         "target_bytes": budget, "actual_bytes": actual_bytes, "docs": docs,
                     }
@@ -1975,6 +2023,19 @@ def main():
                               "Raise for I/O-bound HTML/PDF-heavy runs; keep low if ASR transcription "
                               "is in play (each faster-whisper call is CPU/GPU-heavy) or the LLM judge "
                               "is on (concurrent calls just queue behind a single local Ollama model).")
+    parser.add_argument("--category-concurrency", type=int, default=0,
+                         help="Max number of categories to run concurrently (default 0 = all of "
+                              "them at once, bounded only by --concurrency within each). Categories "
+                              "used to run one at a time, so total wall-clock time was the SUM "
+                              "across categories instead of roughly the slowest one -- the single "
+                              "biggest end-to-end throughput fix at multi-category, multi-hundred-GB "
+                              "scale. All categories share the same MCP server subprocess (now "
+                              "backed by a process pool for CPU-bound extraction, see "
+                              "SCRAPER_EXTRACT_WORKERS/SCRAPER_MEDIA_WORKERS) and the same Ollama "
+                              "judge batcher, both of which are designed for exactly this kind of "
+                              "concurrent, cross-category load. Lower this only if you have very "
+                              "many categories and want to cap total in-flight work more tightly "
+                              "than --concurrency alone does.")
     parser.add_argument("--judge-batch-size", type=int, default=8,
                          help="Number of documents to coalesce into a single Ollama judge / SFT-"
                               "extract call (default 8). Local Ollama processes one request at a "

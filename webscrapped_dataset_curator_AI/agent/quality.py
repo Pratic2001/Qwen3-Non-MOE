@@ -178,22 +178,37 @@ class ExactDedup:
     def __init__(self, persist_path: Optional[str] = None):
         self._seen: set = set()
         self.persist_path = persist_path
+        self._fh = None
         if persist_path and os.path.exists(persist_path):
             with open(persist_path, "r") as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         self._seen.add(bytes.fromhex(line))
+        if persist_path:
+            # Opened once and kept open for the life of the run, instead of
+            # open()+write()+close() on every single document -- at
+            # hundreds of thousands of docs/category (the scale this whole
+            # pipeline targets) that was one extra open/close syscall pair
+            # per document, purely for a one-line append. line-buffered
+            # (buffering=1) so a crash mid-run still loses at most the
+            # partially-written last line, matching the previous
+            # durability characteristics without paying the per-call cost.
+            self._fh = open(persist_path, "a", buffering=1)
 
     def is_duplicate(self, text: str) -> bool:
         h = hashlib.sha1(text.encode("utf-8", errors="ignore")).digest()
         if h in self._seen:
             return True
         self._seen.add(h)
-        if self.persist_path:
-            with open(self.persist_path, "a") as f:
-                f.write(h.hex() + "\n")
+        if self._fh:
+            self._fh.write(h.hex() + "\n")
         return False
+
+    def close(self):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
 
 
 class _ShingleNearDedup:

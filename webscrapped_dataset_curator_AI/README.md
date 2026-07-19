@@ -301,6 +301,38 @@ cron/systemd timer) — each run picks up roughly where the last one left off.
 
 ## Notes, limits, and things worth tuning
 
+- **Categories now run concurrently, not one after another**: previously
+  `dataset_agent.py` processed categories in a strict sequential loop, so
+  total wall-clock time was the SUM across categories. They now run in
+  parallel via `asyncio.gather` (bounded by `--category-concurrency`,
+  default 0 = unbounded -- all categories at once). Each category already
+  has its own `ShardWriter`/`ExactDedup`/`RunState` rooted at
+  `<out-dir>/<category>/`, so there's no shared mutable state to race on;
+  the shared MCP session and Ollama judge batchers are both designed to
+  handle concurrent callers (a single category's `--concurrency` workers
+  already prove the session handles concurrent tool calls).
+- **The MCP server offloads CPU-bound extraction to process pools**:
+  trafilatura/readability HTML parsing, pdfplumber + OCR, python-docx/
+  pptx, openpyxl, and faster-whisper ASR are all synchronous, CPU-bound
+  functions. Running them directly on the server's single asyncio event
+  loop (the original design) blocked every other in-flight request --
+  across every category and every `--concurrency` worker -- for the
+  duration of each one, which capped real throughput at roughly one
+  extraction at a time no matter how high `--concurrency` was set.
+  `web_scraper_mcp/server.py` now runs fast extractors (HTML/PDF/Office/
+  image) in a `ProcessPoolExecutor` sized by `SCRAPER_EXTRACT_WORKERS`
+  (default: all CPU cores), and video/audio transcription in a **separate**,
+  smaller pool sized by `SCRAPER_MEDIA_WORKERS` (default: half the cores)
+  so a few long-running ASR jobs can't occupy worker slots that many fast
+  HTML/PDF extractions need. `web_search`'s DDGS calls and robots.txt
+  fetches are similarly moved off the event loop thread (a thread pool is
+  enough there since they're I/O-, not CPU-, bound). Set either worker
+  count to 1 to reproduce the old fully-serial behavior for debugging.
+- **`ExactDedup` no longer opens/closes its persistence file per document**:
+  it now keeps one line-buffered file handle open for the run. At the
+  hundreds-of-thousands-of-docs-per-category scale this pipeline targets,
+  the old open+write+close-per-document pattern was a real per-doc syscall
+  cost.
 - **Search backend**: DuckDuckGo's free endpoint is rate-limited and can be
   flaky at high volume. For serious scale, swap `web_search` in `server.py`
   to a paid API (Bing Search, Serper, Tavily, Brave Search API) — the tool
