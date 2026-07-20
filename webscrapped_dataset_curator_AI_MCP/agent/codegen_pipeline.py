@@ -427,11 +427,16 @@ def _py_compile_check(script_path: str) -> Optional[str]:
     return None if result.returncode == 0 else (result.stderr or result.stdout)
 
 
-def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 2) -> bool:
+def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 2,
+                                  prior_error: Optional[str] = None) -> bool:
     """prompt_fn(prior_error) -> prompt string. Generates, compiles, and on
     failure re-prompts with the exact error up to max_repair times. Returns
-    True if a compiling script now exists at script_path."""
-    prior_error = None
+    True if a compiling script now exists at script_path.
+
+    `prior_error` can be seeded from outside (e.g. a previous *runtime*
+    failure passed in by generate_validate_and_run below) so the very first
+    generation attempt already includes it, not just compile errors found
+    here."""
     for attempt in range(max_repair + 1):
         label = "generating" if attempt == 0 else f"repairing (attempt {attempt})"
         print(f"  [codegen] {label} {os.path.basename(script_path)}...")
@@ -451,11 +456,24 @@ def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 
     return False
 
 
+# Generated scripts are instructed to wrap their whole run in a broad
+# try/except and print the caught exception instead of dying with a bare
+# traceback (see _QUALITY_API_SUMMARY / build_*_codegen_prompt). Match that
+# convention here so a runtime failure can be pulled back out of the
+# captured output and fed to Ollama as a repair prompt, the same way a
+# compile error already is.
+_FATAL_ERROR_RE = re.compile(r"^\[FATAL ERROR CAUGHT\]:\s*(.*)$")
+
+
 def run_generated_script(script_path: str, target_size: str, out_dir: str, category: str,
                           min_doc_chars: int, log_path: str, extra_args: Optional[list] = None) -> dict:
     """Runs the generated script as a plain subprocess, streaming its output
     live to both the console and a log file (so a long run can be tailed),
-    and parses the trailing RESULT_JSON line for a manifest entry."""
+    and parses the trailing RESULT_JSON line for a manifest entry. Also
+    watches for the script's own "[FATAL ERROR CAUGHT]: ..." line (or a
+    non-zero exit with no RESULT_JSON at all, i.e. it crashed before even
+    reaching its own try/except) and returns that under "error" so callers
+    can decide whether to trigger a repair-and-rerun."""
     cmd = [sys.executable, script_path,
            "--target-size", target_size, "--out-dir", out_dir,
            "--category", category, "--min-doc-chars", str(min_doc_chars)]
@@ -464,6 +482,8 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
     print(f"  [run] {' '.join(cmd)}")
     print(f"  [run] logging to {log_path}")
     result_json = {"actual_bytes": 0, "docs": 0}
+    fatal_error = None
+    tail_lines = []  # last few lines, in case it crashes with no FATAL marker at all
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as log_fh:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -471,6 +491,11 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
         for line in proc.stdout:
             sys.stdout.write(line)
             log_fh.write(line)
+            tail_lines.append(line)
+            tail_lines[:] = tail_lines[-40:]
+            m = _FATAL_ERROR_RE.match(line.strip())
+            if m:
+                fatal_error = m.group(1).strip()
             if line.startswith("RESULT_JSON:"):
                 try:
                     result_json = json.loads(line[len("RESULT_JSON:"):].strip())
@@ -480,7 +505,65 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
     if proc.returncode != 0:
         print(f"  [run] WARNING: script exited with code {proc.returncode} "
               f"(see {log_path}) -- using whatever RESULT_JSON it printed, if any")
+        if fatal_error is None:
+            # Crashed hard enough it never even hit its own try/except
+            # (e.g. an ImportError before the loop starts) -- fall back to
+            # the raw tail of output so there's still something to repair with.
+            fatal_error = "".join(tail_lines[-15:]).strip() or f"process exited with code {proc.returncode}"
+    elif fatal_error is None and result_json.get("docs", 0) == 0 and result_json.get("actual_bytes", 0) == 0:
+        # Exited cleanly but wrote nothing at all -- often the same class of
+        # bug (e.g. it caught its own error and printed RESULT_JSON with
+        # zeros) without matching our marker regex exactly. Surface the tail
+        # of output so a human/Ollama can see why nothing was produced.
+        fatal_error = "".join(tail_lines[-15:]).strip() or None
+    result_json["error"] = fatal_error
     return result_json
+
+
+def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out_dir: str,
+                               category: str, min_doc_chars: int, log_path: str,
+                               extra_args: Optional[list] = None, max_repair: int = 2) -> dict:
+    """Ties generate -> compile-validate -> run into one repair loop. A
+    failure at EITHER stage (compile error, or a runtime "[FATAL ERROR
+    CAUGHT]"/crash/zero-output from the actual run) is fed back into
+    prompt_fn as prior_error and the script is regenerated, up to
+    max_repair times total across both stages combined. This is what
+    closes the gap that let a runtime bug like a bad load_dataset() kwarg
+    slip through silently before: previously only compile errors triggered
+    a rewrite, so a script that compiled fine but blew up at runtime just
+    printed its FATAL line and was left alone."""
+    prior_error = None
+    result = {"actual_bytes": 0, "docs": 0, "error": None}
+    for attempt in range(max_repair + 1):
+        ok = generate_and_validate_script(
+            prompt_fn, script_path, max_repair=0, prior_error=prior_error)
+        if not ok:
+            # generate_and_validate_script with max_repair=0 only fails on a
+            # compile error with no more compile-retries left; treat that
+            # compile error as this attempt's failure and loop again here.
+            error = _py_compile_check(script_path)
+            prior_error = error or prior_error
+            print(f"  [codegen] attempt {attempt + 1}/{max_repair + 1} failed to compile, "
+                  f"{'retrying' if attempt < max_repair else 'giving up'}...")
+            continue
+
+        result = run_generated_script(
+            script_path, target_size, out_dir, category, min_doc_chars,
+            log_path=log_path, extra_args=extra_args,
+        )
+        if result.get("error") is None:
+            return result
+
+        print(f"  [codegen] runtime error on attempt {attempt + 1}/{max_repair + 1}:\n"
+              f"{result['error'][:500]}")
+        if attempt < max_repair:
+            print(f"  [codegen] regenerating {os.path.basename(script_path)} with this "
+                  f"error fed back to Ollama...")
+        prior_error = result["error"]
+
+    print(f"  [codegen] giving up on {os.path.basename(script_path)} after "
+          f"{max_repair + 1} generate+run attempt(s)")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -514,17 +597,11 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
 
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_{dataset_id}")
         script_path = os.path.join(scripts_dir, f"{safe_name}.py")
-        ok = generate_and_validate_script(
+        remaining = budget_bytes - total_bytes
+        result = generate_validate_and_run(
             lambda err: build_hf_codegen_prompt(
                 category, mode, dataset_id, config, sample["split"],
                 sample["columns"], sample["rows"], prior_error=err),
-            script_path,
-        )
-        if not ok:
-            continue
-
-        remaining = budget_bytes - total_bytes
-        result = run_generated_script(
             script_path, f"{remaining}B", out_dir, category, min_doc_chars,
             log_path=os.path.join(logs_dir, f"{safe_name}.log"),
         )
@@ -560,14 +637,8 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
 
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_web")
     script_path = os.path.join(scripts_dir, f"{safe_name}.py")
-    ok = generate_and_validate_script(
+    result = generate_validate_and_run(
         lambda err: build_web_codegen_prompt(category, mode, raw_path, sample_rows, prior_error=err),
-        script_path,
-    )
-    if not ok:
-        return {"target_bytes": budget_bytes, "actual_bytes": 0, "docs": 0}
-
-    result = run_generated_script(
         script_path, f"{budget_bytes}B", out_dir, category, min_doc_chars,
         log_path=os.path.join(logs_dir, f"{safe_name}.log"),
         extra_args=["--raw-path", raw_path],
