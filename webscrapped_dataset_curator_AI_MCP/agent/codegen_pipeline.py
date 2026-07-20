@@ -864,7 +864,21 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
 
 def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: str,
                         min_doc_chars: int, discover_limit: int = 5,
-                        max_candidates_to_try: int = 3) -> dict:
+                        max_candidates_to_try: int = 3,
+                        max_total_considered: int = 40) -> dict:
+    """Tries candidate datasets one at a time until either budget_bytes is
+    filled or max_candidates_to_try datasets have *actually contributed*
+    data. A dataset that gets rejected -- whether pre-download (unsupported
+    dtype, gated, doesn't exist -- sample_hf_dataset() returns None) or
+    post-download (codegen/run produced zero usable bytes) -- does NOT
+    consume one of those max_candidates_to_try slots and is not counted
+    toward the quota; the loop just moves on to the next candidate. If the
+    initially discovered candidate list runs dry before the quota is met,
+    more candidates are pulled in (widening the search) rather than giving
+    up early. max_total_considered is an absolute safety ceiling on how
+    many datasets we'll ever look at for one category, regardless of
+    outcome, so a category with nothing but bad candidates can't loop
+    forever."""
     scripts_dir = os.path.join(out_dir, "_generated_scripts")
     logs_dir = os.path.join(out_dir, "_logs")
     os.makedirs(scripts_dir, exist_ok=True)
@@ -876,17 +890,43 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
                 f"candidate dataset(s): {candidates}")
 
     total_bytes, total_docs = 0, 0
-    tried = 0
-    for dataset_id in candidates:
-        if total_bytes >= budget_bytes or tried >= max_candidates_to_try:
+    tried = 0       # datasets that actually contributed data -- gates max_candidates_to_try
+    rejected = 0    # datasets skipped/failed and NOT counted toward the quota
+    considered = set()
+    idx = 0
+    widen_limit = discover_limit
+
+    while total_bytes < budget_bytes and tried < max_candidates_to_try:
+        if idx >= len(candidates):
+            # Ran out of candidates without filling the quota -- widen the
+            # discovery search instead of giving up.
+            widen_limit *= 2
+            more = [c for c in discover_candidates(category, limit=widen_limit)
+                     if c not in considered]
+            if not more:
+                log_warn(f"[{category}] no more candidate datasets left to try "
+                         f"(considered {len(considered)}) -- stopping short of quota")
+                break
+            candidates.extend(more)
+
+        dataset_id = candidates[idx]
+        idx += 1
+        if dataset_id in considered:
+            continue
+        considered.add(dataset_id)
+        if len(considered) > max_total_considered:
+            log_warn(f"[{category}] hit the {max_total_considered}-dataset safety "
+                     f"ceiling -- stopping short of quota")
             break
-        tried += 1
+
         configs = discover_hf_configs(dataset_id) or [None]
         config = configs[0]
         log_section(category, f"sampling {_paint(dataset_id, _Ansi.BOLD)} (config={config})...")
         sample = sample_hf_dataset(dataset_id, config)
         if sample is None:
-            log_warn(f"[{category}] could not sample {dataset_id} -- skipping")
+            log_warn(f"[{category}] {dataset_id} rejected before download -- "
+                     f"not counted toward quota, trying next candidate")
+            rejected += 1
             continue
 
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_{dataset_id}")
@@ -899,13 +939,21 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
             script_path, f"{remaining}B", out_dir, category, min_doc_chars,
             log_path=os.path.join(logs_dir, f"{safe_name}.log"),
         )
+        if result.get("actual_bytes", 0) <= 0:
+            log_warn(f"[{category}] {dataset_id} produced no usable data after "
+                     f"download -- not counted toward quota, trying next candidate")
+            rejected += 1
+            continue
+
+        tried += 1
         total_bytes += result.get("actual_bytes", 0)
         total_docs += result.get("docs", 0)
         log_success(f"[{category}] after {dataset_id}: {total_bytes/1024**2:.1f} MB / "
-                    f"{budget_bytes/1024**2:.1f} MB, {total_docs} docs total")
+                    f"{budget_bytes/1024**2:.1f} MB, {total_docs} docs total "
+                    f"({rejected} rejected so far)")
 
     return {"target_bytes": budget_bytes, "actual_bytes": total_bytes, "docs": total_docs,
-            "candidates_tried": tried}
+            "candidates_tried": tried, "candidates_rejected": rejected}
 
 
 def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
