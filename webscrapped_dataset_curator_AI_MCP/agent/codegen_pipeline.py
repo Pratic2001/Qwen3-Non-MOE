@@ -347,12 +347,55 @@ def _extract_code_block(text: str) -> str:
 # PHASE 1a (public datasets): discover + sample
 # ---------------------------------------------------------------------------
 
+_UNSUPPORTED_FEATURE_TYPES = {
+    "Image", "Audio", "Video", "Array2D", "Array3D", "Array4D", "Array5D",
+}
+
+
+def _unsupported_feature_column(features) -> Optional[str]:
+    """Inspects a `datasets.Features` mapping (available on a streaming
+    dataset without pulling any rows) and returns the name of the first
+    column whose type is unsupported for this text-only pipeline, or None
+    if every column looks safe. Also looks one level into Sequence(...)
+    wrappers, e.g. Sequence(Image())."""
+    if not features:
+        return None
+    for col_name, feat in features.items():
+        feat_type = type(feat).__name__
+        if feat_type in _UNSUPPORTED_FEATURE_TYPES:
+            return col_name
+        inner = getattr(feat, "feature", None)
+        if inner is not None and type(inner).__name__ in _UNSUPPORTED_FEATURE_TYPES:
+            return col_name
+    return None
+
+
+def _row_has_unsupported_value(value) -> bool:
+    """Belt-and-suspenders fallback for the (rarer) case where a dataset's
+    declared Features don't reveal a binary column -- e.g. custom loading
+    scripts -- but an actual sampled row still contains a non-JSON-safe
+    object such as a PIL image, raw bytes, or a numpy array. Recurses into
+    dicts/lists since HF rows are often nested."""
+    if isinstance(value, dict):
+        return any(_row_has_unsupported_value(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_row_has_unsupported_value(v) for v in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return False
+    # Anything else -- PIL.Image.Image, bytes/bytearray, numpy arrays,
+    # torch tensors, etc. -- is not something this text pipeline supports.
+    return True
+
+
 def sample_hf_dataset(dataset_id: str, config: Optional[str], split: str = "train",
                        n: int = 12) -> Optional[dict]:
     """Streams the first n rows of one dataset/config/split and returns
     {"columns": [...], "rows": [...]}, or None if it can't be opened at all
     (gated, doesn't exist, no matching split -- all treated as skip-this-
-    candidate rather than fatal, same convention as public_sources.py)."""
+    candidate rather than fatal, same convention as public_sources.py) OR
+    if it carries an unsupported dtype (images/audio/video/tensors) that
+    this text-only pipeline can never turn into JSONL -- such datasets are
+    skipped here, before any full download is ever kicked off."""
     try:
         from datasets import load_dataset
     except ImportError:
@@ -361,9 +404,25 @@ def sample_hf_dataset(dataset_id: str, config: Optional[str], split: str = "trai
     for try_split in (split, "train", "validation", "test"):
         try:
             ds = load_dataset(dataset_id, config, split=try_split, streaming=True)
+
+            bad_col = _unsupported_feature_column(getattr(ds, "features", None))
+            if bad_col:
+                log_warn(f"skipping {dataset_id} (config={config}): column "
+                         f"'{bad_col}' has an unsupported dtype (image/audio/"
+                         f"video/tensor) for this text-only pipeline")
+                return None
+
             rows = list(itertools.islice(ds, n))
             if not rows:
                 continue
+
+            for row in rows:
+                if any(_row_has_unsupported_value(v) for v in row.values()):
+                    log_warn(f"skipping {dataset_id} (config={config}): sampled "
+                             f"rows contain an unsupported (non-JSON-serializable) "
+                             f"value for this text-only pipeline")
+                    return None
+
             columns = sorted(rows[0].keys())
             return {"columns": columns, "rows": rows, "split": try_split}
         except Exception:
@@ -515,7 +574,12 @@ def build_hf_codegen_prompt(category: str, mode: str, dataset_id: str, config: O
                              split: str, columns: list, rows: list,
                              prior_error: Optional[str] = None) -> str:
     schema = MODE_SCHEMAS[mode]
-    sample_json = json.dumps(rows[:5], ensure_ascii=False, indent=2)[:4000]
+    # rows should already be pure JSON-safe types -- sample_hf_dataset()
+    # filters out anything with an unsupported dtype (images/audio/etc.)
+    # before it ever gets here. default=str is only a last-ditch safety net
+    # so a stray non-serializable value degrades to a string instead of
+    # crashing the whole pipeline.
+    sample_json = json.dumps(rows[:5], ensure_ascii=False, indent=2, default=str)[:4000]
     repair_note = ""
     if prior_error:
         repair_note = (
