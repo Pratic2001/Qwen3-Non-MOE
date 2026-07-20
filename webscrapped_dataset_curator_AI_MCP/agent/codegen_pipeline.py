@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import io
 import itertools
 import json
@@ -78,6 +79,126 @@ from topics import HUB_SEARCH_KEYWORDS, TOPIC_SEEDS
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 QUALITY_PY_PATH = os.path.join(os.path.dirname(__file__), "quality.py")
+
+# ---------------------------------------------------------------------------
+# Interpreter / environment -- every subprocess this module launches (the
+# generated extractor scripts, py_compile, the MCP server) is spawned with
+# sys.executable, i.e. THIS process's own interpreter, so they all share
+# whatever venv/conda env is currently active and see the same installed
+# requirements. env=os.environ.copy() is passed explicitly too, so PATH,
+# VIRTUAL_ENV, HF_TOKEN, OLLAMA_URL, etc. all carry through rather than
+# relying on subprocess's default inherit-parent-env behavior.
+# ---------------------------------------------------------------------------
+
+SUBPROCESS_ENV = os.environ.copy()
+
+
+def _env_banner() -> None:
+    """Prints which interpreter/env is about to be used, and does a quick,
+    non-fatal check for the packages the pipeline (and the scripts it will
+    generate) rely on, so a missing-dependency problem shows up immediately
+    instead of surfacing later as a cryptic runtime failure in a generated
+    script's own [FATAL ERROR CAUGHT] line."""
+    venv = os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_DEFAULT_ENV")
+    log_header("Environment")
+    log_info(f"interpreter : {sys.executable}")
+    log_info(f"python      : {sys.version.split()[0]}")
+    log_info(f"active env  : {venv or '(none detected -- system/base interpreter)'}")
+    for pkg in ("datasets", "httpx", "mcp"):
+        found = importlib.util.find_spec(pkg) is not None
+        (log_success if found else log_warn)(
+            f"{pkg:<10} {'available' if found else 'NOT FOUND -- pip install ' + pkg} "
+            f"(in {os.path.basename(sys.executable)}'s env)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Colorized console logging -- plain ANSI, no external dependency. Auto-
+# disabled when stdout isn't a real terminal or NO_COLOR is set, so piping
+# to a file or CI log never ends up full of escape codes. Subprocess output
+# streamed from generated scripts is colorized for the console the same way
+# but always written PLAIN to the per-dataset log file (see
+# run_generated_script) so log files stay grep-friendly.
+# ---------------------------------------------------------------------------
+
+class _Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    YELLOW = "\033[33m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    GRAY = "\033[90m"
+    B_RED = "\033[91m"
+    B_GREEN = "\033[92m"
+    B_YELLOW = "\033[93m"
+    B_BLUE = "\033[94m"
+    B_MAGENTA = "\033[95m"
+    B_CYAN = "\033[96m"
+
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def _paint(text: str, *codes: str) -> str:
+    if not _COLOR or not text:
+        return text
+    return "".join(codes) + text + _Ansi.RESET
+
+
+def log_header(text: str) -> None:
+    bar = "─" * max(20, min(78, len(text) + 4))
+    print(_paint(f"\n{bar}", _Ansi.B_CYAN, _Ansi.BOLD))
+    print(_paint(f"  {text}", _Ansi.B_CYAN, _Ansi.BOLD))
+    print(_paint(bar, _Ansi.B_CYAN, _Ansi.BOLD))
+
+
+def log_section(category: str, text: str) -> None:
+    print(_paint(f"[{category}] ", _Ansi.B_MAGENTA, _Ansi.BOLD) + text)
+
+
+def log_info(text: str) -> None:
+    print(_paint("  ℹ ", _Ansi.B_BLUE) + text)
+
+
+def log_step(text: str) -> None:
+    print(_paint("  ▸ ", _Ansi.B_CYAN) + text)
+
+
+def log_success(text: str) -> None:
+    print(_paint("  ✔ ", _Ansi.B_GREEN, _Ansi.BOLD) + _paint(text, _Ansi.GREEN))
+
+
+def log_warn(text: str) -> None:
+    print(_paint("  ⚠ ", _Ansi.B_YELLOW, _Ansi.BOLD) + _paint(text, _Ansi.YELLOW))
+
+
+def log_error(text: str) -> None:
+    print(_paint("  ✘ ", _Ansi.B_RED, _Ansi.BOLD) + _paint(text, _Ansi.RED))
+
+
+def log_dim(text: str) -> None:
+    print(_paint(text, _Ansi.GRAY))
+
+
+def _colorize_passthrough(line: str) -> str:
+    """Colorizes one line of a generated script's stdout for console
+    display only -- the caller writes the original, uncolored `line` to
+    the log file separately."""
+    if not _COLOR:
+        return line
+    stripped = line.rstrip("\n")
+    if stripped.startswith("[FATAL ERROR CAUGHT]"):
+        return _paint(stripped, _Ansi.B_RED, _Ansi.BOLD) + "\n"
+    if stripped.startswith("RESULT_JSON:"):
+        return _paint(stripped, _Ansi.B_GREEN, _Ansi.BOLD) + "\n"
+    low = stripped.lower()
+    if "warn" in low[:20]:
+        return _paint(stripped, _Ansi.B_YELLOW) + "\n"
+    if "error" in low[:20] or "traceback" in low[:20]:
+        return _paint(stripped, _Ansi.RED) + "\n"
+    return _paint(stripped, _Ansi.GRAY) + "\n"
+
 
 # ---------------------------------------------------------------------------
 # Target schemas -- same three the hand-written reference scripts use.
@@ -150,7 +271,7 @@ def sample_hf_dataset(dataset_id: str, config: Optional[str], split: str = "trai
     try:
         from datasets import load_dataset
     except ImportError:
-        print("[error] `datasets` package not installed -- pip install datasets")
+        log_error("`datasets` package not installed -- pip install datasets")
         return None
     for try_split in (split, "train", "validation", "test"):
         try:
@@ -198,7 +319,11 @@ async def _crawl_raw_batch_async(category: str, byte_budget: int, raw_path: str,
     from mcp.client.stdio import stdio_client
 
     server_path = os.environ.get("MCP_SERVER_PATH") or _find_server_path()
-    server_params = StdioServerParameters(command=sys.executable, args=[server_path])
+    # command=sys.executable alone guarantees the right interpreter binary,
+    # but the MCP stdio transport doesn't necessarily forward the parent's
+    # full environment by default -- pass it explicitly so HF_TOKEN,
+    # KAGGLE_*, OLLAMA_URL etc. from the active env reach the server too.
+    server_params = StdioServerParameters(command=sys.executable, args=[server_path], env=SUBPROCESS_ENV)
     written_bytes = 0
     seen_urls = set()
     queries = TOPIC_SEEDS.get(category, [category])
@@ -214,7 +339,7 @@ async def _crawl_raw_batch_async(category: str, byte_budget: int, raw_path: str,
                     try:
                         hits = await scraper.search(query, max_results=max_results_per_query)
                     except Exception as e:
-                        print(f"[warn] search failed for {query!r}: {e}")
+                        log_warn(f"search failed for {query!r}: {e}")
                         continue
                     for hit in hits:
                         if written_bytes >= byte_budget:
@@ -226,7 +351,7 @@ async def _crawl_raw_batch_async(category: str, byte_budget: int, raw_path: str,
                         try:
                             doc = await scraper.extract(url)
                         except Exception as e:
-                            print(f"[warn] extract failed for {url}: {e}")
+                            log_warn(f"extract failed for {url}: {e}")
                             continue
                         text = (doc or {}).get("text") or (doc or {}).get("content") or ""
                         if not text or len(text) < 50:
@@ -235,8 +360,10 @@ async def _crawl_raw_batch_async(category: str, byte_budget: int, raw_path: str,
                         raw_fh.write(line)
                         written_bytes += len(line.encode("utf-8"))
                         if written_bytes % (1024 * 256) < len(line):
-                            print(f"[{category}] raw crawl: {written_bytes/1024**2:.1f} MB "
-                                  f"/ {byte_budget/1024**2:.1f} MB", end="\r")
+                            msg = _paint(
+                                f"[{category}] raw crawl: {written_bytes/1024**2:.1f} MB "
+                                f"/ {byte_budget/1024**2:.1f} MB", _Ansi.B_CYAN)
+                            print(msg, end="\r")
                     # itertools.cycle over a small finite list forever would
                     # spin if every query keeps failing/returning nothing;
                     # bail once we've gone through all queries with zero
@@ -253,8 +380,8 @@ def crawl_raw_batch(category: str, byte_budget: int, raw_path: str) -> int:
     function dips into asyncio, because the MCP scraper protocol requires
     it, and that's hidden here."""
     os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
-    print(f"[{category}] crawling raw batch -> {raw_path} "
-          f"(target {byte_budget/1024**2:.1f} MB)")
+    log_section(category, f"crawling raw batch -> {raw_path} "
+                f"(target {byte_budget/1024**2:.1f} MB)")
     return asyncio.run(_crawl_raw_batch_async(category, byte_budget, raw_path))
 
 
@@ -422,7 +549,7 @@ def _py_compile_check(script_path: str) -> Optional[str]:
     """Returns None if the script compiles cleanly, else the error text."""
     result = subprocess.run(
         [sys.executable, "-m", "py_compile", script_path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=SUBPROCESS_ENV,
     )
     return None if result.returncode == 0 else (result.stderr or result.stdout)
 
@@ -439,20 +566,21 @@ def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 
     here."""
     for attempt in range(max_repair + 1):
         label = "generating" if attempt == 0 else f"repairing (attempt {attempt})"
-        print(f"  [codegen] {label} {os.path.basename(script_path)}...")
+        log_step(f"codegen: {label} {_paint(os.path.basename(script_path), _Ansi.BOLD)}...")
         response = call_ollama(prompt_fn(prior_error))
         code = _extract_code_block(response)
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(code)
         error = _py_compile_check(script_path)
         if error is None:
-            print(f"  [codegen] {os.path.basename(script_path)} compiles OK "
-                  f"({attempt + 1} attempt(s))")
+            log_success(f"codegen: {os.path.basename(script_path)} compiles OK "
+                        f"({attempt + 1} attempt(s))")
             return True
-        print(f"  [codegen] compile error, will retry:\n{error[:500]}")
+        log_warn(f"codegen: compile error, will retry:")
+        log_dim(error[:500])
         prior_error = error
-    print(f"  [codegen] giving up on {os.path.basename(script_path)} after "
-          f"{max_repair + 1} attempt(s) -- skipping this source")
+    log_error(f"codegen: giving up on {os.path.basename(script_path)} after "
+              f"{max_repair + 1} attempt(s) -- skipping this source")
     return False
 
 
@@ -479,18 +607,19 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
            "--category", category, "--min-doc-chars", str(min_doc_chars)]
     if extra_args:
         cmd.extend(extra_args)
-    print(f"  [run] {' '.join(cmd)}")
-    print(f"  [run] logging to {log_path}")
+    log_step(f"run: {' '.join(cmd)}")
+    log_dim(f"    (using {sys.executable}, same env this pipeline is running in)")
+    log_dim(f"    logging to {log_path}")
     result_json = {"actual_bytes": 0, "docs": 0}
     fatal_error = None
     tail_lines = []  # last few lines, in case it crashes with no FATAL marker at all
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as log_fh:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1)
+                                 text=True, bufsize=1, env=SUBPROCESS_ENV)
         for line in proc.stdout:
-            sys.stdout.write(line)
-            log_fh.write(line)
+            sys.stdout.write(_colorize_passthrough(line))
+            log_fh.write(line)  # log file always gets the plain, uncolored line
             tail_lines.append(line)
             tail_lines[:] = tail_lines[-40:]
             m = _FATAL_ERROR_RE.match(line.strip())
@@ -503,8 +632,8 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
                     pass
         proc.wait()
     if proc.returncode != 0:
-        print(f"  [run] WARNING: script exited with code {proc.returncode} "
-              f"(see {log_path}) -- using whatever RESULT_JSON it printed, if any")
+        log_warn(f"run: script exited with code {proc.returncode} "
+                 f"(see {log_path}) -- using whatever RESULT_JSON it printed, if any")
         if fatal_error is None:
             # Crashed hard enough it never even hit its own try/except
             # (e.g. an ImportError before the loop starts) -- fall back to
@@ -543,8 +672,8 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
             # compile error as this attempt's failure and loop again here.
             error = _py_compile_check(script_path)
             prior_error = error or prior_error
-            print(f"  [codegen] attempt {attempt + 1}/{max_repair + 1} failed to compile, "
-                  f"{'retrying' if attempt < max_repair else 'giving up'}...")
+            log_warn(f"codegen: attempt {attempt + 1}/{max_repair + 1} failed to compile, "
+                     f"{'retrying' if attempt < max_repair else 'giving up'}...")
             continue
 
         result = run_generated_script(
@@ -554,15 +683,15 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
         if result.get("error") is None:
             return result
 
-        print(f"  [codegen] runtime error on attempt {attempt + 1}/{max_repair + 1}:\n"
-              f"{result['error'][:500]}")
+        log_warn(f"codegen: runtime error on attempt {attempt + 1}/{max_repair + 1}:")
+        log_dim(result["error"][:500])
         if attempt < max_repair:
-            print(f"  [codegen] regenerating {os.path.basename(script_path)} with this "
-                  f"error fed back to Ollama...")
+            log_step(f"codegen: regenerating {os.path.basename(script_path)} with this "
+                     f"error fed back to Ollama...")
         prior_error = result["error"]
 
-    print(f"  [codegen] giving up on {os.path.basename(script_path)} after "
-          f"{max_repair + 1} generate+run attempt(s)")
+    log_error(f"codegen: giving up on {os.path.basename(script_path)} after "
+              f"{max_repair + 1} generate+run attempt(s)")
     return result
 
 
@@ -579,7 +708,8 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
     os.makedirs(logs_dir, exist_ok=True)
 
     candidates = discover_candidates(category, limit=discover_limit)
-    print(f"[{category}] discovered {len(candidates)} candidate dataset(s): {candidates}")
+    log_section(category, f"discovered {_paint(str(len(candidates)), _Ansi.BOLD)} "
+                f"candidate dataset(s): {candidates}")
 
     total_bytes, total_docs = 0, 0
     tried = 0
@@ -589,10 +719,10 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
         tried += 1
         configs = discover_hf_configs(dataset_id) or [None]
         config = configs[0]
-        print(f"[{category}] sampling {dataset_id} (config={config})...")
+        log_section(category, f"sampling {_paint(dataset_id, _Ansi.BOLD)} (config={config})...")
         sample = sample_hf_dataset(dataset_id, config)
         if sample is None:
-            print(f"[{category}] could not sample {dataset_id} -- skipping")
+            log_warn(f"[{category}] could not sample {dataset_id} -- skipping")
             continue
 
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_{dataset_id}")
@@ -607,8 +737,8 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
         )
         total_bytes += result.get("actual_bytes", 0)
         total_docs += result.get("docs", 0)
-        print(f"[{category}] after {dataset_id}: {total_bytes/1024**2:.1f} MB / "
-              f"{budget_bytes/1024**2:.1f} MB, {total_docs} docs total")
+        log_success(f"[{category}] after {dataset_id}: {total_bytes/1024**2:.1f} MB / "
+                    f"{budget_bytes/1024**2:.1f} MB, {total_docs} docs total")
 
     return {"target_bytes": budget_bytes, "actual_bytes": total_bytes, "docs": total_docs,
             "candidates_tried": tried}
@@ -628,11 +758,11 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
     if not os.path.exists(raw_path) or os.path.getsize(raw_path) < raw_budget:
         crawl_raw_batch(category, raw_budget, raw_path)
     else:
-        print(f"[{category}] reusing existing raw batch at {raw_path}")
+        log_section(category, f"reusing existing raw batch at {raw_path}")
 
     sample_rows = sample_raw_batch(raw_path)
     if not sample_rows:
-        print(f"[{category}] raw batch is empty -- nothing to process")
+        log_warn(f"[{category}] raw batch is empty -- nothing to process")
         return {"target_bytes": budget_bytes, "actual_bytes": 0, "docs": 0}
 
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", f"{category}_web")
@@ -676,6 +806,8 @@ def main():
                              "Defaults to an even split across --categories.")
     args = parser.parse_args()
 
+    _env_banner()
+
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
     target_bytes = parse_size(args.target_size)
     if args.mix:
@@ -693,8 +825,8 @@ def main():
         budget = int(target_bytes * frac)
         if budget <= 0:
             continue
-        print(f"\n=== [{category}] target {budget/1024**2:.1f} MB "
-              f"({'public datasets' if args.public_only else 'live web crawl'}) ===")
+        log_header(f"[{category}] target {budget/1024**2:.1f} MB "
+                   f"({'public datasets' if args.public_only else 'live web crawl'})")
         if args.public_only:
             manifest["categories"][category] = run_category_public(
                 category, budget, args.out_dir, args.mode, args.min_doc_chars)
@@ -706,11 +838,11 @@ def main():
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     total_actual = sum(c["actual_bytes"] for c in manifest["categories"].values())
-    print(f"\n=== Done. Total: {total_actual/1024**2:.2f} MB across "
-          f"{len(manifest['categories'])} categories ===")
-    print(f"Manifest written to {manifest_path}")
-    print(f"Generated scripts kept under {os.path.join(args.out_dir, '_generated_scripts')} "
-          f"-- re-runs skip regeneration if you rerun the same script directly.")
+    log_header(f"Done -- {total_actual/1024**2:.2f} MB across "
+               f"{len(manifest['categories'])} categories")
+    log_success(f"manifest written to {manifest_path}")
+    log_dim(f"generated scripts kept under {os.path.join(args.out_dir, '_generated_scripts')} "
+            f"-- re-runs skip regeneration if you rerun the same script directly.")
 
 
 if __name__ == "__main__":
