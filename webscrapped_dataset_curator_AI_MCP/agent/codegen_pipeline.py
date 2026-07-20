@@ -65,6 +65,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -79,6 +80,30 @@ from topics import HUB_SEARCH_KEYWORDS, TOPIC_SEEDS
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 QUALITY_PY_PATH = os.path.join(os.path.dirname(__file__), "quality.py")
+
+# ---------------------------------------------------------------------------
+# Generated scripts are told (see _QUALITY_API_SUMMARY below) to import
+# quality.py by adding their OWN directory to sys.path -- which only works
+# if quality.py actually lives next to them. That's true when --out-dir is
+# somewhere under this codebase, but as soon as --out-dir points anywhere
+# else (a different drive, /mnt/data, a mounted volume, etc.) the generated
+# script's directory (<out-dir>/_generated_scripts) has nothing in it but
+# the script itself, and every run fails with "ModuleNotFoundError: No
+# module named 'quality'" before it ever gets to the real work. Fix: stage
+# a fresh copy of quality.py into <out-dir>/_generated_scripts up front, so
+# "same directory" is actually true regardless of where --out-dir points.
+# ---------------------------------------------------------------------------
+
+def _stage_shared_modules(scripts_dir: str) -> None:
+    """Copies quality.py (the only local module generated scripts import)
+    into scripts_dir so it's available no matter where --out-dir is. Safe
+    to call every run -- always re-copies so an edited quality.py doesn't
+    leave stale copies behind in old output directories."""
+    os.makedirs(scripts_dir, exist_ok=True)
+    dest = os.path.join(scripts_dir, "quality.py")
+    shutil.copy2(QUALITY_PY_PATH, dest)
+    log_dim(f"  staged quality.py -> {dest} (so generated scripts can "
+            f"`import quality` regardless of where --out-dir points)")
 
 # ---------------------------------------------------------------------------
 # Interpreter / environment -- every subprocess this module launches (the
@@ -240,12 +265,72 @@ MODE_SCHEMAS = {
 # since this is one call per *dataset*, not per row.
 # ---------------------------------------------------------------------------
 
-def call_ollama(prompt: str, timeout: float = 240.0) -> str:
-    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "")
+def call_ollama(prompt: str, timeout: float = 240.0, log_path: Optional[str] = None,
+                 label: str = "") -> str:
+    """Streams the generation from Ollama (stream=True) instead of waiting
+    for the whole response, so the prompt and the model's output can both
+    be shown live -- lets you watch/validate what's actually being sent
+    and generated instead of staring at a blank screen for up to
+    `timeout` seconds.
+
+    The full prompt is printed to the console (boxed, dimmed) before the
+    call, and every token Ollama streams back is echoed live as it
+    arrives. If `log_path` is given, the full prompt AND the full
+    streamed response are also appended to `<log_path>.ollama.log`
+    (plain text, no ANSI codes) so you can review a run afterward even if
+    you weren't watching the console at the time."""
+    header = f"Ollama call{f' -- {label}' if label else ''} (model={OLLAMA_MODEL})"
+    log_header(header)
+
+    log_fh = None
+    if log_path:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        log_fh = open(f"{log_path}.ollama.log", "a", encoding="utf-8")
+        log_fh.write(f"\n{'=' * 80}\n"
+                      f"# {label or 'ollama call'} @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                      f"{'=' * 80}\n## PROMPT\n{prompt}\n\n## RESPONSE (streamed)\n")
+        log_dim(f"  full transcript -> {log_path}.ollama.log")
+
+    print(_paint("  ┌─ PROMPT " + "─" * 60, _Ansi.B_BLUE, _Ansi.BOLD))
+    for pline in prompt.splitlines() or [""]:
+        print(_paint("  │ ", _Ansi.B_BLUE) + _paint(pline, _Ansi.DIM))
+    print(_paint("  └" + "─" * 70, _Ansi.B_BLUE, _Ansi.BOLD))
+
+    print(_paint("  ┌─ OLLAMA OUTPUT (live) " + "─" * 46, _Ansi.B_GREEN, _Ansi.BOLD))
+    sys.stdout.write(_paint("  │ ", _Ansi.B_GREEN))
+    sys.stdout.flush()
+
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": True}
+    chunks = []
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("POST", f"{OLLAMA_URL}/api/generate", json=payload) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        obj = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    piece = obj.get("response", "")
+                    if piece:
+                        chunks.append(piece)
+                        # keep the left margin lined up across the wrapped/streamed text
+                        sys.stdout.write(_paint(piece.replace("\n", "\n  │ "), _Ansi.GREEN))
+                        sys.stdout.flush()
+                        if log_fh:
+                            log_fh.write(piece)
+                            log_fh.flush()
+                    if obj.get("done"):
+                        break
+    finally:
+        print()
+        print(_paint("  └" + "─" * 70, _Ansi.B_GREEN, _Ansi.BOLD))
+        if log_fh:
+            log_fh.close()
+
+    return "".join(chunks)
 
 
 def _extract_code_block(text: str) -> str:
@@ -555,7 +640,9 @@ def _py_compile_check(script_path: str) -> Optional[str]:
 
 
 def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 2,
-                                  prior_error: Optional[str] = None) -> bool:
+                                  prior_error: Optional[str] = None,
+                                  log_path: Optional[str] = None,
+                                  attempt_label: str = "") -> bool:
     """prompt_fn(prior_error) -> prompt string. Generates, compiles, and on
     failure re-prompts with the exact error up to max_repair times. Returns
     True if a compiling script now exists at script_path.
@@ -563,11 +650,14 @@ def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 
     `prior_error` can be seeded from outside (e.g. a previous *runtime*
     failure passed in by generate_validate_and_run below) so the very first
     generation attempt already includes it, not just compile errors found
-    here."""
+    here. `log_path`/`attempt_label` are forwarded to call_ollama so the
+    prompt sent and the response streamed back are logged/labeled per
+    attempt (see call_ollama's docstring)."""
     for attempt in range(max_repair + 1):
-        label = "generating" if attempt == 0 else f"repairing (attempt {attempt})"
-        log_step(f"codegen: {label} {_paint(os.path.basename(script_path), _Ansi.BOLD)}...")
-        response = call_ollama(prompt_fn(prior_error))
+        stage = "generating" if attempt == 0 else f"repairing (attempt {attempt})"
+        log_step(f"codegen: {stage} {_paint(os.path.basename(script_path), _Ansi.BOLD)}...")
+        call_label = f"{os.path.basename(script_path)} -- {attempt_label or stage}"
+        response = call_ollama(prompt_fn(prior_error), log_path=log_path, label=call_label)
         code = _extract_code_block(response)
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(code)
@@ -614,9 +704,17 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
     fatal_error = None
     tail_lines = []  # last few lines, in case it crashes with no FATAL marker at all
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    # Belt-and-suspenders alongside _stage_shared_modules() having already
+    # copied quality.py next to script_path: also put script_path's own
+    # directory on PYTHONPATH, so `import quality` still resolves even if
+    # the generated script's own sys.path.insert line is missing/wrong.
+    run_env = dict(SUBPROCESS_ENV)
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    run_env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (script_dir, run_env.get("PYTHONPATH")) if p)
     with open(log_path, "w", encoding="utf-8") as log_fh:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1, env=SUBPROCESS_ENV)
+                                 text=True, bufsize=1, env=run_env)
         for line in proc.stdout:
             sys.stdout.write(_colorize_passthrough(line))
             log_fh.write(line)  # log file always gets the plain, uncolored line
@@ -665,7 +763,8 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
     result = {"actual_bytes": 0, "docs": 0, "error": None}
     for attempt in range(max_repair + 1):
         ok = generate_and_validate_script(
-            prompt_fn, script_path, max_repair=0, prior_error=prior_error)
+            prompt_fn, script_path, max_repair=0, prior_error=prior_error,
+            log_path=log_path, attempt_label=f"attempt {attempt + 1}/{max_repair + 1}")
         if not ok:
             # generate_and_validate_script with max_repair=0 only fails on a
             # compile error with no more compile-retries left; treat that
@@ -706,6 +805,7 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
     logs_dir = os.path.join(out_dir, "_logs")
     os.makedirs(scripts_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
+    _stage_shared_modules(scripts_dir)
 
     candidates = discover_candidates(category, limit=discover_limit)
     log_section(category, f"discovered {_paint(str(len(candidates)), _Ansi.BOLD)} "
@@ -752,6 +852,7 @@ def run_category_web(category: str, budget_bytes: int, out_dir: str, mode: str,
     os.makedirs(scripts_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(raw_dir, exist_ok=True)
+    _stage_shared_modules(scripts_dir)
 
     raw_path = os.path.join(raw_dir, f"{category}_raw.jsonl")
     raw_budget = int(budget_bytes * raw_headroom)
