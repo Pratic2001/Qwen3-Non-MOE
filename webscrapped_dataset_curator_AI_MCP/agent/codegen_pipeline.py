@@ -53,6 +53,11 @@ Usage:
 
     python codegen_pipeline.py --target-size 200MB \\
         --categories web,knowledge --out-dir ./data --mode pretrain
+
+    # Tune how aggressively --public-only discovers candidate datasets:
+    python codegen_pipeline.py --target-size 5GB --public-only \\
+        --categories web,math --discover-limit 20 \\
+        --max-candidates-to-try 8 --max-total-considered 100
 """
 
 from __future__ import annotations
@@ -1017,6 +1022,19 @@ def main():
     parser.add_argument("--mix", default=None,
                         help="Comma-separated category=fraction, e.g. web=0.5,math=0.5. "
                              "Defaults to an even split across --categories.")
+    parser.add_argument("--discover-limit", type=int, default=5,
+                        help="[--public-only] How many HF Hub results to pull per search "
+                             "keyword when discovering candidate datasets for a category "
+                             "(each category has ~3 keywords, so the initial candidate pool "
+                             "is roughly 3x this number). Default: 5.")
+    parser.add_argument("--max-candidates-to-try", type=int, default=3,
+                        help="[--public-only] How many datasets must actually contribute "
+                             "usable data before a category is considered done (rejected/"
+                             "empty datasets don't count against this). Default: 3.")
+    parser.add_argument("--max-total-considered", type=int, default=40,
+                        help="[--public-only] Absolute safety ceiling on how many candidate "
+                             "datasets will ever be looked at for one category, including "
+                             "rejected ones, before giving up on the quota. Default: 40.")
     args = parser.parse_args()
 
     _env_banner()
@@ -1042,7 +1060,10 @@ def main():
                    f"({'public datasets' if args.public_only else 'live web crawl'})")
         if args.public_only:
             manifest["categories"][category] = run_category_public(
-                category, budget, args.out_dir, args.mode, args.min_doc_chars)
+                category, budget, args.out_dir, args.mode, args.min_doc_chars,
+                discover_limit=args.discover_limit,
+                max_candidates_to_try=args.max_candidates_to_try,
+                max_total_considered=args.max_total_considered)
         else:
             manifest["categories"][category] = run_category_web(
                 category, budget, args.out_dir, args.mode, args.min_doc_chars)
