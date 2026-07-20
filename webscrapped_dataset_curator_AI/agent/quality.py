@@ -173,18 +173,46 @@ def passes_code_quality_filter(text: str, path: str, min_doc_chars: int = 500) -
 
 
 class ExactDedup:
-    """Streaming exact-duplicate filter (sha1 digest set, not full text)."""
+    """Streaming exact-duplicate filter.
 
-    def __init__(self, persist_path: Optional[str] = None):
-        self._seen: set = set()
+    Default mode: an in-memory sha1 digest set (not full text) -- exact,
+    zero false positives, but grows by one 20-byte digest per document for
+    the entire life of the category and is NEVER evicted. At the scale this
+    pipeline targets (hundreds of thousands+ docs/category) that's real,
+    live, referenced memory -- not garbage. A MemoryGovernor pausing new
+    work and calling gc.collect()/malloc_trim() cannot free it, because
+    it's still in use; the set itself just keeps growing. For very large
+    --target-size runs this can be the actual source of "memory pressure
+    that never goes away."
+
+    Pass max_memory_mb to switch to a fixed-size Bloom filter instead: the
+    memory footprint is capped up front and does NOT grow with document
+    count, at the cost of a small, tunable false-positive rate (an
+    occasional duplicate slips through uncaught -- never the reverse, a
+    unique doc is never wrongly dropped). For a target false-positive rate
+    of ~1%, budget roughly 1.2 bytes per document you expect to see; e.g.
+    max_memory_mb=50 comfortably covers several million documents.
+    """
+
+    def __init__(self, persist_path: Optional[str] = None, max_memory_mb: Optional[float] = None):
         self.persist_path = persist_path
         self._fh = None
+        self._bloom: Optional[_BloomFilter] = None
+        self._seen: Optional[set] = None
+        if max_memory_mb:
+            self._bloom = _BloomFilter(size_bytes=int(max_memory_mb * 1024 * 1024))
+        else:
+            self._seen = set()
         if persist_path and os.path.exists(persist_path):
             with open(persist_path, "r") as f:
                 for line in f:
                     line = line.strip()
                     if line:
-                        self._seen.add(bytes.fromhex(line))
+                        h = bytes.fromhex(line)
+                        if self._bloom is not None:
+                            self._bloom.add(h)
+                        else:
+                            self._seen.add(h)
         if persist_path:
             # Opened once and kept open for the life of the run, instead of
             # open()+write()+close() on every single document -- at
@@ -198,9 +226,14 @@ class ExactDedup:
 
     def is_duplicate(self, text: str) -> bool:
         h = hashlib.sha1(text.encode("utf-8", errors="ignore")).digest()
-        if h in self._seen:
-            return True
-        self._seen.add(h)
+        if self._bloom is not None:
+            if self._bloom.contains(h):
+                return True
+            self._bloom.add(h)
+        else:
+            if h in self._seen:
+                return True
+            self._seen.add(h)
         if self._fh:
             self._fh.write(h.hex() + "\n")
         return False
@@ -209,6 +242,33 @@ class ExactDedup:
         if self._fh:
             self._fh.close()
             self._fh = None
+
+
+class _BloomFilter:
+    """Minimal fixed-size Bloom filter (bit array + k hash slices carved
+    out of a single sha256 digest, no extra dependency needed). Memory
+    usage is exactly size_bytes for the life of the object, regardless of
+    how many items get added -- the whole point, versus a set() which grows
+    forever. Trades a small false-positive rate for that guarantee."""
+
+    def __init__(self, size_bytes: int, num_hashes: int = 4):
+        self.num_bits = max(8, size_bytes * 8)
+        self.num_hashes = num_hashes
+        self.bits = bytearray(size_bytes)
+
+    def _slices(self, item: bytes):
+        # sha256 gives 32 bytes = 8 uint32 slices, plenty for num_hashes<=8
+        digest = hashlib.sha256(item).digest()
+        for i in range(self.num_hashes):
+            chunk = digest[i * 4:i * 4 + 4]
+            yield int.from_bytes(chunk, "little") % self.num_bits
+
+    def add(self, item: bytes) -> None:
+        for bit in self._slices(item):
+            self.bits[bit // 8] |= (1 << (bit % 8))
+
+    def contains(self, item: bytes) -> bool:
+        return all(self.bits[bit // 8] & (1 << (bit % 8)) for bit in self._slices(item))
 
 
 class _ShingleNearDedup:
@@ -251,15 +311,29 @@ class _MinHashLSHNearDedup:
     """Real MinHash + LSH near-dedup via `datasketch`. LSH lookup per doc
     instead of comparing against every prior fingerprint, so this scales to
     far more docs than the shingle-set fallback above. Same public
-    interface (is_near_duplicate), so callers don't care which one they got."""
+    interface (is_near_duplicate), so callers don't care which one they got.
 
-    def __init__(self, shingle_size: int = 5, num_perm: int = 128, threshold: float = 0.8):
+    The LSH index itself holds one MinHash per document inserted and, like
+    ExactDedup's set, is never evicted by default -- live, referenced
+    memory that grows with the run, not garbage a MemoryGovernor can
+    reclaim by pausing. `max_docs` bounds it with FIFO eviction (oldest
+    inserted doc's fingerprint gets dropped from the index once the cap is
+    hit), trading "can no longer catch a near-duplicate of something seen
+    very long ago" for a hard memory ceiling -- reasonable for this
+    pipeline since duplicate web content overwhelmingly clusters close
+    together in scrape order (same crawl session/source), not far apart."""
+
+    def __init__(self, shingle_size: int = 5, num_perm: int = 128, threshold: float = 0.8,
+                 max_docs: Optional[int] = 200_000):
         from datasketch import MinHash, MinHashLSH
+        from collections import deque
         self._MinHash = MinHash
         self.shingle_size = shingle_size
         self.num_perm = num_perm
         self.lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
         self._counter = 0
+        self.max_docs = max_docs
+        self._keys = deque()  # FIFO of inserted keys, for eviction order
 
     def _minhash(self, text: str):
         words = _WORD_RE.findall(text.lower())
@@ -274,18 +348,29 @@ class _MinHashLSHNearDedup:
         if self.lsh.query(mh):
             return True
         self._counter += 1
-        self.lsh.insert(f"doc-{self._counter}", mh)
+        key = f"doc-{self._counter}"
+        self.lsh.insert(key, mh)
+        self._keys.append(key)
+        if self.max_docs and len(self._keys) > self.max_docs:
+            oldest = self._keys.popleft()
+            try:
+                self.lsh.remove(oldest)
+            except KeyError:
+                pass
         return False
 
 
-def NearDedup(shingle_size: int = 5, threshold: float = 0.8):
+def NearDedup(shingle_size: int = 5, threshold: float = 0.8, max_docs: Optional[int] = 200_000):
     """Factory: returns the datasketch-backed MinHash/LSH near-dedup if
     `datasketch` is installed (recommended once a run produces more than a
     few tens of thousands of docs per category), else falls back to the
     lightweight shingle-overlap version so the pipeline still works with
-    zero extra dependencies at small scale."""
+    zero extra dependencies at small scale. max_docs bounds the LSH index's
+    memory with FIFO eviction; ignored by the shingle fallback, which is
+    already capped at 5000 fingerprints."""
     try:
-        return _MinHashLSHNearDedup(shingle_size=shingle_size, threshold=threshold)
+        return _MinHashLSHNearDedup(shingle_size=shingle_size, threshold=threshold,
+                                     max_docs=max_docs)
     except ImportError:
         return _ShingleNearDedup(shingle_size=shingle_size, threshold=threshold)
 

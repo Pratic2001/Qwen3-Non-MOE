@@ -32,6 +32,8 @@ an Ollama daemon running locally (default http://localhost:11434).
 
 import argparse
 import asyncio
+import ctypes
+import gc
 import itertools
 import json
 import logging
@@ -41,6 +43,12 @@ import time
 import urllib.parse
 from contextlib import AsyncExitStack
 from typing import Optional
+
+try:
+    import psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -70,90 +78,179 @@ class MemoryGovernor:
 
     This adds a real ceiling: every task checks in before doing its (memory-
     heavy) work and blocks -- without holding its concurrency-semaphore slot
-    hostage forever, since it re-checks on an interval -- until system memory
-    drops back under `threshold_percent`. It also forces a `gc.collect()`
-    periodically, since CPython doesn't always return freed memory to the OS
-    promptly under bursty alloc/free patterns.
+    hostage forever, since it re-checks on an interval -- until memory drops
+    back under threshold.
 
-    Silently becomes a no-op if psutil isn't installed (it's an optional
-    dependency here even though crawl4ai pulls it in transitively) --
-    the rest of the mitigations (browser recycling, page semaphore, image
-    blocking in crawl4ai_backend.py) still apply either way.
+    Three things this version fixes that the first pass got wrong:
+
+    1. It only looked at RAM (psutil.virtual_memory().percent), never swap.
+       A run can be swapping heavily while RAM% still reads fine (the
+       kernel had already moved the excess to swap by the time we checked),
+       so the governor would never even trigger on the exact symptom being
+       reported. Now checks psutil.swap_memory().percent too and pauses on
+       whichever crosses its threshold.
+
+    2. gc.collect() alone doesn't make RSS/swap actually go down. CPython's
+       allocator (and glibc's underneath it) generally keep freed arenas
+       mapped rather than handing them back to the OS via munmap, so
+       "freed" Python memory often doesn't shrink the process's real
+       footprint at all -- the governor would see the percentage plateau
+       and wait forever even though the *garbage* was successfully
+       collected. Now also calls glibc's malloc_trim(0) after gc.collect(),
+       which explicitly asks glibc to release empty arenas back to the OS.
+       (Linux/glibc only; harmless no-op elsewhere.)
+
+    3. If usage doesn't come down even after (1) and (2), it's very likely
+       not garbage at all -- it's live, still-referenced state that scales
+       with how much data the run has processed so far (the exact-dedup
+       hash set and near-dedup index in quality.py are exactly this: one
+       entry per document ever seen, never evicted, for the life of the
+       category). No amount of waiting fixes that; waiting forever just
+       means the run hangs. So this version tracks how long it's been
+       stuck and, past `stall_timeout`, logs a loud one-time diagnostic and
+       lets work resume anyway rather than deadlocking silently -- letting
+       memory pressure continue is still better than a run that never
+       finishes. See ExactDedup(max_memory_mb=...) / near-dedup FIFO cap in
+       quality.py for the actual fix to that class of growth.
+
+    Silently disables the RAM/swap checks (but still calls malloc_trim) if
+    psutil isn't installed.
     """
 
-    def __init__(self, threshold_percent: float = 90.0, check_interval: float = 2.0,
-                 gc_every: int = 25):
+    def __init__(self, threshold_percent: float = 90.0, swap_threshold_percent: float = 60.0,
+                 check_interval: float = 2.0, gc_every: int = 25, stall_timeout: float = 120.0):
         self.threshold_percent = threshold_percent
+        self.swap_threshold_percent = swap_threshold_percent
         self.check_interval = check_interval
         self.gc_every = max(1, gc_every)
+        self.stall_timeout = stall_timeout
         self._checks_since_gc = 0
         self._warned_no_psutil = False
         self._last_log = 0.0
 
-    def _current_percent(self) -> Optional[float]:
+    def _current(self) -> Optional[tuple]:
+        """Returns (ram_pct, swap_pct, reason) for whichever metric is
+        currently over its threshold, or None if both are fine (or psutil
+        isn't available)."""
         if not _HAVE_PSUTIL:
             if not self._warned_no_psutil:
-                log.warning("psutil not installed -- MemoryGovernor is disabled "
-                            "(pip install psutil to enable memory-based throttling)")
+                log.warning("psutil not installed -- MemoryGovernor RAM/swap checks are "
+                            "disabled (pip install psutil to enable memory-based throttling); "
+                            "malloc_trim() calls still run")
                 self._warned_no_psutil = True
             return None
-        return psutil.virtual_memory().percent
+        ram_pct = psutil.virtual_memory().percent
+        swap = psutil.swap_memory()
+        swap_pct = swap.percent if swap.total > 0 else 0.0
+        over_ram = ram_pct >= self.threshold_percent
+        over_swap = swap_pct >= self.swap_threshold_percent
+        if over_ram or over_swap:
+            reason = (f"RAM {ram_pct:.1f}%>={self.threshold_percent:.1f}%"
+                      if over_ram else "") + \
+                     (" and " if over_ram and over_swap else "") + \
+                     (f"swap {swap_pct:.1f}%>={self.swap_threshold_percent:.1f}%"
+                      if over_swap else "")
+            return (ram_pct, swap_pct, reason)
+        return None
+
+    @staticmethod
+    def _release_freed_memory() -> None:
+        """gc.collect() only identifies and frees Python garbage -- it
+        doesn't make the OS-visible RSS shrink, because CPython's allocator
+        (and glibc malloc underneath it) hang onto freed arenas rather than
+        munmap-ing them back to the kernel by default. malloc_trim(0) asks
+        glibc to actually release whatever it can. Without this the
+        governor can measure a plateaued percentage forever even when
+        collection is working perfectly -- which is exactly the "pauses
+        but never clears up" symptom."""
+        gc.collect()
+        if sys.platform.startswith("linux"):
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+
+    def _stall_check(self, first_pct, pct, elapsed: float, tag: str) -> bool:
+        """Returns True if we should give up waiting and let work resume
+        despite still being over threshold -- past stall_timeout with no
+        real improvement, this is very likely live/referenced memory
+        (dedup sets etc.), not garbage, and no amount of extra waiting
+        will free it."""
+        if elapsed < self.stall_timeout:
+            return False
+        ram0, swap0, _ = first_pct
+        ram1, swap1, _ = pct
+        improved = (ram0 - ram1) > 2.0 or (swap0 - swap1) > 2.0
+        if improved:
+            return False
+        log.error(
+            f"[mem-governor] still over threshold after {elapsed:.0f}s of waiting"
+            f"{f' ({tag})' if tag else ''} with no real improvement (RAM "
+            f"{ram0:.1f}%->{ram1:.1f}%, swap {swap0:.1f}%->{swap1:.1f}%) despite "
+            f"repeated gc.collect()+malloc_trim(). This usually means the memory is "
+            f"live, referenced state that grows with dataset size (the exact/near-dedup "
+            f"sets in quality.py are the most common culprit) rather than reclaimable "
+            f"garbage -- waiting longer won't help. Letting work resume anyway to avoid "
+            f"a permanent hang; consider ExactDedup(max_memory_mb=...) / a lower "
+            f"--near-dedup-max-docs, or a lower --target-size, if this keeps happening."
+        )
+        return True
 
     async def wait_if_needed(self, tag: str = "") -> None:
-        pct = self._current_percent()
-        if pct is None:
+        state = self._current()
+        if state is None:
+            self._maybe_periodic_release()
             return
-        waited = False
-        while pct is not None and pct >= self.threshold_percent:
-            waited = True
+        first_state = state
+        start = time.monotonic()
+        while state is not None:
+            ram_pct, swap_pct, reason = state
             now = time.monotonic()
             if now - self._last_log > 5:
-                log.warning(f"[mem-governor] system memory at {pct:.1f}% "
-                            f">= threshold {self.threshold_percent:.1f}% -- "
-                            f"pausing new work{f' ({tag})' if tag else ''} "
-                            f"until it drops")
+                log.warning(f"[mem-governor] {reason} -- pausing new work"
+                            f"{f' ({tag})' if tag else ''} until it drops")
                 self._last_log = now
-            gc.collect()
+            self._release_freed_memory()
+            if self._stall_check(first_state, state, now - start, tag):
+                break
             await asyncio.sleep(self.check_interval)
-            pct = self._current_percent()
-        if waited:
-            log.info(f"[mem-governor] memory back under threshold "
-                     f"({pct:.1f}%), resuming")
-        self._checks_since_gc += 1
-        if self._checks_since_gc >= self.gc_every:
-            self._checks_since_gc = 0
-            gc.collect()
+            state = self._current()
+        if state is None and start:
+            log.info("[mem-governor] memory back under threshold, resuming")
+        self._maybe_periodic_release()
 
     def wait_if_needed_sync(self, tag: str = "") -> None:
         """Blocking twin of wait_if_needed, for code that runs inside
-        asyncio.to_thread (e.g. _drain_dataset_rows, or pandas'
-        synchronous file-reading calls in public_sources.py) where there's
-        no event loop to await against. Uses time.sleep instead of
-        asyncio.sleep -- fine here since the caller is already off the
-        event loop in a worker thread."""
-        pct = self._current_percent()
-        if pct is None:
+        asyncio.to_thread (e.g. _drain_dataset_rows, or pandas' synchronous
+        file-reading calls in public_sources.py) where there's no event
+        loop to await against."""
+        state = self._current()
+        if state is None:
+            self._maybe_periodic_release()
             return
-        waited = False
-        while pct is not None and pct >= self.threshold_percent:
-            waited = True
+        first_state = state
+        start = time.monotonic()
+        while state is not None:
+            ram_pct, swap_pct, reason = state
             now = time.monotonic()
             if now - self._last_log > 5:
-                log.warning(f"[mem-governor] system memory at {pct:.1f}% "
-                            f">= threshold {self.threshold_percent:.1f}% -- "
-                            f"pausing new work{f' ({tag})' if tag else ''} "
-                            f"until it drops")
+                log.warning(f"[mem-governor] {reason} -- pausing new work"
+                            f"{f' ({tag})' if tag else ''} until it drops")
                 self._last_log = now
-            gc.collect()
+            self._release_freed_memory()
+            if self._stall_check(first_state, state, now - start, tag):
+                break
             time.sleep(self.check_interval)
-            pct = self._current_percent()
-        if waited:
-            log.info(f"[mem-governor] memory back under threshold "
-                     f"({pct:.1f}%), resuming")
+            state = self._current()
+        if state is None and start:
+            log.info("[mem-governor] memory back under threshold, resuming")
+        self._maybe_periodic_release()
+
+    def _maybe_periodic_release(self) -> None:
         self._checks_since_gc += 1
         if self._checks_since_gc >= self.gc_every:
             self._checks_since_gc = 0
-            gc.collect()
+            self._release_freed_memory()
 
 
 # Configured for real in main() from --max-memory-percent /
@@ -161,14 +258,6 @@ class MemoryGovernor:
 # does `await MEM_GOVERNOR.wait_if_needed()` works even in code paths (tests,
 # import-time) that never touch argparse.
 MEM_GOVERNOR = MemoryGovernor()
-
-import gc
-
-try:
-    import psutil
-    _HAVE_PSUTIL = True
-except ImportError:
-    _HAVE_PSUTIL = False
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -1696,10 +1785,12 @@ async def run_public_sources_for_category(category: str, byte_budget: int, mode:
 async def run_category(scraper: ScraperClient, category: str, byte_budget: int, out_dir: str,
                         mode: str, min_doc_chars: int, use_llm_judge: bool, concurrency: int = 5,
                         public_cfg: Optional[dict] = None, deep_crawl_per_domain: int = 0,
-                        deep_crawl_max_pages: int = 10):
+                        deep_crawl_max_pages: int = 10, dedup_max_memory_mb: Optional[float] = None,
+                        near_dedup_max_docs: Optional[int] = 200_000):
     writer = ShardWriter(out_dir, category)
-    exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"))
-    near_dedup = NearDedup()
+    exact_dedup = ExactDedup(persist_path=os.path.join(out_dir, category, ".seen_hashes"),
+                              max_memory_mb=dedup_max_memory_mb)
+    near_dedup = NearDedup(max_docs=near_dedup_max_docs)
     state = RunState(out_dir, category)  # resumable across process runs
     write_lock = asyncio.Lock()
     sem = asyncio.Semaphore(concurrency)
@@ -1899,11 +1990,15 @@ async def main_async(args):
     global MEM_GOVERNOR
     MEM_GOVERNOR = MemoryGovernor(
         threshold_percent=max(1.0, min(99.0, args.max_memory_percent)),
+        swap_threshold_percent=max(1.0, min(99.0, args.max_swap_percent)),
         check_interval=max(0.1, args.memory_check_interval),
+        stall_timeout=max(5.0, args.memory_stall_timeout),
     )
-    log.info(f"Memory governor: threshold={MEM_GOVERNOR.threshold_percent:.1f}%, "
-             f"check_interval={MEM_GOVERNOR.check_interval}s"
-             f"{'' if _HAVE_PSUTIL else ' (DISABLED -- psutil not installed)'}")
+    log.info(f"Memory governor: ram_threshold={MEM_GOVERNOR.threshold_percent:.1f}%, "
+             f"swap_threshold={MEM_GOVERNOR.swap_threshold_percent:.1f}%, "
+             f"check_interval={MEM_GOVERNOR.check_interval}s, "
+             f"stall_timeout={MEM_GOVERNOR.stall_timeout}s"
+             f"{'' if _HAVE_PSUTIL else ' (RAM/swap CHECKS DISABLED -- psutil not installed)'}")
 
     # Apply the CLI-controlled Ollama batcher settings before any
     # judge_quality / extract_sft_pair call can happen. Default is
@@ -2035,6 +2130,8 @@ async def main_async(args):
                 args.min_doc_chars, use_llm_judge=use_llm_judge_flag,
                 concurrency=args.concurrency, public_cfg=public_cfg,
                 deep_crawl_per_domain=0,  # no MCP session in the public-only path -- N/A
+                dedup_max_memory_mb=args.dedup_max_memory_mb,
+                near_dedup_max_docs=args.near_dedup_max_docs,
             )
 
         results = await asyncio.gather(
@@ -2076,6 +2173,8 @@ async def main_async(args):
                         concurrency=args.concurrency, public_cfg=public_cfg,
                         deep_crawl_per_domain=args.deep_crawl_per_domain,
                         deep_crawl_max_pages=args.deep_crawl_max_pages,
+                        dedup_max_memory_mb=args.dedup_max_memory_mb,
+                        near_dedup_max_docs=args.near_dedup_max_docs,
                     )
 
                 results = await asyncio.gather(
@@ -2200,15 +2299,42 @@ def main():
     parser.add_argument("--deep-crawl-max-pages", type=int, default=10,
                          help="Max pages to extract per deep_crawl call (default 10). Only relevant "
                               "when --deep-crawl-per-domain > 0.")
+    parser.add_argument("--dedup-max-memory-mb", type=float, default=None,
+                         help="If set, caps exact-dedup memory at this many MB by switching "
+                              "from an exact (unbounded, grows forever) sha1 set to a fixed-size "
+                              "Bloom filter -- trades a small, tunable false-positive rate "
+                              "(occasional duplicate slips through; a unique doc is never "
+                              "wrongly dropped) for a hard memory ceiling. Recommended for very "
+                              "large --target-size runs, since the exact set's growth is live "
+                              "referenced state that --max-memory-percent/--max-swap-percent "
+                              "cannot reclaim by pausing. ~50MB comfortably covers several "
+                              "million documents at a ~1% false-positive rate. Default: "
+                              "unbounded exact set (previous behavior).")
+    parser.add_argument("--near-dedup-max-docs", type=int, default=200_000,
+                         help="Caps the near-dedup (MinHashLSH) index at this many documents "
+                              "via FIFO eviction -- same rationale as --dedup-max-memory-mb: "
+                              "the index otherwise grows forever and is live state a memory "
+                              "governor can't reclaim. Pass 0 to disable the cap (previous, "
+                              "unbounded behavior). Default: 200000.")
     parser.add_argument("--max-memory-percent", type=float, default=90.0,
-                         help="Hard memory ceiling (default 90.0). Whenever system RAM+swap "
-                              "usage hits this percentage, every category pauses launching new "
-                              "extract/ASR/deep_crawl work (existing in-flight tasks finish) and "
-                              "forces a gc.collect() until usage drops back below it. This is "
-                              "independent of --concurrency/--category-concurrency -- it catches "
-                              "the case where memory grows over the life of a long run rather "
-                              "than from too many tasks starting at once. Requires psutil "
-                              "(pip install psutil); silently disabled if it's not installed.")
+                         help="Hard RAM ceiling (default 90.0). Whenever system RAM usage "
+                              "hits this percentage, every category pauses launching new "
+                              "extract/ASR/deep_crawl/drain work (existing in-flight tasks "
+                              "finish) and forces a gc.collect()+malloc_trim() until usage "
+                              "drops back below it. Requires psutil; disabled if not installed.")
+    parser.add_argument("--max-swap-percent", type=float, default=60.0,
+                         help="Hard swap ceiling (default 60.0), checked alongside "
+                              "--max-memory-percent. A run can be swapping heavily while RAM%% "
+                              "still reads as fine (the kernel already moved the excess out), "
+                              "so this is checked independently -- crossing either threshold "
+                              "pauses new work.")
+    parser.add_argument("--memory-stall-timeout", type=float, default=120.0,
+                         help="Seconds to wait for memory to actually drop (default 120) "
+                              "before giving up and letting work resume anyway. If usage is "
+                              "still pinned after repeated gc.collect()+malloc_trim() calls "
+                              "with no real improvement, it's very likely live/referenced "
+                              "state (e.g. the exact/near-dedup sets) rather than reclaimable "
+                              "garbage, and waiting longer would just hang the run forever.")
     parser.add_argument("--memory-check-interval", type=float, default=2.0,
                          help="Seconds between memory re-checks while paused above "
                               "--max-memory-percent (default 2.0).")
