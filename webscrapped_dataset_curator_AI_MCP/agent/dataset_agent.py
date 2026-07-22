@@ -1352,6 +1352,8 @@ async def _process_article(article: dict, url: str, category: str, mode: str,
             counters["http_error"] += 1
         elif "not installed" in reason_str or "deps missing" in reason_str:
             counters["missing_dependency"] += 1
+        elif reason_str.startswith("rejected:"):
+            counters["schema_rejected"] += 1
         else:
             counters["other_extract_fail"] += 1
         log.info(f"[extract:{category}] SKIP {url} -- {reason}")
@@ -1799,6 +1801,7 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
         "filtered_quality": 0, "filtered_dup": 0, "llm_rejected": 0,
         "robots_blocked": 0, "http_error": 0, "video_skipped": 0,
         "missing_dependency": 0, "other_extract_fail": 0, "no_sft_pair": 0,
+        "schema_rejected": 0,
         "filtered_quality_reasons": {},
     }
 
@@ -1819,7 +1822,8 @@ async def run_category(scraper: ScraperClient, category: str, byte_budget: int, 
                   f"{writer.total_bytes / 1024**2:.2f} MB, {writer.total_docs} docs, "
                   f"filtered {counters['filtered_quality']} low-quality + "
                   f"{counters['filtered_dup']} duplicate + {counters['llm_rejected']} llm-rejected + "
-                  f"{counters['no_sft_pair']} no-labeled-pair"
+                  f"{counters['no_sft_pair']} no-labeled-pair + "
+                  f"{counters['schema_rejected']} schema-rejected (bad columns)"
                   f" -- quality reject breakdown: {counters['filtered_quality_reasons']}")
             writer.close()
             exact_dedup.close()

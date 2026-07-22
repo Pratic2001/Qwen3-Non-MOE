@@ -79,7 +79,7 @@ from typing import Optional
 import httpx
 
 sys.path.insert(0, os.path.dirname(__file__))
-from public_sources import discover_hf_datasets, discover_hf_configs
+from public_sources import discover_hf_datasets, discover_hf_configs, schema_is_suitable
 from topics import HUB_SEARCH_KEYWORDS, TOPIC_SEEDS
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -429,6 +429,25 @@ def sample_hf_dataset(dataset_id: str, config: Optional[str], split: str = "trai
                     return None
 
             columns = sorted(rows[0].keys())
+
+            if not schema_is_suitable(columns):
+                # Same gate dataset_agent.py's public_sources path uses --
+                # applied HERE, before codegen, is the expensive half of
+                # the fix: without this, a dataset with no usable text/
+                # prompt/answer/conversation column still gets a full
+                # Ollama codegen call (which will hallucinate SOME mapping
+                # rather than refuse -- it was never told "no" is an
+                # option) followed by a full-dataset streaming download,
+                # and only shows up as wasted time/junk output much later.
+                # Rejecting on the columns alone, from the cheap n-row
+                # sample already in hand, means bad datasets cost one
+                # `sample_hf_dataset` call and nothing more.
+                log_warn(f"skipping {dataset_id} (config={config}): columns {columns} "
+                         f"don't match any known prompt/answer/text/conversation "
+                         f"pattern -- rejecting before codegen, not worth an LLM call "
+                         f"or a full download")
+                return None
+
             return {"columns": columns, "rows": rows, "split": try_split}
         except Exception:
             continue
@@ -925,11 +944,17 @@ def run_category_public(category: str, budget_bytes: int, out_dir: str, mode: st
             break
 
         configs = discover_hf_configs(dataset_id) or [None]
-        config = configs[0]
-        log_section(category, f"sampling {_paint(dataset_id, _Ansi.BOLD)} (config={config})...")
-        sample = sample_hf_dataset(dataset_id, config)
+        sample, config = None, None
+        for config in configs:
+            log_section(category, f"sampling {_paint(dataset_id, _Ansi.BOLD)} (config={config})...")
+            sample = sample_hf_dataset(dataset_id, config)
+            if sample is not None:
+                break
+            log_warn(f"[{category}] {dataset_id} config={config} rejected -- "
+                     f"trying next config of this dataset, if any")
         if sample is None:
             log_warn(f"[{category}] {dataset_id} rejected before download -- "
+                     f"no config ({configs}) had usable columns -- "
                      f"not counted toward quota, trying next candidate")
             rejected += 1
             continue

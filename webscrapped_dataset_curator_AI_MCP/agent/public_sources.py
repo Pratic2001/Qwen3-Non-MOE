@@ -75,6 +75,30 @@ _TURN_VALUE_KEYS = ("value", "content", "text")
 _HUMAN_ROLE_VALUES = {"human", "user", "prompter"}
 _ASSISTANT_ROLE_VALUES = {"gpt", "assistant", "bot", "model"}
 
+_ALL_KNOWN_COLUMNS = (frozenset(c.lower() for c in _TEXT_COLUMNS)
+                      | frozenset(c.lower() for c in _PROMPT_COLUMNS)
+                      | frozenset(c.lower() for c in _ANSWER_COLUMNS)
+                      | frozenset(c.lower() for c in _CODE_COLUMNS)
+                      | frozenset(c.lower() for c in _CONVERSATION_COLUMNS))
+
+
+def schema_is_suitable(columns, column_hint: Optional[dict] = None) -> bool:
+    """Gate applied ONCE per dataset/config (on the first row), not per
+    row. True means row_to_record has at least one real column to draw
+    from -- either the LLM-inferred hint resolved to something, or a
+    static heuristic column name is present. False means every row from
+    this schema would fall through to row_to_record's last resort (join
+    every string field), which produces noisy, un-labeled, low-value rows
+    instead of anything actually usable for the target production format.
+    Callers should treat False as "reject this dataset/config immediately
+    and move on to the next one" instead of streaming/reading the rest of
+    it and filtering row-by-row after the fact."""
+    if column_hint and any(column_hint.get(k) for k in
+                            ("prompt_col", "answer_col", "conversation_col", "text_col")):
+        return True
+    cols_lower = {c.lower() for c in columns}
+    return bool(cols_lower & _ALL_KNOWN_COLUMNS)
+
 
 def _first_str(row: dict, candidates) -> Optional[str]:
     for key in candidates:
@@ -322,6 +346,7 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
     count = 0
     any_success = False
     last_err = None
+    schema_rejected_configs = []
     for cfg_attempt in configs_to_try:
         if count >= max_rows:
             break
@@ -359,6 +384,22 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
                         log.warning(f"[hf] column_mapper failed for {dataset_id}{cfg_label}: {e}")
                         column_hint = None
                 hint_resolved = True
+                # Reject THIS config immediately if its schema has nothing
+                # row_to_record can actually use -- don't burn the rest of
+                # the streaming budget pulling rows that would only ever
+                # hit the "join every string field" last resort. This
+                # stops the network iterator right here (streaming mode,
+                # so nothing further has been downloaded yet) and moves on
+                # to the next config/dataset instead of quietly degrading
+                # every row from this one.
+                if not schema_is_suitable(list(row.keys()), column_hint):
+                    schema_rejected_configs.append(cfg_attempt)
+                    log.warning(f"[hf] REJECT {dataset_id}{cfg_label}: columns "
+                                f"{list(row.keys())} don't match any known prompt/answer/"
+                                f"text/conversation pattern (LLM column hint also found "
+                                f"nothing usable) -- skipping this config entirely, moving "
+                                f"on")
+                    break
             ref = f"hf://{dataset_id}{cfg_label}#{used_split}:{cfg_count}"
             yield row_to_record(row, "huggingface", dataset_id, ref, column_hint=column_hint)
             count += 1
@@ -368,6 +409,19 @@ def stream_hf_dataset(dataset_id: str, max_rows: int = 200, split: Optional[str]
         yield {"title": None, "text": "", "author": None, "date": None,
                "content_type": "dataset_row", "url": f"hf://{dataset_id}",
                "error": f"could not load any split/config of {dataset_id}: {last_err}",
+               "extra": {"source": "huggingface", "dataset": dataset_id}}
+    elif count == 0 and schema_rejected_configs:
+        # Every config that loaded successfully was rejected for having
+        # unsuitable columns -- surface that as a distinct, clearly-labeled
+        # reason (not "could not load"/last_err, which is about connection/
+        # auth/existence failures, a different problem) so the caller's
+        # logs and counters can tell "loaded fine, but columns are wrong
+        # for the target format" apart from "couldn't load it at all".
+        yield {"title": None, "text": "", "author": None, "date": None,
+               "content_type": "dataset_row", "url": f"hf://{dataset_id}",
+               "error": f"rejected: no config of {dataset_id} has columns matching a "
+                        f"known prompt/answer/text/conversation pattern "
+                        f"(configs checked: {schema_rejected_configs})",
                "extra": {"source": "huggingface", "dataset": dataset_id}}
 
 
@@ -494,6 +548,7 @@ def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200, column_mapp
 
         file_hint = None
         file_hint_resolved = False
+        file_rejected = False
         for chunk in df_iter:
             for i, row in chunk.iterrows():
                 if count >= max_rows:
@@ -515,9 +570,27 @@ def fetch_kaggle_dataset_rows(dataset_ref: str, max_rows: int = 200, column_mapp
                             log.warning(f"[kaggle] column_mapper failed for {dataset_ref}/{rel}: {e}")
                             file_hint = None
                     file_hint_resolved = True
+                    # Same immediate-reject gate as the HF path: if this
+                    # file's schema (LLM hint + static heuristics, both
+                    # already tried above) has nothing row_to_record can
+                    # use, stop reading this file's remaining rows right
+                    # here instead of yielding thousands of "joined every
+                    # string field" rows that quality filtering would only
+                    # end up discarding one at a time downstream. The
+                    # download already happened (Kaggle has no streaming
+                    # API), but at least the row-by-row filter/judge/write
+                    # cost for the rest of the file is skipped.
+                    if not schema_is_suitable(list(chunk.columns), file_hint):
+                        log.warning(f"[kaggle] REJECT {dataset_ref}/{rel}: columns "
+                                    f"{list(chunk.columns)} don't match any known prompt/"
+                                    f"answer/text/conversation pattern (LLM column hint "
+                                    f"also found nothing usable) -- skipping rest of this "
+                                    f"file, moving on")
+                        file_rejected = True
+                        break
                 record = row_to_record(row_dict, "kaggle", dataset_ref,
                                         f"kaggle://{dataset_ref}/{rel}#{i}", column_hint=file_hint)
                 yield record
                 count += 1
-            if count >= max_rows:
+            if count >= max_rows or file_rejected:
                 break
