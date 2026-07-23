@@ -306,6 +306,11 @@ class SFTDataset:
 
         self.tokens = _ConcatMemmap(token_arrays)
         self.mask   = _ConcatMemmap(mask_arrays)
+        # NOTE: self.tokens/self.mask get reassigned below via __getitem__
+        # for rank-sharding, which always returns a plain ndarray/memmap
+        # (never another _ConcatMemmap) — so the shard count must be
+        # captured here, before that happens, for any caller that wants it.
+        self.n_shards = len(token_arrays)
 
         if rank == 0:
             print(f"[SFTDataset] {split}: discovered {len(manifests)} worker "

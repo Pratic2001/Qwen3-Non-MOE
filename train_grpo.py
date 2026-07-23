@@ -338,8 +338,9 @@ class GRPOPromptDataset:
             rank=0, world_size=1,
             split="train",
         )
-        self._tokens_memmap = probe.tokens   # _ConcatMemmap (read-only)
-        self._mask_memmap   = probe.mask     # _ConcatMemmap (read-only)
+        self._tokens_memmap = probe.tokens   # plain ndarray/memmap (post rank-slice)
+        self._mask_memmap   = probe.mask     # plain ndarray/memmap (post rank-slice)
+        self._n_shards      = probe.n_shards
         total = len(self._tokens_memmap)
 
         # ---- find (prompt_start, prompt_end_assistant_end) by scanning
@@ -946,8 +947,7 @@ def train(args):
         eos_id=eos_id,
     )
     if master:
-        n_shards = len(getattr(train_ds, "_tokens_memmap", None).arrays) \
-            if hasattr(train_ds, "_tokens_memmap") else 0
+        n_shards = getattr(train_ds, "_n_shards", 0)
         print(f"[Dataset] {len(train_ds):,} prompts "
               f"({n_shards} packed shard(s))")
 
