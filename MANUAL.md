@@ -30,43 +30,78 @@ recent guidance (see §7).
 
 ## 2. How to get N (non-embedding parameters)
 
-For a Qwen3-style dense transformer:
+For a Qwen3-style dense transformer (closed form, matching
+`Qwen3Config._param_count` in `model.py`):
 
 ```
 N = V × H                         # embedding table (tied to lm_head when tie_word_embeddings=True)
    + L × (                       # per-layer
-        4 × H × (H + 2·H·G)      # Q (H) + K,V (each H·G, G = num_kv_groups)
-      + 2 × H                    # Q/K RMSNorms (Qwen3 has 2 norms × H each)
-      + 3 × H × I                # SwiGLU: gate, up, down (I = intermediate_size)
-      + 2 × H                    # pre+post RMSNorm
+        H · H_q                  # Q projection       (H_q = num_heads     * head_dim)
+      + H · H_kv                 # K projection       (H_kv = num_kv_heads * head_dim)
+      + H · H_kv                 # V projection
+      + H_q · H                  # O projection
+      + 2 · head_dim             # QK-Norm: per-head RMSNorm over head_dim
+                                 # (constant 256 with head_dim=128, NOT a function of H)
+      + 3 · H · I                # SwiGLU: gate, up, down (I = intermediate_size)
+      + 2 · H                    # pre + post RMSNorm
      )
-   − 2 × V × H                   # subtract tied output projection when tie_word_embeddings=True
+   + H                            # final norm
+   − V × H                        # subtract tied output projection when tie_word_embeddings=True
 ```
 
 With Qwen3's standard ratios (`head_dim=128`, `gqa_ratio=4`,
-`mlp_ratio=3`, `tie_embeddings=true` for <2B), this reduces to roughly:
+`mlp_ratio=3`, `tie_embeddings=true` for <2B), the per-layer cost
+collapses to roughly `H²·(4 + 2/G) + 3·H·I + 2·H` for GQA ratio G, plus
+the constant qk-norm `2·head_dim`. Plugging the standard ratios:
 
 ```
-N ≈ L × (12 · H²)  +  V · H       (tied)  for hidden H, layers L
+N ≈ L · H² · (4 + 2/G)  +  3 · L · H · I  +  V · H
+  ≈ L · H² · (4 + 0.5)   +  9 · L · H²    +  V · H        (G = 4, I ≈ 3H)
+  ≈ 13.5 · L · H²        +  V · H         (tied)
 ```
 
-Quick lookup (Qwen3 conventions, tied embeddings):
+The 13.5 × L × H² shortcut is rough — the real number is a few percent
+smaller because `I` is rounded down to a multiple of 256 and the
+qk-norm + final norm terms are negligible. Always treat
+`python model.py --target-size X` as the source of truth for the exact
+shape; the shortcut is only useful for back-of-envelope sizing.
 
-| Model  | Hidden H | Layers L | Heads | KV groups | Inter I | Params (B) |
-|--------|---------:|---------:|------:|----------:|--------:|-----------:|
-| 0.6B   | 1024     | 28       | 16    | 4         | 3072    | ~0.6       |
-| 1.7B   | 2048     | 28       | 16    | 4         | 6144    | ~1.7       |
-| 4B     | 2560     | 36       | 20    | 4         | 7680    | ~4.0       |
-| 8B     | 4096     | 36       | 32    | 8         | 12288   | ~8.0       |
+### Concrete shapes picked by `Qwen3Config.from_target_size`
 
-For exact numbers run:
+With `vocab_size=32000` and the default ratios
+(`head_dim=128`, `gqa_ratio=4`, `mlp_ratio=3.0`),
+`from_target_size` selects these shapes (output of
+`python model.py --target-size X`):
+
+| Model  | Hidden H | Layers L | Heads | KV groups | Inter I | Tied? | Actual params |
+|--------|---------:|---------:|------:|----------:|--------:|:-----:|--------------:|
+| 0.6B   | 1280     | 30       | 10    | 2         | 3840    | yes   | 0.601 B       |
+| 1.7B   | 1728     | 34       | 40    | 10        | 5120    | yes   | 1.710 B       |
+| 4B     | 2304     | 46       | 48    | 12        | 6912    | no    | 3.973 B       |
+| 8B     | 3008     | 60       | 48    | 12        | 8960    | no    | 7.816 B       |
+
+A few things worth noticing:
+
+- **0.6B picks 10 heads, not 16.** The quality score penalizes 16 heads
+  here because the only 4:1 GQA split that gives `num_heads=16` lands
+  on a less-balanced (hidden_size, num_layers) pair. 10/2 is the
+  closest-to-target config that keeps a balanced shape.
+- **KV-head count is small at the 0.6B end** (just 2 — the GQA
+  minimum). At small sizes, MQA is genuinely competitive with GQA
+  because the KV-cache saving is small in absolute terms.
+- **Embedding tying flips off at ≥2B params**, matching Qwen3's
+  published convention.
+
+For the actual param count of any specific shape (including the
+embedding-tied head, which `count_parameters` returns but Chinchilla's
+N excludes), run:
 
 ```bash
 python model.py --target-size 1.7B
 ```
 
-Use the printed `total_params` for the embedding-tied head and
-`total_params - embed_params` for the Chinchilla N.
+The script prints `total_params` and
+`total_params - embed_params`; the latter is the Chinchilla N.
 
 ---
 
@@ -523,12 +558,18 @@ sample of the **pretrain corpus**. Reuse it for SFT and GRPO.
 python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./tokenizer
 
 # 2. Pretrain — uses ./tokenizer for packing and the LM head
-python build_dataset.py --target-size 50GB
+#    Produce JSONL shards under ./data/<category>/*.jsonl in the
+#    shape documented by pack_dataset.py. The current producer is
+#    the webscrapped_dataset_curator_AI agent (see
+#    webscrapped_dataset_curator_AI_MCP/README.md); the older
+#    build_dataset.py is being retired.
 python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
 torchrun --nproc_per_node=1 train.py --model-size 0.6B --data-dir ./packed
 
 # 3. SFT — same ./tokenizer, different packed cache
-python download_sft_data.py --target-size 2GB
+#    Produce SFT JSONL shards under ./sft_data/<category>/*.jsonl
+#    in the {prompt, thinking, answer} shape. Same producer as step 2
+#    with --mode sft.
 python pack_sft_data.py --data-dir ./sft_data --tokenizer ./tokenizer \
     --cache-dir ./sft_packed
 python train_sft.py --checkpoint ./checkpoints/latest.pt \

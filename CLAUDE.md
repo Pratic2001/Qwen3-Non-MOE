@@ -17,12 +17,17 @@ The model implements: RMSNorm (pre-norm), RoPE, Grouped Query Attention with **p
 
 ### Data preparation
 - `train_tokenizer.py` — Train a byte-level BPE tokenizer (Qwen3-family) with ChatML + `<think>`/`</think>` special tokens. Writes `./tokenizer/`.
-- `build_dataset.py` — Stream from HuggingFace (FineWeb, TheStack, FineMath, Wikipedia, OpenOrca) and write JSONL shards to `./data/<category>/`.
-- `download_sft_data.py` — Download/format SFT records (NuminaMath, Evol-Instruct-Code, OpenThoughts, ARC, etc.) with `{prompt, thinking, answer}` schema to `./sft_data/<category>/`.
-- `download_grpo_data.py` — Download/format GRPO records (GSM8K, MATH, NuminaMath, ARC, OpenOrca, IFEval) with `{prompt, answer}` schema to `./grpo_data/<category>/`. Datasets are deliberately chosen so the rule-based reward in `train_grpo.py` has clean numeric / boxed ground truths to compare against.
-- `pack_dataset.py` — Tokenize `./data/**/*.jsonl`, write `./packed/{train,val}.bin` + `meta.json` (uint16 or uint32 token ids).
-- `pack_sft_data.py` — Tokenize SFT JSONL, apply ChatML + `<think>` template, write packed `{tokens, mask}` memmaps with per-worker manifests (multi-process safe).
+- `pack_dataset.py` — Tokenize `./data/**/*.jsonl`, write `./packed/{train,val}.bin` + `meta.json` (uint16 or uint32 token ids). The packer consumes the JSONL shape documented in its own docstring; that shape used to be produced by `build_dataset.py` (now retired — see `webscrapped_dataset_curator_AI_MCP/` for the current producer).
+- `pack_sft_data.py` — Tokenize SFT JSONL (`{prompt, thinking, answer}` records), apply ChatML + `<think>` template, write packed `{tokens, mask}` memmaps with per-worker manifests (multi-process safe).
 - `pack_grpo_data.py` — Single-turn ChatML packer for GRPO records. Output is the same on-disk format as `pack_sft_data.py` so `train_grpo.py` can read it via the same `SFTDataset` manifest convention. The packed `answer` is **not** used for the GRPO loss — it's only read back to recover the ground-truth string for reward scoring at rollout time.
+
+> **Note.** The earlier `build_dataset.py` / `download_sft_data.py` /
+> `download_grpo_data.py` scripts have been removed. The live producer
+> of pretrain and SFT/GRPO JSONL shards is the
+> `webscrapped_dataset_curator_AI_MCP/` agent (HuggingFace/Kaggle
+> top-up + live web scrape). Write your own producer if you have a
+> different source — only the JSONL shape on disk matters to the
+> packers.
 
 ### Training
 Pretrain:
@@ -31,7 +36,6 @@ Pretrain:
 
 SFT:
 - `train_sft.py` — SFT reading packed memmaps. Supports LoRA on Q/K/V/O, DDP, `merge-lora`.
-- `sft_standalone.py` — Older SFT entry point reading raw JSONL. Prefer `train_sft.py`.
 - `train_sft_deepspeed.py` — DeepSpeed twin of `train_sft.py`; mirrors the hardware audit / ZeRO selection / native sharded-checkpoint format of `train_deepspeed.py`.
 
 GRPO (RL):
@@ -52,7 +56,7 @@ Checkpoint tooling:
 - `make_anneal_dataset.py` — Replays the deterministic `PackedDataLoader` RNG stream from `train.py` / `train_deepspeed.py` to extract the "never sampled" token ranges and write an annealing `train.bin`. The seed formula (`seed*1_000_003 + rank*31 + loader_id`) and the per-worker seed formula (`base_seed + worker_id*9973`) are shared between both trainers and this script — keep them in sync if you change either trainer.
 
 ### Web data agent
-- `webscrapped_dataset_curator_AI/` — Separate subproject. Live-scraping companion that writes JSONL shards in the **same format** as `build_dataset.py` / `download_sft_data.py`, so the packers consume them with zero changes. Uses a local Ollama model as planner + quality judge and an MCP server for search/fetch/extract. Has its own `README.md` and `requirements.txt`.
+- `webscrapped_dataset_curator_AI_MCP/` — Separate subproject. Live-scraping companion that writes JSONL shards in the **same format** the packers (`pack_dataset.py` / `pack_sft_data.py` / `pack_grpo_data.py`) consume directly, so they need zero changes. Uses a local Ollama model as planner + quality judge and an MCP server for search/fetch/extract. Has its own `README.md` and `requirements.txt`.
 
 ### Environment files
 - `hostfile` — `192.168.0.105 slots=1` / `192.168.0.111 slots=1` (multi-node DeepSpeed launch).
@@ -65,8 +69,13 @@ Checkpoint tooling:
 # 1. Train tokenizer
 python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./tokenizer
 
-# 2. Build pretraining corpus
-python build_dataset.py --target-size 5GB
+# 2. Produce pretrain JSONL shards under ./data/<category>/*.jsonl
+#    in the shape documented by pack_dataset.py. Use the live producer:
+#       python agent/dataset_agent.py --target-size 5GB \
+#           --categories web,knowledge,reasoning,code,math \
+#           --out-dir ./data --mode pretrain
+#    See webscrapped_dataset_curator_AI_MCP/README.md for setup, options,
+#    and the on-disk JSONL shape contract.
 
 # 3. Pack tokens
 python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
@@ -81,7 +90,11 @@ deepspeed --num_gpus 4 train_deepspeed.py --model-size 1.7B --data-dir ./packed
 deepspeed --hostfile hostfile train_deepspeed.py --model-size 8B --data-dir ./packed
 
 # 5. SFT data
-python download_sft_data.py --target-size 2GB
+#    Produce SFT JSONL shards under ./sft_data/<category>/*.jsonl
+#    in the {prompt, thinking, answer} shape. Same producer as step 2
+#    with --mode sft:
+#       python agent/dataset_agent.py --target-size 2GB \
+#           --categories math,code,reasoning --out-dir ./sft_data --mode sft
 
 # 6. Pack SFT
 python pack_sft_data.py --data-dir ./sft_data --tokenizer ./tokenizer \
@@ -108,7 +121,11 @@ python train_sft.py --merge-lora \
     --checkpoint ./sft_checkpoints/latest.pt --out-dir ./sft_merged
 
 # 10. GRPO data
-python download_grpo_data.py --target-size 2GB
+#     Produce GRPO JSONL shards under ./grpo_data/<category>/*.jsonl
+#     in the {prompt, answer} shape (rule-based reward needs clean
+#     numeric / boxed ground truths):
+#        python agent/dataset_agent.py --target-size 2GB \
+#            --categories math,reasoning --out-dir ./grpo_data --mode sft
 
 # 11. Pack GRPO
 python pack_grpo_data.py --data-dir ./grpo_data --tokenizer ./tokenizer \

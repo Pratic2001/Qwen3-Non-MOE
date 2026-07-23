@@ -1,4 +1,13 @@
-# Plan: `train_grpo.py` — GRPO RL stage for Qwen3 dense
+# Design rationale: GRPO stage (`train_grpo.py`)
+
+> This file was the design spec for the GRPO stage before
+> `train_grpo.py` was written. The script has since been implemented
+> (and so has its DeepSpeed twin, `train_grpo_deepspeed.py`).
+> Kept as a reference for **why** the trainer is shaped the way it is
+> — the locked-in design decisions, the reward function's three tiers,
+> and the rationale for the single-model vs two-model reference policy
+> are still the source of truth. Read this if you're modifying the
+> GRPO loss, reward, or rollout shape.
 
 ## Context
 
