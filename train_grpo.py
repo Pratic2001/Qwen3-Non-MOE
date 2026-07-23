@@ -420,30 +420,51 @@ class GRPOPromptDataset:
 
         Returns: list of (start, end_exclusive) tuples, where each tuple
         describes one full SFT record in [start, end).
+
+        Implementation: rather than a pure-Python for-loop over every
+        token (O(n_tokens), i.e. billions of iterations for a large
+        corpus — the thing that was pinning a CPU core and holding the
+        whole materialized array resident in RAM for minutes/hours),
+        we first vectorize the search for separator *candidates* with
+        numpy (fast, C-level), then only loop over those candidates
+        (O(n_records), typically a few million at most).
         """
-        boundaries: List[Tuple[int, int]] = []
         n = len(mask_arr)
+        if n == 0:
+            return []
+
+        # Candidate separator positions: mask==0 and token==EOS(0).
+        candidates = np.flatnonzero((mask_arr == 0) & (tok_arr == 0))
+
+        # Positions where mask==1, needed to confirm "in_record" was
+        # true since the last boundary (mirrors the original loop's
+        # in_record guard, so padding runs of mask=0/tok=0 without any
+        # intervening mask=1 don't get treated as spurious boundaries).
+        mask1_positions = np.flatnonzero(mask_arr == 1)
+
+        boundaries: List[Tuple[int, int]] = []
         rec_start = 0
-        in_record = False
+        m1_ptr = 0  # monotonically advancing index into mask1_positions
+        n_m1 = len(mask1_positions)
 
-        for i in range(n):
-            m = mask_arr[i]
-            if m == 1:
-                in_record = True
-            else:
-                # mask == 0: either a prompt token or the separator.
-                # Detect separator: an EOS token followed by the next
-                # record starting (mask == 1 again or end of stream).
-                tok = tok_arr[i]
-                if in_record and tok == 0:
-                    # Could be the separator — close the current record.
-                    boundaries.append((rec_start, i + 1))
-                    rec_start = i + 1
-                    in_record = False
+        for c in candidates:
+            if c < rec_start:
+                continue
+            # Advance m1_ptr to the first mask==1 position >= rec_start.
+            while m1_ptr < n_m1 and mask1_positions[m1_ptr] < rec_start:
+                m1_ptr += 1
+            in_record = m1_ptr < n_m1 and mask1_positions[m1_ptr] < c
+            if in_record:
+                boundaries.append((rec_start, c + 1))
+                rec_start = c + 1
 
-        # Trailing partial record (no final EOS): include if non-empty.
-        if rec_start < n and in_record:
-            boundaries.append((rec_start, n))
+        # Trailing partial record (no final EOS): include if non-empty
+        # and it actually contains assistant tokens (in_record True).
+        if rec_start < n:
+            while m1_ptr < n_m1 and mask1_positions[m1_ptr] < rec_start:
+                m1_ptr += 1
+            if m1_ptr < n_m1 and mask1_positions[m1_ptr] < n:
+                boundaries.append((rec_start, n))
 
         return boundaries
 
@@ -639,7 +660,7 @@ def generate_rollouts(
             cumsp = sp.cumsum(dim=-1)
             keep = cumsp <= top_p
             keep[..., 0] = True
-            mask = torch.full_like(logits, False)
+            mask = torch.full_like(logits, False, dtype=torch.bool)
             mask.scatter_(-1, sorted_idx, keep)
             logits = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
 

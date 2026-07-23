@@ -398,14 +398,45 @@ def train(args):
               f"vocab={tokenizer.get_vocab_size()}")
 
     # ----------------------------------------------------------------- dataset
-    train_ds = GRPOPromptDataset(
-        cache_dir=args.cache_dir,
-        data_dir=args.data_dir,
-        prompts_file=args.prompts_file,
-        tokenizer=tokenizer,
-        max_prompt_len=args.max_prompt_len,
-        eos_id=eos_id,
-    )
+    # Only rank 0 does the expensive work: SFTDataset concatenates every
+    # packed shard into one in-RAM array and scans it for record
+    # boundaries (see GRPOPromptDataset._init_from_packed). If every rank
+    # did this independently, peak host RAM would be
+    # world_size * (dataset size), since all ranks on a node run this
+    # concurrently. Instead, rank 0 builds it once and broadcasts the
+    # much smaller derived (prompt_ids, answer, prompt_text) lists.
+    if world_size > 1:
+        if master:
+            train_ds = GRPOPromptDataset(
+                cache_dir=args.cache_dir,
+                data_dir=args.data_dir,
+                prompts_file=args.prompts_file,
+                tokenizer=tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                eos_id=eos_id,
+            )
+            payload = [train_ds._prompts, train_ds._answers, train_ds._prompt_text]
+        else:
+            payload = [None, None, None]
+        dist.broadcast_object_list(payload, src=0, device=device)
+        if not master:
+            # Lightweight shell: skip GRPOPromptDataset.__init__ entirely
+            # (that's what does the expensive memmap/JSONL work) and
+            # just populate the few attributes sample_batch()/__len__ need.
+            train_ds = GRPOPromptDataset.__new__(GRPOPromptDataset)
+            train_ds.tokenizer      = tokenizer
+            train_ds.max_prompt_len = args.max_prompt_len
+            train_ds.eos_id         = eos_id
+            train_ds._prompts, train_ds._answers, train_ds._prompt_text = payload
+    else:
+        train_ds = GRPOPromptDataset(
+            cache_dir=args.cache_dir,
+            data_dir=args.data_dir,
+            prompts_file=args.prompts_file,
+            tokenizer=tokenizer,
+            max_prompt_len=args.max_prompt_len,
+            eos_id=eos_id,
+        )
     if master:
         n_shards = getattr(train_ds, "_n_shards", 0)
         print(f"[Dataset] {len(train_ds):,} prompts "
