@@ -404,7 +404,7 @@ if __name__ == "__main__":
         vocab_size=tokenizer.get_vocab_size(),
     )
 
-    print(f"\nDone. Worker {args.worker}/{args.num_workers} packed files are in "
+    print(f"\nDone. Worker {args.worker + 1}/{args.num_workers} packed files are in "
           f"{args.cache_dir}")
     if args.num_workers > 1:
         print(f"Run the remaining {args.num_workers - 1} worker(s) before "

@@ -617,6 +617,35 @@ do not reimplement filtering or dedup logic yourself:
         .total_bytes / .total_docs   # read after the loop for a summary
 """
 
+# ---------------------------------------------------------------------------
+# Per-row error handling convention. Without this, models tend to wrap the
+# per-row mapping logic in its own try/except that prints something like
+# "Error processing row: {e}" and just `continue`s -- which is fine for a
+# genuinely bad individual row (missing field, malformed value, etc.) but
+# catastrophic when the bug is systemic (a NameError from an undefined
+# variable, a wrong column name, ...): every single row fails the same way,
+# the loop happily "succeeds" with 0 or near-0 docs written, prints a clean
+# RESULT_JSON, and exits 0 -- so generate_validate_and_run sees no error at
+# all and never triggers a repair. This block is included in both codegen
+# prompts so every generated script fails LOUDLY on a systemic bug instead
+# of silently degrading to zero output.
+# ---------------------------------------------------------------------------
+_ROW_ERROR_HANDLING_CONVENTION = """\
+Per-row error handling convention (IMPORTANT):
+- It's fine to skip an individual bad row (missing field, bad value, etc.)
+  inside a per-row try/except -- but you MUST track consecutive identical
+  failures. Keep a running count of consecutive rows that raised an
+  exception with the same str(e) message. If that count reaches 5, this is
+  a systemic bug (not a bad row) -- print a line starting with exactly
+  "[FATAL ERROR CAUGHT]: " followed by the exception message, then stop the
+  loop, close the writer, and print RESULT_JSON with whatever was written
+  so far, then exit(1). Do NOT keep silently skipping rows forever on the
+  same repeating error -- that produces a script which "succeeds" with
+  little or no output and hides a real bug from the caller.
+- Reset the consecutive-failure counter to 0 every time a row succeeds.
+"""
+
+
 
 def build_hf_codegen_prompt(category: str, mode: str, dataset_id: str, config: Optional[str],
                              split: str, columns: list, rows: list,
@@ -638,9 +667,16 @@ def build_hf_codegen_prompt(category: str, mode: str, dataset_id: str, config: O
 markdown outside a single ```python code fence.
 
 TASK: write a complete, runnable Python script that streams the Hugging Face
-dataset "{dataset_id}" (config={config!r}, split="{split}") in FULL (not just
-the sample below) via `datasets.load_dataset(..., streaming=True)`, maps each
-row to this target record shape, filters, dedups, and writes JSONL shards.
+dataset "{dataset_id}" (Hub subset/config name: {config!r}, split="{split}")
+in FULL (not just the sample below) via `datasets.load_dataset(...,
+streaming=True)`, maps each row to this target record shape, filters,
+dedups, and writes JSONL shards.
+
+CRITICAL -- exact load_dataset call to use, do not deviate from this
+parameter name: the Hub subset/config name goes in the `name` parameter,
+NOT a parameter called `config`. `load_dataset()` has no `config=` keyword
+at all; passing one raises "BuilderConfig ... doesn't have a 'config' key."
+{("Use exactly: load_dataset(" + repr(dataset_id) + ", name=" + repr(config) + ", split=" + repr(split) + ", streaming=True)") if config else ("This dataset has no subset/config (config=None) -- do NOT pass a name= argument at all. Use exactly: load_dataset(" + repr(dataset_id) + ", split=" + repr(split) + ", streaming=True)")}
 
 Target record shape for mode="{mode}":
     {schema['record_shape']}
@@ -678,6 +714,8 @@ Script requirements:
   and still calls ShardWriter.close() and prints the RESULT_JSON line with
   whatever was written so far, rather than crashing with a traceback and no
   usable output.
+
+{_ROW_ERROR_HANDLING_CONVENTION}
 {repair_note}
 Output ONLY the script in a single ```python fence.
 """
@@ -733,6 +771,8 @@ Script requirements:
 - Wrap the main loop in a broad try/except that still closes the writer and
   prints RESULT_JSON with whatever was produced so far, rather than crashing
   with no usable output.
+
+{_ROW_ERROR_HANDLING_CONVENTION}
 {repair_note}
 Output ONLY the script in a single ```python fence.
 """
@@ -794,6 +834,20 @@ def generate_and_validate_script(prompt_fn, script_path: str, max_repair: int = 
 # compile error already is.
 _FATAL_ERROR_RE = re.compile(r"^\[FATAL ERROR CAUGHT\]:\s*(.*)$")
 
+# Backstop for scripts that don't follow the _ROW_ERROR_HANDLING_CONVENTION
+# instruction (models don't always comply). Catches the general family of
+# messages a generated per-row try/except tends to print -- "Error
+# processing row: ...", "Error on row ...", "Failed to process row: ...",
+# etc. -- regardless of exact wording, so a systemic bug (same message
+# every time) can be detected and the run aborted even if the script never
+# prints the [FATAL ERROR CAUGHT] marker at all.
+_GENERIC_ROW_ERROR_RE = re.compile(
+    r"error\s+(?:processing|on|handling|parsing)\s+row.*?:\s*(.*)$", re.IGNORECASE)
+# How many consecutive identical row-error messages before we conclude
+# it's a systemic bug (not isolated bad data) and kill the run early
+# rather than let it burn through the whole dataset producing nothing.
+_ROW_ERROR_REPEAT_THRESHOLD = 5
+
 
 def run_generated_script(script_path: str, target_size: str, out_dir: str, category: str,
                           min_doc_chars: int, log_path: str, extra_args: Optional[list] = None) -> dict:
@@ -815,6 +869,8 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
     result_json = {"actual_bytes": 0, "docs": 0}
     fatal_error = None
     tail_lines = []  # last few lines, in case it crashes with no FATAL marker at all
+    last_row_error_msg = None
+    row_error_repeat_count = 0
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     # Belt-and-suspenders alongside _stage_shared_modules() having already
     # copied quality.py next to script_path: also put script_path's own
@@ -835,6 +891,28 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
             m = _FATAL_ERROR_RE.match(line.strip())
             if m:
                 fatal_error = m.group(1).strip()
+            # Backstop: script didn't follow the FATAL-marker convention,
+            # but is printing its own per-row error line repeatedly with
+            # the identical message -- that's a systemic bug (e.g. a
+            # NameError from an undefined variable), not per-row bad data.
+            # Kill it now rather than let it silently "succeed" with
+            # near-zero output after churning through the whole dataset.
+            gm = _GENERIC_ROW_ERROR_RE.search(line.strip())
+            if gm and fatal_error is None:
+                msg = gm.group(1).strip()
+                if msg and msg == last_row_error_msg:
+                    row_error_repeat_count += 1
+                else:
+                    last_row_error_msg = msg
+                    row_error_repeat_count = 1
+                if row_error_repeat_count >= _ROW_ERROR_REPEAT_THRESHOLD:
+                    fatal_error = (
+                        f"Same per-row error repeated {row_error_repeat_count}+ times "
+                        f"in a row (systemic bug, not isolated bad data): {msg}"
+                    )
+                    log_warn(f"run: detected repeating per-row error, stopping early: {msg[:200]}")
+                    proc.terminate()
+                    break
             if line.startswith("RESULT_JSON:"):
                 try:
                     result_json = json.loads(line[len("RESULT_JSON:"):].strip())
@@ -857,6 +935,41 @@ def run_generated_script(script_path: str, target_size: str, out_dir: str, categ
         fatal_error = "".join(tail_lines[-15:]).strip() or None
     result_json["error"] = fatal_error
     return result_json
+
+
+def _try_known_autofix(script_path: str, error: str) -> bool:
+    """Mechanical, zero-LLM-call fix for a small set of *exactly* recognized
+    error signatures that are common, unambiguous, and mechanically
+    correctable in the generated script's source -- no need to burn an
+    Ollama repair attempt (and risk it repeating the same mistake) for a
+    bug this well-understood. Returns True if a fix was applied (caller
+    should re-run without consuming a repair attempt), False otherwise.
+
+    Currently handles: `load_dataset(..., config=X, ...)` -- the Hub
+    subset/config parameter is called `name`, not `config`; passing
+    `config=` routes the value into the internal BuilderConfig object
+    instead and raises "BuilderConfig ... doesn't have a 'config' key."
+    This is the single most common mistake models make here (they
+    pattern-match prompt text like "config=None" into a kwarg), so it's
+    worth a direct fix rather than a round trip through the LLM."""
+    if "doesn't have a 'config' key" not in error:
+        return False
+    with open(script_path, "r", encoding="utf-8") as f:
+        src = f.read()
+    # Only rewrite `config=` when it appears as a keyword arg inside a
+    # load_dataset(...) call, not anywhere else in the file.
+    patched = re.sub(
+        r"(load_dataset\s*\([^)]*?)\bconfig\s*=",
+        r"\1name=",
+        src,
+    )
+    if patched == src:
+        return False  # signature matched but nothing to rewrite -- don't claim success
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(patched)
+    log_success(f"codegen: auto-patched known load_dataset(config=...) -> "
+                f"name=... mistake in {os.path.basename(script_path)}, no LLM call needed")
+    return True
 
 
 def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out_dir: str,
@@ -893,6 +1006,16 @@ def generate_validate_and_run(prompt_fn, script_path: str, target_size: str, out
         )
         if result.get("error") is None:
             return result
+
+        # Try a free, instant mechanical fix before spending an LLM repair
+        # attempt on a mistake we can already recognize and correct directly.
+        if _try_known_autofix(script_path, result["error"]):
+            result = run_generated_script(
+                script_path, target_size, out_dir, category, min_doc_chars,
+                log_path=log_path, extra_args=extra_args,
+            )
+            if result.get("error") is None:
+                return result
 
         log_warn(f"codegen: runtime error on attempt {attempt + 1}/{max_repair + 1}:")
         log_dim(result["error"][:500])

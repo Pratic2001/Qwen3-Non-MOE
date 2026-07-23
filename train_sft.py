@@ -729,7 +729,7 @@ def train(args):
         if master and step % args.log_interval == 0:
             t1  = time.perf_counter()
             tok_per_sec = tokens_per_step * args.log_interval / max(t1 - t0, 1e-9)
-            loss_display = loss_accum * args.grad_accum_steps / args.log_interval
+            loss_display = loss_accum / args.log_interval
             loss_accum = 0.0
             print(
                 f"step {step:7d} | loss {loss_display:.4f} | lr {lr:.2e} | "

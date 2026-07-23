@@ -599,24 +599,17 @@ def load_pretrained_checkpoint(path: str) -> Tuple[Qwen3Config, dict]:
 
 def estimate_mfu(model, tokens_per_sec: float, gpu_info: List[dict]) -> float:
     """
-    MFU is reported against the *trainable* parameter count when running
-    in LoRA mode (that's the work that's actually happening) and against
-    the *non-embedding total* otherwise. This keeps the metric meaningful
-    for sparse-adapter runs where 99.9% of weights are frozen.
+    MFU is always reported against the non-embedding *total* parameter
+    count, matching train.py / train_deepspeed.py. Forward and backward
+    still multiply through every frozen base-model weight in LoRA mode
+    (LoRA only skips the optimizer update on those weights, not the
+    matmuls), so counting only the trainable adapter params would hugely
+    undercount real FLOPs and make MFU look artificially low.
     """
     raw = model.module if hasattr(model, "module") else model
     inner = raw._orig_mod if hasattr(raw, "_orig_mod") else raw
-    # Treat LoRA matrices as the trainable work; include norms/embeddings
-    # in the count only when we're doing a full fine-tune.
-    is_lora = any(isinstance(m, LoRALinear) for m in inner.modules())
-    if is_lora:
-        n = sum(
-            p.numel() for pname, p in inner.named_parameters()
-            if ("lora_A" in pname or "lora_B" in pname) and p.requires_grad
-        )
-    else:
-        n = sum(p.numel() for pname, p in inner.named_parameters()
-                if "embed_tokens" not in pname)
+    n = sum(p.numel() for pname, p in inner.named_parameters()
+            if "embed_tokens" not in pname)
 
     flops = 6 * n * tokens_per_sec
     if not gpu_info:
@@ -725,11 +718,14 @@ def prune_checkpoints(out_dir: str, keep: int = 3):
 
 @torch.no_grad()
 def evaluate(engine, val_ds: SFTDataset, eval_steps: int,
-             batch_size: int, device: torch.device, world_size: int):
+             batch_size: int, device: torch.device, world_size: int,
+             use_cudagraphs: bool = False):
     engine.eval()
     losses: List[float] = []
     for _ in range(eval_steps):
         x, y, m = val_ds.get_batch(batch_size, device=device)
+        if use_cudagraphs:
+            torch.compiler.cudagraph_mark_step_begin()
         out     = engine(x)
         loss    = masked_cross_entropy(out["logits"], y, m)
         losses.append(loss.item())
@@ -854,6 +850,14 @@ def train(args):
         print(f"[Optimizer] decay={sum(p.numel() for p in decay):,}  "
               f"no_decay={sum(p.numel() for p in no_decay):,}")
 
+    # ---------------------------------------------------------------- compile
+    _use_cudagraphs = False
+    if args.compile:
+        if master:
+            print(f"[compile] torch.compile(mode='{args.compile_mode}')…")
+        model = torch.compile(model, mode=args.compile_mode)
+        _use_cudagraphs = (args.compile_mode == "reduce-overhead")
+
     # --------------------------------------------------------- DeepSpeed init
     engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
@@ -932,6 +936,8 @@ def train(args):
         # accounting below.
         for micro in range(args.grad_accum_steps):
             x, y, m = train_ds.get_batch(args.batch_size, device)
+            if _use_cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
             out     = engine(x)
             # masked cross entropy: only assistant tokens contribute
             loss    = masked_cross_entropy(out["logits"], y, m) / args.grad_accum_steps
@@ -951,7 +957,7 @@ def train(args):
             # Per micro-batch we divided by grad_accum_steps; multiply
             # back so the displayed value is the mean per-optimizer-step
             # loss, directly comparable to train_sft.py.
-            loss_display = loss_accum * args.grad_accum_steps / args.log_interval
+            loss_display = loss_accum / args.log_interval
             loss_accum   = 0.0
             grad_norm    = engine.get_global_grad_norm() or 0.0
 
@@ -975,6 +981,7 @@ def train(args):
         if step % args.eval_interval == 0 and step > start_step:
             val_loss = evaluate(
                 engine, val_ds, args.eval_steps, args.batch_size, device, world_size,
+                use_cudagraphs=_use_cudagraphs,
             )
             if master:
                 improved = " ✓ best" if val_loss < best_val_loss else ""
@@ -1092,18 +1099,29 @@ def parse_args():
     p.add_argument("--model-size-label", default="sft",
                    help="Label used in W&B run name; the actual architecture "
                         "is read from --checkpoint's config")
-    p.add_argument("--seq-len",          type=int,   default=2048)
-    p.add_argument("--batch-size",       type=int,   default=4,
+    p.add_argument("--seq-len",          type=int,   default=4096)
+    p.add_argument("--batch-size",       type=int,   default=16,
                    help="Micro-batch size PER GPU (before grad accum)")
     p.add_argument("--grad-accum-steps", type=int,   default=8)
-    p.add_argument("--max-steps",        type=int,   default=10_000)
-    p.add_argument("--warmup-steps",     type=int,   default=200)
+    p.add_argument("--max-steps",        type=int,   default=100000)
+    p.add_argument("--warmup-steps",     type=int,   default=1000)
     p.add_argument("--lr",               type=float, default=2e-5,
                    help="Peak LR (typically 1e-5 to 5e-5 for SFT)")
     p.add_argument("--min-lr",           type=float, default=2e-6)
     p.add_argument("--weight-decay",     type=float, default=0.01)
     p.add_argument("--grad-clip",        type=float, default=1.0)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    p.add_argument("--compile", action="store_true",
+                   help="Run torch.compile for kernel fusion (+25-40%% throughput, higher MFU)")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help=(
+                       "torch.compile mode. "
+                       "'default' — safe, good speedup, no CUDAGraphs. "
+                       "'reduce-overhead' — uses CUDAGraphs for lower kernel-launch overhead "
+                       "(marginally faster for small batches, needs cudagraph_mark_step_begin). "
+                       "'max-autotune' — exhaustive kernel search, very slow to compile."
+                   ))
     p.add_argument("--gradient-checkpointing", action="store_true",
                    help="Recompute activations on backward (~35%% less VRAM)")
     p.add_argument("--seed", type=int, default=42)
@@ -1117,11 +1135,11 @@ def parse_args():
                    help="Force CPU offload of model parameters (ZeRO-3 only)")
 
     # checkpointing / logging
-    p.add_argument("--ckpt-interval",  type=int, default=1_000)
+    p.add_argument("--ckpt-interval",  type=int, default=1_00)
     p.add_argument("--keep-ckpts",     type=int, default=3)
-    p.add_argument("--log-interval",   type=int, default=10)
-    p.add_argument("--eval-interval",  type=int, default=200)
-    p.add_argument("--eval-steps",     type=int, default=20)
+    p.add_argument("--log-interval",   type=int, default=1)
+    p.add_argument("--eval-interval",  type=int, default=50)
+    p.add_argument("--eval-steps",     type=int, default=200)
     p.add_argument("--wandb-project",  default=None)
     p.add_argument("--wandb-run-name", default=None)
 
