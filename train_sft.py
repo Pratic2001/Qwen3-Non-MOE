@@ -224,6 +224,21 @@ class _ConcatMemmap:
     def __len__(self):
         return self.total
 
+    def __array__(self, dtype=None):
+        # Supports np.asarray(concat_memmap) / np.array(concat_memmap).
+        # Materializes exactly the pieces this instance holds — for a
+        # per-step training window (this class's main use case via
+        # __getitem__ below) that's tiny (seq_len-ish elements, usually
+        # just 1-2 pieces). Callers holding a _ConcatMemmap spanning a
+        # much larger range (e.g. GRPO's whole-dataset probe) should
+        # avoid calling this unless they specifically want the one-time
+        # full-materialization cost.
+        if not self.arrays:
+            return np.array([], dtype=dtype or np.uint16)
+        pieces = [np.asarray(a) for a in self.arrays]
+        out = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+        return out.astype(dtype) if dtype is not None else out
+
     def _locate(self, idx):
         # Find which underlying array `idx` falls into.
         arr_i = int(np.searchsorted(self.offsets, idx, side="right") - 1)
@@ -234,15 +249,25 @@ class _ConcatMemmap:
             start, stop, step = key.indices(self.total)
             assert step == 1, "strided slicing not supported"
             if start >= stop:
-                return np.array([], dtype=self.arrays[0].dtype if self.arrays else np.uint16)
+                return _ConcatMemmap([])
             # Fast path: slice lies entirely within one underlying array
             arr_i_start, local_start = self._locate(start)
             arr_i_end,   local_end   = self._locate(stop - 1)
             if arr_i_start == arr_i_end:
-                return self.arrays[arr_i_start][local_start: local_end + 1]
-            # Slow path: spans multiple arrays — concatenate the pieces
-            # (only happens for windows that straddle a worker-shard
-            # boundary; rare and small, seq_len at most).
+                return _ConcatMemmap([self.arrays[arr_i_start][local_start: local_end + 1]])
+            # Slow path: spans multiple arrays. Historically this eagerly
+            # np.concatenate'd the pieces into one RAM-resident array —
+            # fine for a small per-step training window that happens to
+            # straddle a shard boundary, but this same __getitem__ is also
+            # what SFTDataset.__init__ uses for its rank-sharding slice,
+            # which can span the *entire* dataset (e.g. world_size=1).
+            # That silently forced a multi-GB anonymous-memory copy that
+            # the OS can't reclaim the way it can mmap'd pages — breaking
+            # the "RAM stays flat" promise this class is supposed to keep.
+            # Instead, stitch the (still memmap-backed, no-copy) pieces
+            # into a new lazy _ConcatMemmap. Callers that truly need a
+            # single contiguous in-RAM ndarray (e.g. _contiguous_view)
+            # materialize explicitly and deliberately, once.
             pieces = []
             cur = start
             while cur < stop:
@@ -251,7 +276,7 @@ class _ConcatMemmap:
                 take = min(len(arr) - local, stop - cur)
                 pieces.append(arr[local: local + take])
                 cur += take
-            return np.concatenate(pieces)
+            return _ConcatMemmap(pieces)
         else:
             arr_i, local = self._locate(key)
             return self.arrays[arr_i][local]

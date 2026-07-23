@@ -338,23 +338,32 @@ class GRPOPromptDataset:
             rank=0, world_size=1,
             split="train",
         )
-        self._tokens_memmap = probe.tokens   # plain ndarray/memmap (post rank-slice)
-        self._mask_memmap   = probe.mask     # plain ndarray/memmap (post rank-slice)
+        self._tokens_memmap = probe.tokens   # lazy _ConcatMemmap (mmap-backed, no copy)
+        self._mask_memmap   = probe.mask     # lazy _ConcatMemmap (mmap-backed, no copy)
         self._n_shards      = probe.n_shards
         total = len(self._tokens_memmap)
 
         # ---- find (prompt_start, prompt_end_assistant_end) by scanning
         #      the mask array. Sample boundary = mask==0 position that is
         #      also an EOS token (the separator pack_sft_data.py writes).
-        # Memory: one uint8 / uint16 / uint32 pass + a list of tuples.
-        # We do this once at __init__ and reuse forever.
-        mask_arr = _contiguous_view(self._mask_memmap)
-        tok_arr  = _contiguous_view(self._tokens_memmap)
+        #
+        # We scan each underlying worker-shard memmap directly (still
+        # disk-/page-cache-backed, evictable under memory pressure)
+        # instead of materializing the whole concatenated dataset into
+        # one permanent, non-reclaimable RAM buffer via _contiguous_view.
+        # Each worker shard from pack_sft_data.py holds complete records
+        # (no record straddles two shard files), so per-shard scanning
+        # finds the exact same boundaries as a single global scan would.
+        tok_shards  = self._tokens_memmap.arrays
+        mask_shards = self._mask_memmap.arrays
 
-        boundaries = self._scan_boundaries(mask_arr, tok_arr)
-        # boundaries: list of (sample_start, sample_end) absolute offsets
-        # within the memmap, where sample_start is the first prompt token
-        # of a record and sample_end is one past the trailing EOS.
+        # (shard_idx, local_start, local_end) — kept per-shard rather
+        # than flattened into one global offset, so prompt extraction
+        # below can index straight into that shard's own memmap.
+        boundaries: List[Tuple[int, int, int]] = []
+        for shard_idx, (tok_arr, mask_arr) in enumerate(zip(tok_shards, mask_shards)):
+            for s, e in self._scan_boundaries(mask_arr, tok_arr):
+                boundaries.append((shard_idx, s, e))
 
         # ---- recover the original `answer` strings from the JSONL pool
         answers_text: List[Optional[str]] = self._load_answer_strings(data_dir, len(boundaries))
@@ -367,11 +376,13 @@ class GRPOPromptDataset:
 
         skipped_long = 0
         skipped_no_gt = 0
-        for i, (s, e) in enumerate(boundaries):
+        for i, (shard_idx, s, e) in enumerate(boundaries):
             gt = answers_text[i] if i < len(answers_text) else None
             if not gt:
                 skipped_no_gt += 1
                 continue
+            tok_arr  = tok_shards[shard_idx]
+            mask_arr = mask_shards[shard_idx]
             # Find the assistant-turn start: the first mask==1 within [s, e).
             # (pack_sft_data.py writes a contiguous <|im_start|>user…
             # <|im_end|>\n<|im_start|>assistant block followed by the

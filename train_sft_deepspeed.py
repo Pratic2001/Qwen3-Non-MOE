@@ -624,17 +624,28 @@ def estimate_mfu(model, tokens_per_sec: float, gpu_info: List[dict]) -> float:
 
 def save_checkpoint(engine, step: int, out_dir: str,
                     config: Qwen3Config, args_dict: dict,
-                    best_val_loss: float, is_lora: bool):
+                    best_val_loss: float, is_lora: bool,
+                    master: bool = True):
     """
     DeepSpeed-native save. Writes a directory `step_<n>/` containing
     ZeRO-sharded model/optimizer states, plus a sidecar meta.json that
     holds our config, original CLI args, best val loss, and the LoRA
     adapter (if applicable) so the model can be reconstructed outside
     DeepSpeed without parsing the engine internals.
+
+    `engine.save_checkpoint(...)` is a collective DeepSpeed call — every
+    rank must reach it, since ZeRO-2/3 need every rank to contribute its
+    optimizer/parameter shard during the gather. This function must
+    therefore be called by ALL ranks, not just master; only the sidecar
+    bookkeeping (meta.json, symlink, print) is gated on `master` so we
+    don't get N ranks racing to write the same file.
     """
     tag  = f"step_{step:07d}"
     path = os.path.join(out_dir, tag)
     engine.save_checkpoint(out_dir, tag=tag)
+
+    if not master:
+        return
 
     sidecar: dict = {
         "step":          step,
@@ -994,19 +1005,21 @@ def train(args):
 
         # ---- checkpoint (all ranks must call save_checkpoint together)
         if step % args.ckpt_interval == 0 and step > start_step:
+            save_checkpoint(
+                engine, step, args.out_dir,
+                config, vars(args), best_val_loss, is_lora,
+                master=master,
+            )
             if master:
-                save_checkpoint(
-                    engine, step, args.out_dir,
-                    config, vars(args), best_val_loss, is_lora,
-                )
                 prune_checkpoints(args.out_dir, keep=args.keep_ckpts)
 
-    # ---- final checkpoint
+    # ---- final checkpoint (collective — every rank must call this)
+    save_checkpoint(
+        engine, args.max_steps, args.out_dir,
+        config, vars(args), best_val_loss, is_lora,
+        master=master,
+    )
     if master:
-        save_checkpoint(
-            engine, args.max_steps, args.out_dir,
-            config, vars(args), best_val_loss, is_lora,
-        )
         print(f"\nSFT complete. Best val loss: {best_val_loss:.4f}")
         if is_lora:
             print(f"\nTo merge LoRA into base weights for deployment:")
