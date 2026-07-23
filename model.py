@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -433,12 +434,38 @@ class Qwen3Attention(nn.Module):
 
         is_causal = attention_mask is None and (past_key_value is None) and seq_len > 1
 
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-            scale=1.0 / math.sqrt(self.head_dim),
-        )
+        # Explicitly pin the SDPA backend instead of letting PyTorch choose.
+        # Once we pass a custom float attn_mask (needed for left-padding),
+        # the flash-attention kernel is unavailable — fine, we want the
+        # memory-efficient (xFormers-style) kernel in that case, which is
+        # still ~linear in seq_len. What we must NOT allow is a silent
+        # fallback to the naive "math" kernel: that materializes the full
+        # (batch, heads, seq_len, seq_len) attention-probability matrix and
+        # keeps it around for backward on every layer, turning what should
+        # be linear memory into quadratic. This was happening silently on
+        # every GRPO forward pass (rollout, ref logprobs, policy logprobs)
+        # because all of them pass an explicit padding mask.
+        backend_ctx = nullcontext()
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            backends = ([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+                        if is_causal else [SDPBackend.EFFICIENT_ATTENTION])
+            backend_ctx = sdpa_kernel(backends)
+        except ImportError:
+            # Older torch: same intent via the legacy context manager.
+            backend_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=is_causal,
+                enable_math=False,
+                enable_mem_efficient=True,
+            )
+
+        with backend_ctx:
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
         attn_out = self.o_proj(attn_out)

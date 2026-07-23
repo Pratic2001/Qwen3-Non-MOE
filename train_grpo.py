@@ -641,7 +641,7 @@ def _build_attn_mask(
     causal.masked_fill_(k_pos > q_pos, float("-inf"))
 
     mask = causal.unsqueeze(0) + full_pad.unsqueeze(1)   # (B, seq_len, total_len)
-    return mask.unsqueeze(1).to(dtype)                    # (B, 1, seq_len, total_len)
+    return mask.unsqueeze(1).to(dtype).contiguous()       # (B, 1, seq_len, total_len)
 
 
 def generate_rollouts(
