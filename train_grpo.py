@@ -603,6 +603,47 @@ def _contiguous_view(concat_memmap) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _build_attn_mask(
+    prompt_pad_mask: torch.Tensor,   # (B, P) additive float: 0.0 real, -inf pad
+    seq_len: int,
+    past_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Build a (B, 1, seq_len, past_len+seq_len) additive attention mask
+    combining standard causal restriction with the prompt's left-padding.
+    Passing an explicit attn_mask disables this model's internal
+    `is_causal` SDPA fast path (see Qwen3Attention.forward), so any mask
+    we build here must encode causality itself, not just padding.
+
+    Only the PROMPT's own left-padding needs masking here: batched
+    attention never crosses rows, so a row's own post-EOS filler tokens
+    (pad_id written into full_ids after that row finishes) can't
+    corrupt any other row, and they're excluded from the loss/reward via
+    `gen_mask` anyway. So we only need to carry the prompt's (B, P)
+    padding mask forward as zero (unmasked) columns for every generated
+    key position — both during incremental KV-cache rollout and the
+    single-shot forward used for log-prob scoring.
+    """
+    B, P = prompt_pad_mask.shape
+    device = prompt_pad_mask.device
+    total_len = past_len + seq_len
+    gen_len = total_len - P
+    if gen_len > 0:
+        gen_pad = torch.zeros((B, gen_len), dtype=prompt_pad_mask.dtype, device=device)
+        full_pad = torch.cat([prompt_pad_mask, gen_pad], dim=1)
+    else:
+        full_pad = prompt_pad_mask[:, :total_len]
+
+    q_pos = torch.arange(past_len, total_len, device=device).unsqueeze(1)   # (seq_len,1)
+    k_pos = torch.arange(0, total_len, device=device).unsqueeze(0)          # (1,total_len)
+    causal = torch.zeros((seq_len, total_len), device=device)
+    causal.masked_fill_(k_pos > q_pos, float("-inf"))
+
+    mask = causal.unsqueeze(0) + full_pad.unsqueeze(1)   # (B, seq_len, total_len)
+    return mask.unsqueeze(1).to(dtype)                    # (B, 1, seq_len, total_len)
+
+
 def generate_rollouts(
     model: Qwen3ForCausalLM,
     prompt_ids_list: List[List[int]],
@@ -622,7 +663,10 @@ def generate_rollouts(
 
     Implementation notes:
         - Prompts are left-padded to a common length so the whole batch
-          can be processed as one tensor with KV-cache.
+          can be processed as one tensor with KV-cache. An explicit
+          causal+padding attention mask (see `_build_attn_mask`) is
+          passed on every step so rows with a shorter prompt don't
+          attend to their own left-pad tokens as if they were content.
         - Per-replica seeds give diverse samples without affecting global
           PyTorch RNG state.
         - After EOS, remaining positions are filled with `pad_id` (the
@@ -637,16 +681,28 @@ def generate_rollouts(
     B = len(prompt_ids_list)
     P = max(len(p) for p in prompt_ids_list)
     prompt_ids = torch.full((B, P), pad_id, dtype=torch.long, device=device)
+    prompt_pad_mask = torch.zeros((B, P), dtype=torch.float, device=device)
     for i, p in enumerate(prompt_ids_list):
-        prompt_ids[i, P - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
+        offset = P - len(p)
+        prompt_ids[i, offset:] = torch.tensor(p, dtype=torch.long, device=device)
+        if offset > 0:
+            prompt_pad_mask[i, :offset] = float("-inf")
 
     full_ids   = torch.full((B, P + max_new_tokens), pad_id, dtype=torch.long, device=device)
     full_ids[:, :P] = prompt_ids
     gen_mask   = torch.zeros((B, max_new_tokens), dtype=torch.float, device=device)
     sampled_lp = torch.zeros((B, max_new_tokens), dtype=torch.float, device=device)
 
+    model_dtype = next(model.parameters()).dtype
     past_kv = None
-    cur_ids = prompt_ids
+    # NOTE: `inp` must be reassigned to the just-sampled token at the end
+    # of every step (see bottom of the loop). It used to be sliced from a
+    # `cur_ids` tensor that was set once before the loop and never
+    # updated, which fed the model the *same last prompt token* on every
+    # decode step regardless of what was actually sampled — the KV-cache
+    # position advanced while the token being embedded stayed frozen,
+    # degenerating every rollout into garbage completions.
+    inp = prompt_ids
 
     g = torch.Generator(device=device)
     g.manual_seed(rng.randrange(2**31))
@@ -654,12 +710,10 @@ def generate_rollouts(
     already_done = torch.zeros(B, dtype=torch.bool, device=device)
 
     for t in range(max_new_tokens):
-        if past_kv is None:
-            inp = cur_ids
-        else:
-            inp = cur_ids[:, -1:]
+        past_len = 0 if past_kv is None else (past_kv[0][0].shape[2])
+        attn_mask = _build_attn_mask(prompt_pad_mask, inp.shape[1], past_len, model_dtype)
 
-        out = model(inp, past_key_values=past_kv, use_cache=True)
+        out = model(inp, attention_mask=attn_mask, past_key_values=past_kv, use_cache=True)
         logits = out["logits"][:, -1, :].float()
         past_kv = out["past_key_values"]
 
@@ -691,6 +745,9 @@ def generate_rollouts(
         if already_done.all():
             break
 
+        # Feed the token we just sampled back in on the next step.
+        inp = next_tok.unsqueeze(1)
+
     actual_T = max_new_tokens
     if gen_mask.any():
         active_lens = gen_mask.sum(dim=1).long()
@@ -709,9 +766,25 @@ def compute_logprobs(
     model: Qwen3ForCausalLM,
     full_ids: torch.Tensor,
     gen_mask: torch.Tensor,
+    prompt_pad_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Forward `full_ids`, return per-token log-prob of generated positions."""
-    out = model(full_ids, use_cache=False)
+    """
+    Forward `full_ids`, return per-token log-prob of generated positions.
+
+    `prompt_pad_mask` is the (B, P) additive left-padding mask returned
+    alongside `full_ids` by the caller (see `generate_rollouts`); when
+    given, an explicit causal+padding attention mask is built and passed
+    so rows with a shorter prompt aren't scored against corrupted
+    (pad-attending) hidden states. If omitted, falls back to the
+    model's internal is_causal fast path (only correct when every
+    prompt in the batch is the same length).
+    """
+    attn_mask = None
+    if prompt_pad_mask is not None:
+        seq_len = full_ids.shape[1]
+        model_dtype = next(model.parameters()).dtype
+        attn_mask = _build_attn_mask(prompt_pad_mask, seq_len, 0, model_dtype)
+    out = model(full_ids, attention_mask=attn_mask, use_cache=False)
     logits = out["logits"][:, :-1, :].float()
     targets = full_ids[:, 1:]
     logp = logits.log_softmax(dim=-1)
@@ -1060,6 +1133,15 @@ def train(args):
         # 4. decode + reward
         completions_text: List[str] = []
         P_max = max(len(p) for p in expanded_p)
+        # Same left-padding mask generate_rollouts built internally — needed
+        # again here so the reference/policy forward passes below don't
+        # attend to a shorter prompt's own left-pad tokens as if real
+        # content (see _build_attn_mask).
+        prompt_pad_mask = torch.zeros((len(expanded_p), P_max), dtype=torch.float, device=device)
+        for i, prompt_ids in enumerate(expanded_p):
+            offset = P_max - len(prompt_ids)
+            if offset > 0:
+                prompt_pad_mask[i, :offset] = float("-inf")
         for i, prompt_ids in enumerate(expanded_p):
             start = P_max - len(prompt_ids)
             active = int(gen_mask[i].sum().item())
@@ -1083,10 +1165,13 @@ def train(args):
 
         # 5. reference log-probs (no_grad)
         with torch.no_grad():
-            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask)
+            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask, prompt_pad_mask)
 
         # 6. policy log-probs (with grad)
-        out = model(full_ids, use_cache=False)
+        policy_attn_mask = _build_attn_mask(
+            prompt_pad_mask, full_ids.shape[1], 0, next(model.parameters()).dtype
+        )
+        out = model(full_ids, attention_mask=policy_attn_mask, use_cache=False)
         policy_logits = out["logits"][:, :-1, :].float()
         targets = full_ids[:, 1:]
         policy_logp = policy_logits.log_softmax(dim=-1).gather(

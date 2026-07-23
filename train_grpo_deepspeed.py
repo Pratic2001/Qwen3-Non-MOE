@@ -63,6 +63,7 @@ from model import Qwen3Config, Qwen3ForCausalLM, count_parameters
 
 # Re-use the GRPO machinery so this script stays focused on the engine swap.
 from train_grpo import (
+    _build_attn_mask,
     compute_reward,
     GRPOPromptDataset,
     generate_rollouts,
@@ -524,6 +525,15 @@ def train(args):
         # 4. decode + reward
         completions_text: List[str] = []
         P_max = max(len(p) for p in expanded_p)
+        # Same left-padding mask generate_rollouts built internally — needed
+        # again here so the reference/policy forward passes below don't
+        # attend to a shorter prompt's own left-pad tokens as if real
+        # content (see _build_attn_mask in train_grpo.py).
+        prompt_pad_mask = torch.zeros((len(expanded_p), P_max), dtype=torch.float, device=device)
+        for i, prompt_ids in enumerate(expanded_p):
+            offset = P_max - len(prompt_ids)
+            if offset > 0:
+                prompt_pad_mask[i, :offset] = float("-inf")
         for i, prompt_ids in enumerate(expanded_p):
             start = P_max - len(prompt_ids)
             active = int(gen_mask[i].sum().item())
@@ -547,11 +557,14 @@ def train(args):
 
         # 5. reference log-probs (no_grad)
         with torch.no_grad():
-            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask)
+            ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask, prompt_pad_mask)
 
         # 6. policy log-probs (with grad) — engine drives the forward +
         #    backward + (optional) all-reduce + optimizer step in one go.
-        out = engine(full_ids)
+        policy_attn_mask = _build_attn_mask(
+            prompt_pad_mask, full_ids.shape[1], 0, next(engine.parameters()).dtype
+        )
+        out = engine(full_ids, attention_mask=policy_attn_mask)
         # engine() returns a dict with 'logits' for Qwen3ForCausalLM;
         # under ZeRO-3 the output is materialized after param gather.
         if isinstance(out, dict):
@@ -713,10 +726,10 @@ def parse_args():
 
     # Rollouts
     p.add_argument("--num_generations", type=int,   default=8)
-    p.add_argument("--max_new_tokens",  type=int,   default=512)
+    p.add_argument("--max_new_tokens",  type=int,   default=2048)
     p.add_argument("--temperature",     type=float, default=1.0)
     p.add_argument("--top_p",           type=float, default=0.95)
-    p.add_argument("--max_prompt_len",  type=int,   default=512)
+    p.add_argument("--max_prompt_len",  type=int,   default=4096)
 
     # Reward weights
     p.add_argument("--reward_correct",  type=float, default=1.0)
