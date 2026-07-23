@@ -564,7 +564,8 @@ def train(args):
         policy_attn_mask = _build_attn_mask(
             prompt_pad_mask, full_ids.shape[1], 0, next(engine.parameters()).dtype
         )
-        out = engine(full_ids, attention_mask=policy_attn_mask)
+        T = gen_mask.shape[1]
+        out = engine(full_ids, attention_mask=policy_attn_mask, num_logits_to_keep=T)
         # engine() returns a dict with 'logits' for Qwen3ForCausalLM;
         # under ZeRO-3 the output is materialized after param gather.
         if isinstance(out, dict):
@@ -572,12 +573,11 @@ def train(args):
         else:
             # Some wrappers return ModelOutput; fall back to attribute access.
             policy_logits = out.logits if hasattr(out, "logits") else out["logits"]
-        policy_logits = policy_logits[:, :-1, :].float()
-        targets = full_ids[:, 1:]
+        policy_logits = policy_logits.float()   # (B, T, V) already aligned
+        targets = full_ids[:, -T:]
         policy_logp = policy_logits.log_softmax(dim=-1).gather(
             -1, targets.unsqueeze(-1)).squeeze(-1)
-        T = gen_mask.shape[1]
-        policy_logp = policy_logp[:, -T:] * gen_mask
+        policy_logp = policy_logp * gen_mask
 
         # 7. GRPO loss
         loss, metrics = grpo_loss(
@@ -725,11 +725,13 @@ def parse_args():
     p.add_argument("--ref_policy", default="single", choices=["single", "two"])
 
     # Rollouts
-    p.add_argument("--num_generations", type=int,   default=8)
-    p.add_argument("--max_new_tokens",  type=int,   default=512)
+    p.add_argument("--num_generations", type=int,   default=4,
+                   help="G — completions per prompt. Real batch = "
+                        "batch_size * num_generations.")
+    p.add_argument("--max_new_tokens",  type=int,   default=256)
     p.add_argument("--temperature",     type=float, default=1.0)
     p.add_argument("--top_p",           type=float, default=0.95)
-    p.add_argument("--max_prompt_len",  type=int,   default=512)
+    p.add_argument("--max_prompt_len",  type=int,   default=256)
 
     # Reward weights
     p.add_argument("--reward_correct",  type=float, default=1.0)

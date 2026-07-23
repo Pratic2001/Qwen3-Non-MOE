@@ -784,13 +784,16 @@ def compute_logprobs(
         seq_len = full_ids.shape[1]
         model_dtype = next(model.parameters()).dtype
         attn_mask = _build_attn_mask(prompt_pad_mask, seq_len, 0, model_dtype)
-    out = model(full_ids, attention_mask=attn_mask, use_cache=False)
-    logits = out["logits"][:, :-1, :].float()
-    targets = full_ids[:, 1:]
+    T = gen_mask.shape[1]
+    # Only project the last T positions through lm_head — the prompt
+    # positions' logits are never used (see model.py num_logits_to_keep).
+    out = model(full_ids, attention_mask=attn_mask, use_cache=False,
+                num_logits_to_keep=T)
+    logits = out["logits"].float()          # (B, T, V) already aligned
+    targets = full_ids[:, -T:]
     logp = logits.log_softmax(dim=-1)
     tok_lp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    T = gen_mask.shape[1]
-    return tok_lp[:, -T:] * gen_mask
+    return tok_lp * gen_mask
 
 
 # ---------------------------------------------------------------------------
@@ -1116,16 +1119,17 @@ def train(args):
         # 3. rollout
         rollout_model = _raw(model)
         rollout_model.eval()
-        full_ids, gen_mask, _sampled_lp = generate_rollouts(
-            rollout_model,
-            expanded_p,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_id=eos_id,
-            pad_id=pad_id,
-            rng=rng,
-        )
+        with ctx, torch.no_grad():
+            full_ids, gen_mask, _sampled_lp = generate_rollouts(
+                rollout_model,
+                expanded_p,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_id=eos_id,
+                pad_id=pad_id,
+                rng=rng,
+            )
         rollout_model.train()
         if _use_cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
@@ -1164,20 +1168,22 @@ def train(args):
         rewards = torch.tensor(rewards_list, dtype=torch.float, device=device)
 
         # 5. reference log-probs (no_grad)
-        with torch.no_grad():
+        with ctx, torch.no_grad():
             ref_logp = compute_logprobs(ref_for_logprob, full_ids, gen_mask, prompt_pad_mask)
 
         # 6. policy log-probs (with grad)
         policy_attn_mask = _build_attn_mask(
             prompt_pad_mask, full_ids.shape[1], 0, next(model.parameters()).dtype
         )
-        out = model(full_ids, attention_mask=policy_attn_mask, use_cache=False)
-        policy_logits = out["logits"][:, :-1, :].float()
-        targets = full_ids[:, 1:]
+        T = gen_mask.shape[1]
+        with ctx:
+            out = model(full_ids, attention_mask=policy_attn_mask, use_cache=False,
+                        num_logits_to_keep=T)
+            policy_logits = out["logits"].float()   # (B, T, V) already aligned
+        targets = full_ids[:, -T:]
         policy_logp = policy_logits.log_softmax(dim=-1).gather(
             -1, targets.unsqueeze(-1)).squeeze(-1)
-        T = gen_mask.shape[1]
-        policy_logp = policy_logp[:, -T:] * gen_mask
+        policy_logp = policy_logp * gen_mask
 
         # 7. loss + step
         loss, metrics = grpo_loss(
@@ -1482,12 +1488,21 @@ def parse_args():
                         "'two' keeps a frozen second copy in memory.")
 
     # Rollouts
-    p.add_argument("--num_generations", type=int,   default=8,
-                   help="G — completions per prompt")
-    p.add_argument("--max_new_tokens",  type=int,   default=512)
+    p.add_argument("--num_generations", type=int,   default=4,
+                   help="G — completions per prompt. NOTE: real batch = "
+                        "batch_size * num_generations, not batch_size alone. "
+                        "Lowered from the original 8 as a safer default for "
+                        "single-GPU memory; raise it back once a run fits.")
+    p.add_argument("--max_new_tokens",  type=int,   default=256,
+                   help="Lowered from 512 as a safer default — this "
+                        "directly sets the sequence length scored through "
+                        "the (B*G, T, vocab_size) log-prob pass.")
     p.add_argument("--temperature",     type=float, default=1.0)
     p.add_argument("--top_p",           type=float, default=0.95)
-    p.add_argument("--max_prompt_len",  type=int,   default=512)
+    p.add_argument("--max_prompt_len",  type=int,   default=256,
+                   help="Lowered from 512 for the same reason as "
+                        "--max_new_tokens: this is the other half of the "
+                        "sequence length that determines rollout memory.")
 
     # Reward weights
     p.add_argument("--reward_correct",  type=float, default=1.0,

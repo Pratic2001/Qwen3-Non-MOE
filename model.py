@@ -640,15 +640,41 @@ class Qwen3ForCausalLM(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[list] = None,
         use_cache: bool = False,
+        num_logits_to_keep: int = 0,
     ):
         hidden_states, new_past_key_values = self.model(
             input_ids, attention_mask, position_ids, past_key_values, use_cache,
         )
 
+        # num_logits_to_keep > 0: caller only needs logits to score the
+        # last N *target* tokens (e.g. GRPO log-prob scoring, where the
+        # sequence is prompt+completion but only completion tokens matter).
+        # Projecting every position through lm_head materializes a
+        # (B, L, vocab_size) tensor — with vocab_size in the 100k+ range
+        # this dwarfs everything else in the forward pass. Slicing the
+        # hidden states BEFORE lm_head (rather than slicing logits after,
+        # as the old code effectively did by discarding rows post-hoc)
+        # avoids ever allocating the unused rows.
+        # Note this is mutually exclusive with `labels`, which needs
+        # every position for its own internal shift; GRPO-style callers
+        # never pass both.
+        if num_logits_to_keep > 0:
+            assert labels is None, (
+                "num_logits_to_keep and labels are mutually exclusive: "
+                "labels needs the full-sequence shift, num_logits_to_keep "
+                "is for the pre-sliced last-N-targets case."
+            )
+            # +1 then drop the last row == the standard "shift left by one"
+            # used for next-token prediction, restricted to the last N
+            # target positions instead of the whole sequence.
+            hidden_for_logits = hidden_states[:, -(num_logits_to_keep + 1):-1, :]
+        else:
+            hidden_for_logits = hidden_states
+
         # lm_head is always an nn.Linear; when tie_word_embeddings=True its
         # weight was pointed at embed_tokens.weight in __init__ / tie_weights,
         # so no extra memory is used and gradients flow correctly.
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_for_logits)
 
         loss = None
         if labels is not None:
