@@ -726,10 +726,10 @@ def parse_args():
 
     # Rollouts
     p.add_argument("--num_generations", type=int,   default=8)
-    p.add_argument("--max_new_tokens",  type=int,   default=2048)
+    p.add_argument("--max_new_tokens",  type=int,   default=512)
     p.add_argument("--temperature",     type=float, default=1.0)
     p.add_argument("--top_p",           type=float, default=0.95)
-    p.add_argument("--max_prompt_len",  type=int,   default=4096)
+    p.add_argument("--max_prompt_len",  type=int,   default=512)
 
     # Reward weights
     p.add_argument("--reward_correct",  type=float, default=1.0)
