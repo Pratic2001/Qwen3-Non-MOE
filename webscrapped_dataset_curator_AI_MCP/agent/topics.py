@@ -12,6 +12,7 @@ queries), but a broader seed list gives it a better starting spread.
 """
 
 TOPIC_SEEDS = {
+    "chat": ["general conversation between two people.", "chat conversation.", "Role play chat", "Human-AI conversation"],
     "web": [
         "explainer how the stock market works", "history of the printing press",
         "climate change ocean currents explained", "how vaccines are developed",
