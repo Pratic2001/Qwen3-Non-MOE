@@ -2,7 +2,7 @@
 """
 pack_sft_data.py
 
-Stage 0 of SFT: read raw JSONL SFT records (from download_sft_data.py),
+Stage 0 of SFT: read raw JSONL SFT records ({prompt, thinking, answer}),
 apply the ChatML + <think></think> template, tokenise, and write the
 result to packed memmap .bin files that train_sft.py reads directly.
 
@@ -186,7 +186,7 @@ def select_shards_for_worker(
     if not all_shards:
         raise FileNotFoundError(
             f"No .jsonl shards found under {data_dir}/<category>/. "
-            f"Run download_sft_data.py first."
+            f"Produce SFT JSONL shards with webscrapped_dataset_curator_AI_MCP/ --mode sft or a compatible producer."
         )
     my_shards = all_shards[worker::num_workers]
     return my_shards
@@ -357,13 +357,17 @@ def parse_args():
                      "for train_sft.py."
     )
     p.add_argument("--data-dir",  default="./sft_data",
-                   help="SFT data directory from download_sft_data.py")
+                   help="SFT JSONL directory (shards from webscrapped_dataset_curator_AI_MCP/ --mode sft)")
     p.add_argument("--tokenizer", default="./tokenizer",
                    help="Tokenizer directory from train_tokenizer.py")
     p.add_argument("--cache-dir", default="./sft_packed",
                    help="Where to write the packed memmap files")
     p.add_argument("--max-len-per-example", type=int, default=2048,
                    help="Max tokens per individual SFT example before truncation")
+    p.add_argument("--seq-length", type=int, default=None,
+                   help="Shorthand to set --max-len-per-example to a specific "
+                        "value. Useful for short-context training (e.g. 256, 512). "
+                        "Overrides --max-len-per-example when both are given.")
     p.add_argument("--val-fraction", type=float, default=0.01,
                    help="Fraction of records deterministically routed to val")
 
@@ -385,6 +389,13 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
+    # --seq-length overrides --max-len-per-example
+    max_len = args.seq_length if args.seq_length is not None else args.max_len_per_example
+    print(f"Max tokens per example: {max_len}"
+          + (f"  (--seq-length {args.seq_length} overrides "
+             f"--max-len-per-example {args.max_len_per_example})"
+             if args.seq_length is not None else ""))
+
     if args.worker < 0 or args.worker >= args.num_workers:
         raise ValueError(
             f"--worker must be in [0, {args.num_workers}), got {args.worker}"
@@ -397,7 +408,7 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         cache_dir=args.cache_dir,
-        max_len_per_example=args.max_len_per_example,
+        max_len_per_example=max_len,
         val_fraction=args.val_fraction,
         worker=args.worker,
         num_workers=args.num_workers,

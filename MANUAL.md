@@ -127,6 +127,10 @@ D_pretrain = 20 × N
 - Always use the packed memmap format (`pack_dataset.py`). One packed
   sequence contains many training examples concatenated; the position IDs
   reset at sample boundaries to avoid cross-document attention.
+- Use `pack_dataset.py --seq-length N` to truncate individual documents
+  to N tokens before packing. Useful for short-context training runs
+  where you want to cap document length (e.g. `--seq-length 256` or
+  `--seq-length 512`).
 - Effective tokens per step:
 
 ```
@@ -267,7 +271,7 @@ samples-per-pass` → train for 2–3 full passes.
 | grad clip       | 1.0           | Same as pretraining                              |
 | micro batch     | fits memory   | Bump grad accum to reach B_eff ≥ 0.5 M           |
 | B_eff           | 0.5 – 1 M     | Smaller window than pretraining                  |
-| sequence len    | 4096 – 8192   | Long enough for `<think>...</think>` spans       |
+| sequence len    | 4096 – 8192   | Long enough for `<think>...</think>` spans; use `--seq-length` on packers to truncate for short-context runs |
 | epochs          | 2 – 4         | More → overfit on style, less → underfit on task |
 
 ### 4.4 LoRA (preferred for 1B+ on a single GPU)
@@ -562,7 +566,7 @@ python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./token
 #    shape documented by pack_dataset.py. The current producer is
 #    the webscrapped_dataset_curator_AI agent (see
 #    webscrapped_dataset_curator_AI_MCP/README.md); the older
-#    build_dataset.py is being retired.
+#    build_dataset.py has been retired.
 python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
 torchrun --nproc_per_node=1 train.py --model-size 0.6B --data-dir ./packed
 

@@ -17,9 +17,9 @@ The model implements: RMSNorm (pre-norm), RoPE, Grouped Query Attention with **p
 
 ### Data preparation
 - `train_tokenizer.py` — Train a byte-level BPE tokenizer (Qwen3-family) with ChatML + `<think>`/`</think>` special tokens. Writes `./tokenizer/`.
-- `pack_dataset.py` — Tokenize `./data/**/*.jsonl`, write `./packed/{train,val}.bin` + `meta.json` (uint16 or uint32 token ids). The packer consumes the JSONL shape documented in its own docstring; that shape used to be produced by `build_dataset.py` (now retired — see `webscrapped_dataset_curator_AI_MCP/` for the current producer).
-- `pack_sft_data.py` — Tokenize SFT JSONL (`{prompt, thinking, answer}` records), apply ChatML + `<think>` template, write packed `{tokens, mask}` memmaps with per-worker manifests (multi-process safe).
-- `pack_grpo_data.py` — Single-turn ChatML packer for GRPO records. Output is the same on-disk format as `pack_sft_data.py` so `train_grpo.py` can read it via the same `SFTDataset` manifest convention. The packed `answer` is **not** used for the GRPO loss — it's only read back to recover the ground-truth string for reward scoring at rollout time.
+- `pack_dataset.py` — Tokenize `./data/**/*.jsonl`, write `./packed/{train,val}.bin` + `meta.json` (uint16 or uint32 token ids). Supports `--seq-length N` to truncate individual documents to N tokens (useful for short-context training). The JSONL shape is documented in its own docstring; produce shards with `webscrapped_dataset_curator_AI_MCP/` or any compatible producer.
+- `pack_sft_data.py` — Tokenize SFT JSONL (`{prompt, thinking, answer}` records), apply ChatML + `<think>` template, write packed `{tokens, mask}` memmaps with per-worker manifests (multi-process safe). Supports `--seq-length N` as a shorthand for `--max-len-per-example N`.
+- `pack_grpo_data.py` — Single-turn ChatML packer for GRPO records. Output is the same on-disk format as `pack_sft_data.py` so `train_grpo.py` can read it via the same `SFTDataset` manifest convention. The packed `answer` is **not** used for the GRPO loss — it's only read back to recover the ground-truth string for reward scoring at rollout time. Supports `--seq-length N` as a shorthand for `--max-len-per-example N`.
 
 > **Note.** The earlier `build_dataset.py` / `download_sft_data.py` /
 > `download_grpo_data.py` scripts have been removed. The live producer
@@ -55,6 +55,10 @@ Checkpoint tooling:
 - `calculate_settings.py` — Chinchilla-aware calculator. Given `--data-size`, `--target-size`, or `--tokens`, prints a full set of recommended settings for pretraining, SFT, and GRPO plus the implied command line. Use `--json` for machine output.
 - `make_anneal_dataset.py` — Replays the deterministic `PackedDataLoader` RNG stream from `train.py` / `train_deepspeed.py` to extract the "never sampled" token ranges and write an annealing `train.bin`. The seed formula (`seed*1_000_003 + rank*31 + loader_id`) and the per-worker seed formula (`base_seed + worker_id*9973`) are shared between both trainers and this script — keep them in sync if you change either trainer.
 
+### Patch utilities
+- `_apply_seq_length.py` — One-shot script that applies `--seq-length` support to `pack_sft_data.py` and `pack_grpo_data.py`. Already applied; kept for reference only.
+- `_patch_pack_sft.py`, `_patch_sft.py`, `_write_patch.py` — Earlier iterations of the seq-length patch. Superseded by `_apply_seq_length.py`; kept for reference only.
+
 ### Web data agent
 - `webscrapped_dataset_curator_AI_MCP/` — Separate subproject. Live-scraping companion that writes JSONL shards in the **same format** the packers (`pack_dataset.py` / `pack_sft_data.py` / `pack_grpo_data.py`) consume directly, so they need zero changes. Uses a local Ollama model as planner + quality judge and an MCP server for search/fetch/extract. Has its own `README.md` and `requirements.txt`.
 
@@ -79,6 +83,7 @@ python train_tokenizer.py --data-dir ./data --vocab-size 32000 --out-dir ./token
 
 # 3. Pack tokens
 python pack_dataset.py --data-dir ./data --tokenizer ./tokenizer
+#    Optional: --seq-length 512 to truncate long documents for short-context training
 
 # 4a. Pretrain (single GPU)
 python train.py --model-size 0.6B --data-dir ./packed --out-dir ./checkpoints
@@ -99,6 +104,7 @@ deepspeed --hostfile hostfile train_deepspeed.py --model-size 8B --data-dir ./pa
 # 6. Pack SFT
 python pack_sft_data.py --data-dir ./sft_data --tokenizer ./tokenizer \
     --cache-dir ./sft_packed
+#    Optional: --seq-length 512 to truncate long examples for short-context training
 
 # 7. SFT (vanilla)
 python train_sft.py --checkpoint ./checkpoints/latest.pt \
@@ -130,6 +136,7 @@ python train_sft.py --merge-lora \
 # 11. Pack GRPO
 python pack_grpo_data.py --data-dir ./grpo_data --tokenizer ./tokenizer \
     --cache-dir ./grpo_packed
+#    Optional: --seq-length 512 to truncate long examples for short-context training
 
 # 12. GRPO (consume the SFT checkpoint)
 python train_grpo.py --checkpoint ./sft_checkpoints/latest.pt \

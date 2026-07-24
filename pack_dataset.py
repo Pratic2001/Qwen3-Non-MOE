@@ -2,7 +2,8 @@
 """
 pack_dataset.py
 
-Tokenizes the JSONL shards produced by build_dataset.py (./data/<category>/*.jsonl)
+Tokenizes the JSONL shards under ./data/<category>/*.jsonl
+(produced by webscrapped_dataset_curator_AI_MCP/ or any compatible producer)
 using the tokenizer from train_tokenizer.py, and packs the resulting token IDs
 into flat, memory-mapped .bin files for fast random-access reading during
 training.
@@ -56,16 +57,18 @@ import numpy as np
 _TOKENIZER = None
 _MAX_DOC_CHARS = 0
 _PIECE_OVERLAP_CHARS = 0
+_SEQ_LENGTH = 0
 
 
-def _init_worker(tokenizer_path: str, max_doc_chars: int, piece_overlap_chars: int = 0):
+def _init_worker(tokenizer_path: str, max_doc_chars: int, piece_overlap_chars: int = 0, seq_length: int = 0):
     """Load the tokenizer once per worker. Imported lazily so workers don't
     depend on the parent's torch / numpy state at import time."""
-    global _TOKENIZER, _MAX_DOC_CHARS, _PIECE_OVERLAP_CHARS
+    global _TOKENIZER, _MAX_DOC_CHARS, _PIECE_OVERLAP_CHARS, _SEQ_LENGTH
     from tokenizers import Tokenizer
     _TOKENIZER = Tokenizer.from_file(tokenizer_path)
     _MAX_DOC_CHARS = max_doc_chars
     _PIECE_OVERLAP_CHARS = piece_overlap_chars
+    _SEQ_LENGTH = seq_length
 
 
 def _tokenize_shard(job):
@@ -98,9 +101,12 @@ def _tokenize_shard(job):
         encodings = _TOKENIZER.encode_batch(texts)
         n = 0
         for enc in encodings:
-            if enc.ids:
-                fh.write(struct.pack(f"<{len(enc.ids)}I", *enc.ids))
-                n += len(enc.ids)
+            ids = enc.ids
+            if _SEQ_LENGTH and len(ids) > _SEQ_LENGTH:
+                ids = ids[:_SEQ_LENGTH]
+            if ids:
+                fh.write(struct.pack(f"<{len(ids)}I", *ids))
+                n += len(ids)
         return n
 
     def _enqueue_piece(text, fh):
@@ -251,6 +257,11 @@ def main():
     p.add_argument("--copy-chunk-mb",   type=int, default=64,
                    help="Slice size (MB) when copying chunks to final mmap. "
                         "Controls main-process peak RAM. Default 64 MB.")
+    p.add_argument("--seq-length", type=int, default=None,
+                   help="Max tokens per document. Documents longer than this "
+                        "are truncated to this many tokens. Useful for short "
+                        "context-length training (e.g. 256, 512). "
+                        "Default None (no truncation).")
     p.add_argument("--shuffle-shards",  action="store_true", default=True)
     p.add_argument("--tokenizer-threads", type=int, default=1,
                    help="Threads per worker's encode_batch(). Default 1 to "
@@ -280,7 +291,7 @@ def main():
     if not shard_paths:
         raise FileNotFoundError(
             f"No .jsonl shards found under {args.data_dir}/<category>/. "
-            f"Run build_dataset.py first."
+            f"Produce JSONL shards with webscrapped_dataset_curator_AI_MCP/ or a compatible producer."
         )
     print(f"Found {len(shard_paths)} shard file(s)")
 
@@ -307,6 +318,7 @@ def main():
     print(f"Main proc peak RAM   : ~{main_proc_peak} MB (copy slice)")
     print(f"Per-doc cap          : {args.max_doc_chars:,} chars per piece")
     print(f"Piece overlap        : {args.piece_overlap_chars:,} chars (0 = no overlap)")
+    print(f"Seq-length           : {args.seq_length or 'none (no truncation)'}")
     print(f"Tokenizer threads    : {args.tokenizer_threads} per worker\n")
 
     # ---------------------------------------------------------------
@@ -330,7 +342,8 @@ def main():
     with ctx.Pool(
         processes=args.workers,
         initializer=_init_worker,
-        initargs=(tokenizer_path, args.max_doc_chars, args.piece_overlap_chars),
+        initargs=(tokenizer_path, args.max_doc_chars, args.piece_overlap_chars,
+                  args.seq_length or 0),
     ) as pool:
         for i, (cat, n_tok, chunk_path, chunked) in enumerate(
             pool.imap_unordered(_tokenize_shard, work_items)
@@ -408,6 +421,7 @@ def main():
         "chunked_doc_count":     total_chunked,
         "max_doc_chars":         args.max_doc_chars,
         "piece_overlap_chars":   args.piece_overlap_chars,
+        "seq_length":            args.seq_length,
         "tokenizer_dir":         os.path.abspath(args.tokenizer),
     }
     meta_path = os.path.join(args.out_dir, "meta.json")
